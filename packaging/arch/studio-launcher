@@ -1,0 +1,14 @@
+#!/bin/bash
+
+studio_flags=()
+
+export STUDIO_OMARCHY_PACKAGE=1
+
+if [[ ${XDG_SESSION_TYPE:-} == "wayland" || -n ${WAYLAND_DISPLAY:-} ]]; then
+  studio_flags+=(
+    --ozone-platform=wayland
+    --ozone-platform-hint=wayland
+  )
+fi
+
+exec /usr/lib/studio/studio "${studio_flags[@]}" "$@"

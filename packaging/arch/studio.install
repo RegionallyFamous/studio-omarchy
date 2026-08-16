@@ -1,0 +1,35 @@
+# shellcheck shell=bash
+
+_studio_node='/usr/lib/studio/resources/bin/node'
+_studio_ca='/etc/ca-certificates/trust-source/anchors/studio-ca.crt'
+
+_set_studio_capability() {
+  if [[ -x $_studio_node ]]; then
+    setcap 'cap_net_bind_service=+ep' "$_studio_node" ||
+      echo 'WordPress Studio: unable to grant ports 80/443 to the bundled Node runtime.' >&2
+  fi
+}
+
+post_install() {
+  _set_studio_capability
+  update-desktop-database -q
+}
+
+post_upgrade() {
+  _set_studio_capability
+  update-desktop-database -q
+}
+
+pre_remove() {
+  if [[ -e $_studio_node ]]; then
+    setcap -r "$_studio_node" 2>/dev/null || true
+  fi
+}
+
+post_remove() {
+  if [[ -f $_studio_ca ]]; then
+    rm -f "$_studio_ca"
+    update-ca-trust extract
+  fi
+  update-desktop-database -q
+}

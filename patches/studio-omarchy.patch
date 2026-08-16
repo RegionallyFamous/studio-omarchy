@@ -1,0 +1,455 @@
+diff --git a/apps/studio/src/tests/updates.test.ts b/apps/studio/src/tests/updates.test.ts
+index b90c9371..1241f667 100644
+--- a/apps/studio/src/tests/updates.test.ts
++++ b/apps/studio/src/tests/updates.test.ts
+@@ -25,10 +25,14 @@ vi.mock( 'src/main-window', () => ( {
+ const originalFetch = global.fetch;
+ const originalPlatform = process.platform;
+ const originalArch = process.arch;
++const originalOmarchyPath = process.env.OMARCHY_PATH;
++const originalStudioOmarchyPackage = process.env.STUDIO_OMARCHY_PACKAGE;
+ 
+ beforeEach( () => {
+ 	Object.defineProperty( process, 'platform', { value: 'linux', configurable: true } );
+ 	Object.defineProperty( process, 'arch', { value: 'arm64', configurable: true } );
++	delete process.env.OMARCHY_PATH;
++	delete process.env.STUDIO_OMARCHY_PACKAGE;
+ 	vi.mocked( app.getVersion ).mockReturnValue( '1.8.2' );
+ 	// shell.openExternal isn't part of the global electron mock in vitest.setup.ts.
+ 	( shell as unknown as { openExternal: ReturnType< typeof vi.fn > } ).openExternal = vi
+@@ -40,6 +44,16 @@ afterEach( () => {
+ 	global.fetch = originalFetch;
+ 	Object.defineProperty( process, 'platform', { value: originalPlatform, configurable: true } );
+ 	Object.defineProperty( process, 'arch', { value: originalArch, configurable: true } );
++	if ( originalOmarchyPath === undefined ) {
++		delete process.env.OMARCHY_PATH;
++	} else {
++		process.env.OMARCHY_PATH = originalOmarchyPath;
++	}
++	if ( originalStudioOmarchyPackage === undefined ) {
++		delete process.env.STUDIO_OMARCHY_PACKAGE;
++	} else {
++		process.env.STUDIO_OMARCHY_PACKAGE = originalStudioOmarchyPackage;
++	}
+ } );
+ 
+ describe( 'Linux updater', () => {
+@@ -97,6 +111,34 @@ describe( 'Linux updater', () => {
+ 		);
+ 	} );
+ 
++	it( 'routes updates through Omarchy without downloading the DEB', async () => {
++		process.env.OMARCHY_PATH = '/usr/share/omarchy';
++		process.env.STUDIO_OMARCHY_PACKAGE = '1';
++		global.fetch = vi.fn().mockResolvedValue( {
++			status: 200,
++			ok: true,
++			json: async () => ( {
++				version: '1.9.0',
++				downloadUrl: 'https://appscdn.example.com/path/studio_1.9.0_arm64.deb',
++			} ),
++		} as Response );
++		vi.mocked( dialog.showMessageBox ).mockResolvedValue( {
++			response: 0,
++			checkboxChecked: false,
++		} );
++
++		await manualCheckForUpdates();
++
++		await vi.waitFor( () => {
++			expect( clipboard.writeText ).toHaveBeenCalledWith( 'studio-omarchy-update' );
++		} );
++
++		const args = getLastDialogOptions();
++		expect( args.buttons?.[ 0 ] ).toBe( 'Copy update command' );
++		expect( args.detail ).toContain( 'studio-omarchy-update' );
++		expect( shell.openExternal ).not.toHaveBeenCalled();
++	} );
++
+ 	it( 'does not copy to the clipboard or open the browser when the user dismisses the dialog', async () => {
+ 		global.fetch = vi.fn().mockResolvedValue( {
+ 			status: 200,
+diff --git a/apps/studio/src/updates.ts b/apps/studio/src/updates.ts
+index 142b6b7a..bb075f16 100644
+--- a/apps/studio/src/updates.ts
++++ b/apps/studio/src/updates.ts
+@@ -3,6 +3,7 @@ import * as Sentry from '@sentry/electron/main';
+ import { sprintf, __ } from '@wordpress/i18n';
+ import { AUTO_UPDATE_INTERVAL_MS, NIGHTLY_UPDATE_TTL_MS } from 'src/constants';
+ import { sendIpcEventToRenderer, type AppUpdateStatus } from 'src/ipc-utils';
++import { getLinuxUpdateAction, isStudioOmarchyPackage } from 'src/lib/linux-update';
+ import { shellOpenExternalWrapper } from 'src/lib/shell-open-external-wrapper';
+ import { getPreferredStudioUiMode } from 'src/lib/studio-ui-mode';
+ import { isDevRelease } from 'src/lib/version-utils';
+@@ -361,21 +362,29 @@ function rescheduleLinuxOrFinish() {
+ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: string ) {
+ 	const mainWindow = await getMainWindow();
+ 
+-	const command = `sudo apt install ~/Downloads/${ debFilenameFromUrl( downloadUrl ) }`;
+-	const actionDescription = __(
+-		'Clicking the button below will download the new package and copy the install command to your clipboard.'
+-	);
+-	const followUpInstruction = __(
+-		'Once the download finishes, quit Studio, open a terminal, and paste the command to install:'
+-	);
++	const updateAction = getLinuxUpdateAction( debFilenameFromUrl( downloadUrl ) );
++	const isOmarchy = isStudioOmarchyPackage();
++	const actionDescription = isOmarchy
++		? __( 'This Studio package is updated from its native Omarchy release channel.' )
++		: __(
++				'Clicking the button below will download the new package and copy the install command to your clipboard.'
++		  );
++	const followUpInstruction = isOmarchy
++		? __( 'Quit Studio, open a terminal, and paste:' )
++		: __(
++				'Once the download finishes, quit Studio, open a terminal, and paste the command to install:'
++		  );
+ 
+ 	const { response } = await dialog.showMessageBox( mainWindow, {
+ 		type: 'info',
+-		buttons: [ __( 'Download & copy command' ), __( 'Later' ) ],
++		buttons: [
++			isOmarchy ? __( 'Copy update command' ) : __( 'Download & copy command' ),
++			__( 'Later' ),
++		],
+ 		title: __( 'New Version Available' ),
+ 		// translators: %s is the version number, e.g. "1.9.0".
+ 		message: sprintf( __( 'Studio %s is available' ), version ),
+-		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ command }`,
++		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ updateAction.command }`,
+ 		defaultId: 0,
+ 		cancelId: 1,
+ 	} );
+@@ -384,6 +393,11 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
+ 		return;
+ 	}
+ 
++	if ( ! updateAction.shouldDownload ) {
++		clipboard.writeText( updateAction.command );
++		return;
++	}
++
+ 	try {
+ 		const parsedUrl = new URL( downloadUrl );
+ 		if ( ! [ 'http:', 'https:' ].includes( parsedUrl.protocol ) ) {
+@@ -392,7 +406,7 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
+ 			);
+ 			return;
+ 		}
+-		clipboard.writeText( command );
++		clipboard.writeText( updateAction.command );
+ 		void shellOpenExternalWrapper( parsedUrl.toString() );
+ 	} catch {
+ 		Sentry.captureException( new Error( `Malformed downloadUrl: ${ downloadUrl }` ) );
+diff --git a/packages/common/lib/linux-trust-store.ts b/packages/common/lib/linux-trust-store.ts
+index 485387ab..77309501 100644
+--- a/packages/common/lib/linux-trust-store.ts
++++ b/packages/common/lib/linux-trust-store.ts
+@@ -3,13 +3,41 @@ import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+ import { promisify } from 'node:util';
++import {
++	getLinuxDistribution,
++	isArchBasedLinux,
++	type LinuxDistribution,
++} from '@studio/common/lib/linux-distribution';
+ 
+ const execFilePromise = promisify( execFile );
+ 
+ export const LINUX_SYSTEM_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt';
+ export const LINUX_TRUST_STORE_PATH = '/usr/local/share/ca-certificates/studio-ca.crt';
++export const ARCH_LINUX_TRUST_STORE_PATH =
++	'/etc/ca-certificates/trust-source/anchors/studio-ca.crt';
+ export const LINUX_NSS_NICKNAME = 'WordPress Studio CA';
+ 
++export interface LinuxTrustStoreConfig {
++	trustStorePath: string;
++	updateCommand: string;
++}
++
++export function getLinuxTrustStoreConfig(
++	distribution: LinuxDistribution = getLinuxDistribution()
++): LinuxTrustStoreConfig {
++	if ( isArchBasedLinux( distribution ) ) {
++		return {
++			trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
++			updateCommand: 'update-ca-trust extract',
++		};
++	}
++
++	return {
++		trustStorePath: LINUX_TRUST_STORE_PATH,
++		updateCommand: 'update-ca-certificates',
++	};
++}
++
+ export async function isCATrustedOnLinux( caPath: string ): Promise< boolean > {
+ 	try {
+ 		await execFilePromise( 'openssl', [ 'verify', '-CAfile', LINUX_SYSTEM_CA_BUNDLE, caPath ] );
+@@ -37,8 +65,18 @@ export async function isCAImportedInUserNssDbsLinux(
+ 	return true;
+ }
+ 
+-export function buildLinuxTrustInstallCommand( caPath: string ): string {
+-	return `install -m 0644 "${ caPath }" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`;
++function quoteShellArgument( value: string ): string {
++	return `'${ value.replace( /'/g, `'"'"'` ) }'`;
++}
++
++export function buildLinuxTrustInstallCommand(
++	caPath: string,
++	distribution: LinuxDistribution = getLinuxDistribution()
++): string {
++	const { trustStorePath, updateCommand } = getLinuxTrustStoreConfig( distribution );
++	return `install -m 0644 ${ quoteShellArgument( caPath ) } ${ quoteShellArgument(
++		trustStorePath
++	) } && ${ updateCommand }`;
+ }
+ 
+ // Snap-Chromium uses a sandboxed NSS DB under ~/snap/chromium/, separate
+diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/common/lib/tests/linux-trust-store.test.ts
+index c69b9ebd..696a3380 100644
+--- a/packages/common/lib/tests/linux-trust-store.test.ts
++++ b/packages/common/lib/tests/linux-trust-store.test.ts
+@@ -3,9 +3,11 @@ import os from 'node:os';
+ import path from 'node:path';
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import {
++	ARCH_LINUX_TRUST_STORE_PATH,
+ 	buildLinuxTrustInstallCommand,
+ 	getLinuxFirefoxProfileDbDirs,
+ 	getLinuxNssDbCandidates,
++	getLinuxTrustStoreConfig,
+ 	LINUX_NSS_NICKNAME,
+ 	LINUX_SYSTEM_CA_BUNDLE,
+ 	LINUX_TRUST_STORE_PATH,
+@@ -28,19 +30,59 @@ describe( 'linux-trust-store', () => {
+ 
+ 	describe( 'buildLinuxTrustInstallCommand', () => {
+ 		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
+-			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt' );
++			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt', {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
+ 
+ 			expect( command ).toBe(
+-				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
++				`install -m 0644 '/home/u/.studio/certificates/studio-ca.crt' '${ LINUX_TRUST_STORE_PATH }' && update-ca-certificates`
+ 			);
+ 		} );
+ 
+ 		it( 'quotes the source path so home directories with spaces are handled', () => {
+ 			const command = buildLinuxTrustInstallCommand(
+-				'/home/Some User/.studio/certificates/studio-ca.crt'
++				'/home/Some User/.studio/certificates/studio-ca.crt',
++				{ id: 'ubuntu', idLike: [ 'debian' ] }
+ 			);
+ 
+-			expect( command ).toContain( '"/home/Some User/.studio/certificates/studio-ca.crt"' );
++			expect( command ).toContain( "'/home/Some User/.studio/certificates/studio-ca.crt'" );
++		} );
++
++		it( 'escapes single quotes in the source path', () => {
++			const command = buildLinuxTrustInstallCommand( "/home/O'Neil/studio-ca.crt", {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).toContain( "'/home/O'\"'\"'Neil/studio-ca.crt'" );
++		} );
++
++		it( 'uses the Arch trust anchor directory and update command', () => {
++			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt', {
++				id: 'arch',
++				idLike: [],
++			} );
++
++			expect( command ).toBe(
++				`install -m 0644 '/home/u/.studio/certificates/studio-ca.crt' '${ ARCH_LINUX_TRUST_STORE_PATH }' && update-ca-trust extract`
++			);
++		} );
++	} );
++
++	describe( 'getLinuxTrustStoreConfig', () => {
++		it( 'uses Debian defaults for Ubuntu', () => {
++			expect( getLinuxTrustStoreConfig( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toEqual( {
++				trustStorePath: LINUX_TRUST_STORE_PATH,
++				updateCommand: 'update-ca-certificates',
++			} );
++		} );
++
++		it( 'uses p11-kit anchors for Arch derivatives', () => {
++			expect( getLinuxTrustStoreConfig( { id: 'omarchy', idLike: [ 'arch' ] } ) ).toEqual( {
++				trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
++				updateCommand: 'update-ca-trust extract',
++			} );
+ 		} );
+ 	} );
+ 
+diff --git a/apps/studio/src/lib/linux-update.ts b/apps/studio/src/lib/linux-update.ts
+new file mode 100644
+index 00000000..f4d96a90
+--- /dev/null
++++ b/apps/studio/src/lib/linux-update.ts
+@@ -0,0 +1,25 @@
++export interface LinuxUpdateAction {
++	command: string;
++	shouldDownload: boolean;
++}
++
++export function isStudioOmarchyPackage( env: NodeJS.ProcessEnv = process.env ): boolean {
++	return Boolean( env.OMARCHY_PATH ) && env.STUDIO_OMARCHY_PACKAGE === '1';
++}
++
++export function getLinuxUpdateAction(
++	debFilename: string,
++	env: NodeJS.ProcessEnv = process.env
++): LinuxUpdateAction {
++	if ( isStudioOmarchyPackage( env ) ) {
++		return {
++			command: 'studio-omarchy-update',
++			shouldDownload: false,
++		};
++	}
++
++	return {
++		command: `sudo apt install ~/Downloads/${ debFilename }`,
++		shouldDownload: true,
++	};
++}
+diff --git a/apps/studio/src/lib/tests/linux-update.test.ts b/apps/studio/src/lib/tests/linux-update.test.ts
+new file mode 100644
+index 00000000..2d4c95c9
+--- /dev/null
++++ b/apps/studio/src/lib/tests/linux-update.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, it } from 'vitest';
++import { getLinuxUpdateAction, isStudioOmarchyPackage } from 'src/lib/linux-update';
++
++describe( 'linux-update', () => {
++	it( 'detects Omarchy from its session environment', () => {
++		expect(
++			isStudioOmarchyPackage( {
++				OMARCHY_PATH: '/usr/share/omarchy',
++				STUDIO_OMARCHY_PACKAGE: '1',
++			} )
++		).toBe( true );
++		expect( isStudioOmarchyPackage( { OMARCHY_PATH: '/usr/share/omarchy' } ) ).toBe( false );
++		expect( isStudioOmarchyPackage( { STUDIO_OMARCHY_PACKAGE: '1' } ) ).toBe( false );
++	} );
++
++	it( 'routes Omarchy updates through the system update command', () => {
++		expect(
++			getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {
++				OMARCHY_PATH: '/usr/share/omarchy',
++				STUDIO_OMARCHY_PACKAGE: '1',
++			} )
++		).toEqual( {
++			command: 'studio-omarchy-update',
++			shouldDownload: false,
++		} );
++	} );
++
++	it( 'keeps the DEB installation flow on other Linux systems', () => {
++		expect( getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {} ) ).toEqual( {
++			command: 'sudo apt install ~/Downloads/studio-x64-v1.18.0.deb',
++			shouldDownload: true,
++		} );
++	} );
++
++	it( 'does not change the updater for other Studio packages running on Omarchy', () => {
++		expect(
++			getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {
++				OMARCHY_PATH: '/usr/share/omarchy',
++			} )
++		).toEqual( {
++			command: 'sudo apt install ~/Downloads/studio-x64-v1.18.0.deb',
++			shouldDownload: true,
++		} );
++	} );
++} );
+diff --git a/packages/common/lib/linux-distribution.ts b/packages/common/lib/linux-distribution.ts
+new file mode 100644
+index 00000000..7ca83c00
+--- /dev/null
++++ b/packages/common/lib/linux-distribution.ts
+@@ -0,0 +1,46 @@
++import fs from 'node:fs';
++
++export interface LinuxDistribution {
++	id: string;
++	idLike: string[];
++}
++
++function unquoteOsReleaseValue( value: string ): string {
++	const trimmed = value.trim();
++	if (
++		( trimmed.startsWith( '"' ) && trimmed.endsWith( '"' ) ) ||
++		( trimmed.startsWith( "'" ) && trimmed.endsWith( "'" ) )
++	) {
++		return trimmed.slice( 1, -1 );
++	}
++	return trimmed;
++}
++
++export function parseLinuxOsRelease( contents: string ): LinuxDistribution {
++	const fields = new Map< string, string >();
++	for ( const line of contents.split( /\r?\n/ ) ) {
++		const match = line.match( /^([A-Z_]+)=(.*)$/ );
++		if ( match ) {
++			fields.set( match[ 1 ], unquoteOsReleaseValue( match[ 2 ] ) );
++		}
++	}
++
++	return {
++		id: ( fields.get( 'ID' ) ?? '' ).toLowerCase(),
++		idLike: ( fields.get( 'ID_LIKE' ) ?? '' ).toLowerCase().split( /\s+/ ).filter( Boolean ),
++	};
++}
++
++export function getLinuxDistribution(
++	osReleasePath: string = '/etc/os-release'
++): LinuxDistribution {
++	try {
++		return parseLinuxOsRelease( fs.readFileSync( osReleasePath, 'utf8' ) );
++	} catch {
++		return { id: '', idLike: [] };
++	}
++}
++
++export function isArchBasedLinux( distribution: LinuxDistribution = getLinuxDistribution() ) {
++	return [ distribution.id, ...distribution.idLike ].includes( 'arch' );
++}
+diff --git a/packages/common/lib/tests/linux-distribution.test.ts b/packages/common/lib/tests/linux-distribution.test.ts
+new file mode 100644
+index 00000000..9d6e1768
+--- /dev/null
++++ b/packages/common/lib/tests/linux-distribution.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from 'vitest';
++import { isArchBasedLinux, parseLinuxOsRelease } from '@studio/common/lib/linux-distribution';
++
++describe( 'linux-distribution', () => {
++	it( 'parses quoted os-release fields', () => {
++		expect( parseLinuxOsRelease( 'NAME="Arch Linux"\nID=arch\nBUILD_ID=rolling\n' ) ).toEqual( {
++			id: 'arch',
++			idLike: [],
++		} );
++	} );
++
++	it( 'parses ID_LIKE as a normalized list', () => {
++		expect( parseLinuxOsRelease( 'ID=endeavouros\nID_LIKE="Arch linux"\n' ) ).toEqual( {
++			id: 'endeavouros',
++			idLike: [ 'arch', 'linux' ],
++		} );
++	} );
++
++	it( 'identifies Arch and Arch-derived distributions', () => {
++		expect( isArchBasedLinux( { id: 'arch', idLike: [] } ) ).toBe( true );
++		expect( isArchBasedLinux( { id: 'cachyos', idLike: [ 'arch' ] } ) ).toBe( true );
++		expect( isArchBasedLinux( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toBe( false );
++	} );
++} );
+

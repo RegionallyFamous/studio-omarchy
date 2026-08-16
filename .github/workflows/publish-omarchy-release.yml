@@ -1,0 +1,174 @@
+name: Publish upstream Studio release
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream Studio version without the v prefix; empty uses latest stable"
+        required: false
+        type: string
+      force:
+        description: "Rebuild and replace assets for an existing release"
+        default: false
+        required: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: publish-upstream-studio-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INPUT_VERSION: ${{ inputs.version }}
+      FORCE_RELEASE: ${{ inputs.force || false }}
+    steps:
+      - name: Resolve latest stable Studio release
+        id: release
+        run: |
+          set -euo pipefail
+
+          if [[ -n ${INPUT_VERSION:-} ]]; then
+            version=$INPUT_VERSION
+            upstream_tag="v$version"
+            gh api "repos/Automattic/studio/git/ref/tags/$upstream_tag" >/dev/null
+          else
+            upstream_tag=$(gh api repos/Automattic/studio/releases/latest --jq .tag_name)
+            version=${upstream_tag#v}
+          fi
+
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported Studio release version: $version" >&2
+            exit 1
+          fi
+
+          release_tag="omarchy-v$version"
+          should_build=true
+          if [[ $FORCE_RELEASE != true ]] &&
+            gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_build=false
+          fi
+
+          {
+            echo "version=$version"
+            echo "upstream_tag=$upstream_tag"
+            echo "release_tag=$release_tag"
+            echo "should_build=$should_build"
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-package.yml
+    with:
+      version: ${{ needs.detect.outputs.version }}
+
+  tag-source:
+    needs: [detect, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Record package version and tag
+        run: |
+          set -euo pipefail
+          git config user.name 'studio-omarchy-release[bot]'
+          git config user.email 'studio-omarchy-release[bot]@users.noreply.github.com'
+
+          if git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" 2>/dev/null; then
+            exit 0
+          fi
+
+          packaging/arch/set-package-version.sh "$VERSION"
+          if ! git diff --quiet; then
+            git add manifest.json packaging/arch/PKGBUILD
+            git commit -m "Release Studio $VERSION for Omarchy"
+            git push origin HEAD:main
+          fi
+
+          git tag --annotate "$RELEASE_TAG" --message "Studio $VERSION for Omarchy"
+          git push origin "refs/tags/$RELEASE_TAG"
+
+  release:
+    needs: [detect, build, tag-source]
+    if: needs.tag-source.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: wordpress-studio-omarchy-${{ needs.detect.outputs.version }}-x86_64
+          path: release-assets
+
+      - name: Verify and publish release
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            sha256sum --check ./*.sha256
+          )
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --latest \
+              --title "Studio $VERSION for Omarchy" \
+              --notes "Native Omarchy package for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG). Install it through the WordPress Studio Omarchy plugin or with \`sudo pacman -U ./wordpress-studio-omarchy-*.pkg.tar.zst\`."
+          fi
+
+  report-failure:
+    needs: [detect, build]
+    if: always() && needs.detect.outputs.should_build == 'true' && needs.build.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - name: Open a single actionable issue
+        run: |
+          title="Automated Omarchy release failed for Studio $VERSION"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [[ -z $existing ]]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "The automated patch, test, or package build failed. Review [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) before retrying."
+          fi

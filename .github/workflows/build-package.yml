@@ -1,0 +1,121 @@
+name: Build native package
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Upstream Studio version without the v prefix"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: archlinux:base-devel
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Install Arch build and validation dependencies
+        run: >-
+          pacman -Syu --noconfirm
+          actionlint alsa-lib at-spi2-core ca-certificates-utils curl desktop-file-utils git gtk3 jq
+          libcap libdrm libnotify libsecret libxcb libxkbcommon libxss libxtst
+          mesa nss openssl polkit qt6-declarative shellcheck sudo util-linux
+          util-linux-libs wayland xdg-utils
+
+      - name: Checkout Studio for Omarchy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Prepare and validate sources
+        id: source
+        run: |
+          set -euo pipefail
+
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported Studio version: $VERSION" >&2
+            exit 1
+          fi
+
+          packaging/arch/set-package-version.sh "$VERSION"
+          packaging/arch/test-update-script.sh
+          shellcheck packaging/arch/*.sh packaging/arch/studio-launcher \
+            packaging/arch/studio-omarchy-update packaging/arch/studio.install
+          actionlint .github/workflows/*.yml
+
+          omarchy_root="$RUNNER_TEMP/omarchy"
+          git clone --depth 1 --branch quattro https://github.com/basecamp/omarchy.git "$omarchy_root"
+          "$omarchy_root/bin/omarchy-plugin-validate" "$GITHUB_WORKSPACE"
+          /usr/lib/qt6/bin/qmllint -I "$omarchy_root/shell" BarWidget.qml Panel.qml
+
+          studio_root="$RUNNER_TEMP/studio"
+          git clone --depth 1 --branch "v$VERSION" https://github.com/Automattic/studio.git "$studio_root"
+          git -C "$studio_root" apply --check "$GITHUB_WORKSPACE/patches/studio-omarchy.patch"
+          git -C "$studio_root" apply "$GITHUB_WORKSPACE/patches/studio-omarchy.patch"
+
+          actual_version=$(jq -r .version "$studio_root/apps/studio/package.json")
+          if [[ $actual_version != "$VERSION" ]]; then
+            echo "Studio tag v$VERSION contains app version $actual_version." >&2
+            exit 1
+          fi
+
+          {
+            echo "studio_root=$studio_root"
+            echo "node_version=$(<"$studio_root/.nvmrc")"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ steps.source.outputs.node_version }}
+
+      - name: Install Studio dependencies
+        working-directory: ${{ steps.source.outputs.studio_root }}
+        run: npm ci
+
+      - name: Lint, typecheck, and test Studio
+        working-directory: ${{ steps.source.outputs.studio_root }}
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Package Studio
+        working-directory: ${{ steps.source.outputs.studio_root }}
+        run: npm run package
+
+      - name: Build native Arch package
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE" "${{ steps.source.outputs.studio_root }}"
+          # This expression is intentionally expanded by the child shell run as builder.
+          # shellcheck disable=SC2016
+          runuser -u builder -- env \
+            PATH="$PATH" \
+            STUDIO_SOURCE_ROOT="${{ steps.source.outputs.studio_root }}" \
+            bash -c 'cd "$GITHUB_WORKSPACE/packaging/arch" && makepkg --force --cleanbuild --clean'
+
+      - name: Verify and checksum package
+        run: |
+          set -euo pipefail
+          packaging/arch/verify-package.sh
+          package_path=$(find packaging/arch -maxdepth 1 \
+            -name 'wordpress-studio-omarchy-*.pkg.tar.zst' -print -quit)
+          package_dir=$(dirname "$package_path")
+          package_name=$(basename "$package_path")
+          (
+            cd "$package_dir"
+            sha256sum "$package_name" >"$package_name.sha256"
+          )
+
+      - name: Upload native package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wordpress-studio-omarchy-${{ inputs.version }}-x86_64
+          path: |
+            packaging/arch/wordpress-studio-omarchy-*.pkg.tar.zst
+            packaging/arch/wordpress-studio-omarchy-*.pkg.tar.zst.sha256
+          if-no-files-found: error

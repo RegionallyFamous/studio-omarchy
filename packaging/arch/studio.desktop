@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=WordPress Studio
+Comment=Develop WordPress sites locally
+GenericName=Local WordPress Development
+Exec=/usr/bin/studio %U
+Icon=studio
+Type=Application
+StartupNotify=true
+StartupWMClass=Studio
+Categories=Development;WebDevelopment;
+MimeType=x-scheme-handler/wp-studio;
+Keywords=WordPress;Studio;PHP;Web;Development;

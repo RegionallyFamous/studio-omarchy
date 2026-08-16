@@ -1,0 +1,86 @@
+pkgname=wordpress-studio-omarchy
+pkgver=1.18.0
+pkgrel=1
+pkgdesc='WordPress Studio with native Arch Linux and Omarchy integration'
+arch=('x86_64' 'aarch64')
+url='https://github.com/RegionallyFamous/studio-omarchy'
+license=('GPL-2.0-or-later')
+depends=(
+  'alsa-lib'
+  'at-spi2-core'
+  'bash'
+  'ca-certificates-utils'
+  'coreutils'
+  'curl'
+  'desktop-file-utils'
+  'gtk3'
+  'jq'
+  'libcap'
+  'libdrm'
+  'libnotify'
+  'libsecret'
+  'libxcb'
+  'libxkbcommon'
+  'libxss'
+  'libxtst'
+  'mesa'
+  'nss'
+  'openssl'
+  'polkit'
+  'sudo'
+  'util-linux-libs'
+  'wayland'
+  'xdg-utils'
+)
+optdepends=(
+  'gvfs: desktop file-manager integration'
+  'trash-cli: move deleted files to the desktop trash'
+  'xdg-desktop-portal-hyprland: native file dialogs and desktop integration on Hyprland'
+)
+provides=('studio' 'wordpress-studio')
+conflicts=('studio' 'wordpress-studio' 'wordpress-studio-git')
+install=studio.install
+options=('!strip')
+source=('studio-launcher' 'studio-omarchy-update' 'studio.desktop')
+sha256sums=(
+  '089f65c42c8e3af5f6400244f6e3e842de252594fb8456929a1390bd2e140b3f'
+  '3c9bdc35b53dfde0390b3d06ee89084840410766ab7d31b775b9d04d037c0795'
+  '298d452505eba37ad6f5f8352f8fd39aa11824295f57eb92afc6e6edcb6f7f4c'
+)
+
+package() {
+  local electron_arch
+  case "$CARCH" in
+    x86_64) electron_arch='x64' ;;
+    aarch64) electron_arch='arm64' ;;
+    *) error "Unsupported architecture: $CARCH"; return 1 ;;
+  esac
+
+  if [[ -z ${STUDIO_SOURCE_ROOT:-} ]]; then
+    error 'STUDIO_SOURCE_ROOT must point to the patched upstream Studio checkout.'
+    return 1
+  fi
+
+  local repo_root=$STUDIO_SOURCE_ROOT
+  local app_source="$repo_root/apps/studio/out/Studio-linux-$electron_arch"
+
+  if [[ ! -x $app_source/studio ]]; then
+    error "Packaged Studio app not found at $app_source"
+    error "Run packaging/arch/build-omarchy-package.sh from an Arch Linux system first."
+    return 1
+  fi
+
+  install -d "$pkgdir/usr/lib/studio"
+  cp -a "$app_source/." "$pkgdir/usr/lib/studio/"
+  chmod 4755 "$pkgdir/usr/lib/studio/chrome-sandbox"
+
+  install -Dm755 "$srcdir/studio-launcher" "$pkgdir/usr/bin/studio"
+  install -Dm755 "$srcdir/studio-omarchy-update" \
+    "$pkgdir/usr/bin/studio-omarchy-update"
+  install -Dm644 "$srcdir/studio.desktop" \
+    "$pkgdir/usr/share/applications/studio.desktop"
+  install -Dm644 "$app_source/resources/assets/studio-app-icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/studio.png"
+  install -Dm644 "$repo_root/LICENSE.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+}
