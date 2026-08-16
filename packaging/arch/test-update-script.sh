@@ -26,6 +26,7 @@ cat >"$test_root/release.json" <<EOF
 {
   "tag_name": "omarchy-v9.8.7",
   "assets": [
+    {"name": "wordpress-studio-omarchy-9.8.7-1-$package_arch.pkg.tar.zst", "browser_download_url": "https://example.test/obsolete.pkg.tar.zst"},
     {"name": "$package_name", "browser_download_url": "https://example.test/$package_name"},
     {"name": "$checksum_name", "browser_download_url": "https://example.test/$checksum_name"}
   ]
@@ -66,7 +67,8 @@ EOF
 chmod 755 "$test_root/bin/curl" "$test_root/bin/sudo" "$test_root/bin/pacman"
 
 STUDIO_UPDATE_TEST_ROOT="$test_root" \
-  XDG_DOWNLOAD_DIR="$test_root/downloads" \
+  STUDIO_OMARCHY_TEST_NON_ARCH=1 \
+  STUDIO_OMARCHY_DOWNLOAD_DIR="$test_root/downloads" \
   PATH="$test_root/bin:$PATH" \
   "$script_dir/studio-omarchy-update"
 
@@ -74,4 +76,6 @@ test -f "$test_root/downloads/$package_name"
 test -f "$test_root/downloads/$checksum_name"
 grep -qxF "pacman -U --needed $test_root/downloads/$package_name" "$test_root/sudo-command"
 
-echo 'Verified Studio for Omarchy release download, checksum, and pacman handoff.'
+cmp "$script_dir/../../install.sh" "$script_dir/studio-omarchy-update"
+
+echo 'Verified the direct installer download, checksum, pacman handoff, and packaged updater.'

@@ -18,7 +18,7 @@ The package:
 
 ## Manual desktop test checklist
 
-1. Install from the Quattro plugin panel and launch from both the panel and app launcher.
+1. Install with the repository's direct installer and launch from both the app menu and terminal.
 2. Create, stop, restart, and delete a local site.
 3. Open WP Admin and a site preview in Chromium.
 4. Trust a custom-domain certificate and verify it in Chromium and Firefox.

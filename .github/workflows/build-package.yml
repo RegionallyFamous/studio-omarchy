@@ -24,7 +24,7 @@ jobs:
           pacman -Syu --noconfirm
           actionlint alsa-lib at-spi2-core ca-certificates-utils curl desktop-file-utils git gtk3 jq
           libcap libdrm libnotify libsecret libxcb libxkbcommon libxss libxtst
-          mesa nss openssl polkit qt6-declarative shellcheck sudo util-linux
+          mesa nss openssl polkit shellcheck sudo util-linux
           util-linux-libs wayland xdg-utils
 
       - name: Checkout Studio for Omarchy
@@ -42,14 +42,9 @@ jobs:
 
           packaging/arch/set-package-version.sh "$VERSION"
           packaging/arch/test-update-script.sh
-          shellcheck packaging/arch/*.sh packaging/arch/studio-launcher \
+          shellcheck install.sh packaging/arch/*.sh packaging/arch/studio-launcher \
             packaging/arch/studio-omarchy-update packaging/arch/studio.install
           actionlint .github/workflows/*.yml
-
-          omarchy_root="$RUNNER_TEMP/omarchy"
-          git clone --depth 1 --branch quattro https://github.com/basecamp/omarchy.git "$omarchy_root"
-          "$omarchy_root/bin/omarchy-plugin-validate" "$GITHUB_WORKSPACE"
-          /usr/lib/qt6/bin/qmllint -I "$omarchy_root/shell" BarWidget.qml Panel.qml
 
           studio_root="$RUNNER_TEMP/studio"
           git clone --depth 1 --branch "v$VERSION" https://github.com/Automattic/studio.git "$studio_root"

@@ -87,6 +87,7 @@ jobs:
     permissions:
       contents: write
     env:
+      FORCE_RELEASE: ${{ inputs.force || false }}
       RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
@@ -100,19 +101,28 @@ jobs:
           git config user.name 'studio-omarchy-release[bot]'
           git config user.email 'studio-omarchy-release[bot]@users.noreply.github.com'
 
-          if git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" 2>/dev/null; then
+          tag_exists=false
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            tag_exists=true
+          fi
+
+          if [[ $tag_exists == true && $FORCE_RELEASE != true ]]; then
             exit 0
           fi
 
           packaging/arch/set-package-version.sh "$VERSION"
           if ! git diff --quiet; then
-            git add manifest.json packaging/arch/PKGBUILD
+            git add packaging/arch/PKGBUILD
             git commit -m "Release Studio $VERSION for Omarchy"
             git push origin HEAD:main
           fi
 
-          git tag --annotate "$RELEASE_TAG" --message "Studio $VERSION for Omarchy"
-          git push origin "refs/tags/$RELEASE_TAG"
+          git tag --force --annotate "$RELEASE_TAG" --message "Studio $VERSION for Omarchy"
+          if [[ $tag_exists == true ]]; then
+            git push --force origin "refs/tags/$RELEASE_TAG"
+          else
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
 
   release:
     needs: [detect, build, tag-source]
@@ -135,6 +145,8 @@ jobs:
       - name: Verify and publish release
         run: |
           set -euo pipefail
+          release_notes="Native Omarchy package for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG). Use the repository's direct installer or install the downloaded package with \`sudo pacman -U ./wordpress-studio-omarchy-*.pkg.tar.zst\`."
+
           (
             cd release-assets
             sha256sum --check ./*.sha256
@@ -143,13 +155,27 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release-assets/* \
               --repo "$GITHUB_REPOSITORY" --clobber
+
+            while read -r asset_name; do
+              if [[ ! -e release-assets/$asset_name ]]; then
+                gh release delete-asset "$RELEASE_TAG" "$asset_name" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+              fi
+            done < <(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name | select(startswith("wordpress-studio-omarchy-"))')
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --latest \
+              --title "Studio $VERSION for Omarchy" \
+              --notes "$release_notes"
           else
             gh release create "$RELEASE_TAG" release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --latest \
               --title "Studio $VERSION for Omarchy" \
-              --notes "Native Omarchy package for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG). Install it through the WordPress Studio Omarchy plugin or with \`sudo pacman -U ./wordpress-studio-omarchy-*.pkg.tar.zst\`."
+              --notes "$release_notes"
           fi
 
   report-failure:

@@ -1,33 +1,51 @@
 # WordPress Studio for Omarchy
 
 A native Omarchy/Arch package of
-[Automattic's WordPress Studio](https://github.com/Automattic/studio), plus a Quattro bar plugin for
-installing, updating, launching, and removing it.
+[Automattic's WordPress Studio](https://github.com/Automattic/studio), with direct installation and
+automated releases for each compatible upstream version.
 
 This is a community port maintained by Regionally Famous. It is not an Automattic or Basecamp
 release.
 
-## Install from Omarchy Plugins
+## Install
+
+On an x86_64 Omarchy system, download and run the installer:
 
 ```bash
-omarchy plugin add https://github.com/RegionallyFamous/studio-omarchy.git --enable
+curl -fsSLo /tmp/install-studio-omarchy \
+  https://raw.githubusercontent.com/RegionallyFamous/studio-omarchy/main/install.sh
+bash /tmp/install-studio-omarchy
 ```
 
-Add the **WordPress Studio** widget to the Omarchy bar if it is not placed automatically. Open the
-widget and select **Install Studio**. The installer downloads the latest native package and its
-SHA-256 checksum from this repository's GitHub release, verifies it, and asks pacman to install it.
+The installer discovers the latest package from this repository's
+[GitHub Releases](https://github.com/RegionallyFamous/studio-omarchy/releases), downloads the package
+and its SHA-256 checksum into a temporary directory, verifies it, and asks `pacman` to install it.
+Only `pacman` runs with `sudo`.
 
-The plugin itself runs as your user. Pacman is the only privileged boundary, and Omarchy's normal
-polkit/sudo prompt handles it in a visible terminal.
-
-## Direct package installation
-
-Download the current `.pkg.tar.zst` and `.sha256` files from
-[Releases](https://github.com/RegionallyFamous/studio-omarchy/releases), verify the checksum, then:
+Launch **WordPress Studio** from the Omarchy app menu or run:
 
 ```bash
-sudo pacman -U ./wordpress-studio-omarchy-*.pkg.tar.zst
+studio
 ```
+
+## Update
+
+The package installs its own checksum-verifying updater:
+
+```bash
+studio-omarchy-update
+```
+
+You can also rerun the installation command. Both paths install only a newer package unless you
+explicitly confirm otherwise through `pacman`.
+
+## Remove
+
+```bash
+sudo pacman -Rns wordpress-studio-omarchy
+```
+
+Uninstalling also removes Studio's certificate authority anchor from the Arch trust store.
 
 ## What the port changes
 
@@ -58,14 +76,5 @@ sudo pacman -U ./packaging/arch/wordpress-studio-omarchy-*.pkg.tar.zst
 
 See [packaging/arch/README.md](packaging/arch/README.md) for package internals and the manual desktop
 test checklist.
-
-## Remove
-
-Remove the application from the plugin panel or run:
-
-```bash
-sudo pacman -Rns wordpress-studio-omarchy
-omarchy plugin remove io.github.regionallyfamous.studio
-```
 
 WordPress Studio is GPL-2.0-or-later. See [LICENSE.md](LICENSE.md).
