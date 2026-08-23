@@ -27,6 +27,7 @@ fi
   fail "No safe Studio for Omarchy package found at $package_path"
 
 archive_listing=$(bsdtar -tf "$package_path") || fail 'Package archive is unreadable.'
+archive_details=$(LC_ALL=C bsdtar -tvf "$package_path") || fail 'Package archive modes are unreadable.'
 if awk '$0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ { found=1 } END { exit found ? 0 : 1 }' \
   <<<"$archive_listing"; then
   fail 'Package contains an unsafe absolute or parent-traversal path.'
@@ -79,7 +80,6 @@ bsdtar -xpf "$package_path" -C "$verification_root" -- \
   usr/bin/studio \
   usr/bin/studio-omarchy-cleanup-user-trust \
   usr/bin/studio-omarchy-update \
-  usr/lib/studio/chrome-sandbox \
   usr/lib/studio/resources/app.asar \
   usr/lib/studio/resources/bin/node \
   usr/lib/studio/resources/bin/studio-cli.sh \
@@ -101,11 +101,25 @@ verify_mode() {
     fail "Packaged $relative_path must have mode $expected_mode, not $actual_mode."
 }
 
+verify_archive_mode() {
+  local relative_path=$1 expected_mode=$2
+  local archive_mode
+
+  archive_mode=$(
+    awk -v path="$relative_path" '
+      $NF == path { count++; mode=$1 }
+      END { if (count != 1) exit 1; print mode }
+    ' <<<"$archive_details"
+  ) || fail "Package must contain one mode record for $relative_path."
+  [[ $archive_mode == "$expected_mode" ]] ||
+    fail "Packaged $relative_path must have archived mode $expected_mode, not $archive_mode."
+}
+
 verify_mode '.INSTALL' '644'
 verify_mode 'usr/bin/studio' '755'
 verify_mode 'usr/bin/studio-omarchy-cleanup-user-trust' '755'
 verify_mode 'usr/bin/studio-omarchy-update' '755'
-verify_mode 'usr/lib/studio/chrome-sandbox' '4755'
+verify_archive_mode 'usr/lib/studio/chrome-sandbox' '-rwsr-xr-x'
 verify_mode 'usr/lib/studio/resources/app.asar' '644'
 verify_mode 'usr/lib/studio/resources/bin/node' '755'
 verify_mode 'usr/lib/studio/resources/bin/studio-cli.sh' '755'
@@ -133,7 +147,7 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$verification_root/usr/share/applications/studio.desktop"
 fi
 
-LC_ALL=C bsdtar -tvf "$package_path" | awk '
+awk '
   {
     mode=$1
     path=$NF
@@ -149,6 +163,6 @@ LC_ALL=C bsdtar -tvf "$package_path" | awk '
     }
   }
   END { exit bad ? 1 : 0 }
-' || fail 'Package contains unsafe file modes.'
+' <<<"$archive_details" || fail 'Package contains unsafe file modes.'
 
 echo "Verified package metadata, structure, bytes, and modes: $package_path"
