@@ -1,19 +1,17 @@
 # Native package
 
-The package recipe preserves Studio's bundled Electron, Node, PHP, and WordPress Playground
-runtimes. It does not replace them with rolling system versions.
+The package recipe preserves Studio's bundled Electron, Node, PHP, and WordPress Playground runtimes. It does not replace them with rolling system versions.
 
-`build-omarchy-package.sh` checks out the Studio release matching `pkgver`, applies
-`patches/studio-omarchy.patch`, builds the application, creates the pacman package, and verifies its
-contents.
+`build-omarchy-package.sh` checks out the Studio release matching `pkgver`, applies `patches/studio-omarchy.patch`, builds the application, creates the pacman package, and verifies its contents.
 
 The package:
 
 - registers the application and `wp-studio://` URL handler;
 - launches Electron with Omarchy's native Wayland flags;
 - uses Arch's p11-kit trust store and certificate tooling;
-- grants the bundled Node runtime access to privileged local ports;
-- installs `studio-omarchy-update` for checksum-verified updates from GitHub Releases; and
+- attempts to grant the bundled Node runtime access to privileged local ports and warns visibly if the filesystem refuses the capability;
+- installs `studio-omarchy-update` for checksum-verified updates from GitHub Releases;
+- installs `studio-omarchy-cleanup-user-trust` for bounded, fingerprint-matched current-user browser trust removal; and
 - removes Studio's Arch trust anchor when uninstalled.
 
 ## Manual desktop test checklist
