@@ -1,0 +1,13 @@
+# Security model
+
+The Quattro plugin runs inside the shared, long-lived `omarchy-shell` process. Its QML therefore admits only the shaped output of `scripts/status.sh`: one of `missing`, `error`, or `installed<TAB><version>`. The helper caps raw `pacman` output at 96 bytes before parsing, caps the version field at 64 ASCII characters, applies a three-second outer deadline, and never returns partial package data. It holds the worker behind a fail-closed start gate until a dedicated process group is verified. Normal cancellation sends TERM to that verified group, waits one second, sends KILL to survivors, and reaps the direct child. If the controller itself is killed, a built-in-read watchdog inside the detached group kills that entire group at the deadline, making every descendant non-runnable without depending on the controller.
+
+Install, update, launch, and removal are detached from `omarchy-shell` immediately. Omarchy's session manager owns the launched application or visible terminal. The plugin has no background service, watcher, network process, open file, or privileged QML process.
+
+The installer caps the GitHub release response at 256 KiB before `jq` parses it and rejects more than 64 assets. It accepts only an `omarchy-v<semver>` tag and a fixed package filename shape. Download URLs are constructed from the fixed RegionallyFamous repository rather than accepted from the response. The checksum file is capped at 512 bytes and must name the selected package exactly. Package downloads are capped at 2 GiB. Every request is HTTPS-only and has both connection and wall-clock deadlines.
+
+Production downloads use a fresh private temporary directory. The test-only explicit download path must be an absolute, writable directory and cannot be a symlink or special file. Existing partial files are rejected before curl can open them.
+
+Package installation and removal happen in Omarchy's visible terminal. `sudo` is never started by QML, never receives a password programmatically, and is scoped to the local `pacman` transaction. Studio itself always runs as the desktop user. The package grants only `cap_net_bind_service` to Studio's bundled Node runtime so local sites can use ports 80 and 443; it does not grant that capability to Electron or the Studio process broadly.
+
+Automated regressions cover the exact and one-over byte ceilings, the exact and one-over asset count, multibyte status input, malformed metadata, failed child processes, controller TERM and SIGKILL containment, checksum mismatch and malformed checksum structure, symlink and FIFO path rejection, and the absence of partial data returned to QML.

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.regionallyfamous.studio",
+  "name": "WordPress Studio",
+  "version": "1.18.0",
+  "author": "RegionallyFamous",
+  "license": "GPL-2.0-or-later",
+  "description": "Install, update, launch, and remove the native Omarchy build of WordPress Studio from a keyboard-friendly Quattro panel with visible package verification and native Wayland integration.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "WordPress Studio",
+    "description": "Manage and launch WordPress Studio",
+    "category": "Development",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

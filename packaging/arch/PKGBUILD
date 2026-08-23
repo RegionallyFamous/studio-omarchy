@@ -1,6 +1,6 @@
 pkgname=wordpress-studio-omarchy
 pkgver=1.18.0
-pkgrel=2
+pkgrel=3
 pkgdesc='WordPress Studio with native Arch Linux and Omarchy integration'
 arch=('x86_64' 'aarch64')
 url='https://github.com/RegionallyFamous/studio-omarchy'
@@ -44,7 +44,7 @@ options=('!strip')
 source=('studio-launcher' 'studio-omarchy-update' 'studio.desktop')
 sha256sums=(
   '089f65c42c8e3af5f6400244f6e3e842de252594fb8456929a1390bd2e140b3f'
-  '513b07090b9cc028547f9de98c1754548fe263e795211a0b5ad7f4bc96a9430e'
+  '11a7f64342121964053e1587709a321cd1a29b00d776a55879df80ecb471902a'
   '298d452505eba37ad6f5f8352f8fd39aa11824295f57eb92afc6e6edcb6f7f4c'
 )
 
@@ -72,6 +72,7 @@ package() {
 
   install -d "$pkgdir/usr/lib/studio"
   cp -a "$app_source/." "$pkgdir/usr/lib/studio/"
+  chmod -R a+rX "$pkgdir/usr/lib/studio"
   chmod 4755 "$pkgdir/usr/lib/studio/chrome-sandbox"
 
   install -Dm755 "$srcdir/studio-launcher" "$pkgdir/usr/bin/studio"

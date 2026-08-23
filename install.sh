@@ -4,69 +4,152 @@ set -euo pipefail
 
 readonly github_repo='RegionallyFamous/studio-omarchy'
 readonly releases_api="https://api.github.com/repos/$github_repo/releases/latest"
+readonly release_json_max_bytes=262144
+readonly checksum_max_bytes=512
+package_max_bytes=2147483648
+test_mode=false
 
-if [[ ! -f /etc/arch-release && ${STUDIO_OMARCHY_TEST_NON_ARCH:-0} != 1 ]]; then
-  echo 'WordPress Studio for Omarchy requires Omarchy or Arch Linux.' >&2
+fail() {
+  echo "WordPress Studio installation failed: $*" >&2
   exit 1
+}
+
+if [[ ! -f /etc/arch-release ]]; then
+  [[ ${STUDIO_OMARCHY_TEST_NON_ARCH:-0} == 1 ]] ||
+    fail 'WordPress Studio for Omarchy requires Omarchy or Arch Linux'
+  test_mode=true
 fi
 
-for command_name in curl jq sha256sum sudo pacman; do
-  if ! command -v "$command_name" >/dev/null 2>&1; then
-    echo "WordPress Studio installation requires $command_name." >&2
-    exit 1
-  fi
+if [[ $test_mode == true && -n ${STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES:-} ]]; then
+  [[ $STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES =~ ^[1-9][0-9]*$ ]] ||
+    fail 'invalid test package byte budget'
+  package_max_bytes=$STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES
+fi
+
+download_bounded() {
+  local url="$1"
+  local output="$2"
+  local max_bytes="$3"
+  local max_seconds="$4"
+  local partial="$output.part"
+  local outer_seconds=$((max_seconds + 10))
+  local size
+
+  [[ $url == https://* ]] || fail "refusing a non-HTTPS download"
+  [[ ! -e $partial && ! -L $partial ]] || fail "refusing an existing partial download: $partial"
+
+  timeout --signal=TERM --kill-after=5s "${outer_seconds}s" \
+    curl --fail --show-error --location \
+      --proto '=https' \
+      --proto-redir '=https' \
+      --connect-timeout 10 \
+      --max-time "$max_seconds" \
+      --max-filesize "$max_bytes" \
+      --output "$partial" \
+      "$url"
+
+  [[ -f $partial && ! -L $partial ]] || fail "download did not produce a regular file"
+  size=$(wc -c <"$partial")
+  (( size > 0 && size <= max_bytes )) || fail "download exceeded its byte budget"
+  mv -- "$partial" "$output"
+}
+
+for command_name in curl jq pacman realpath sha256sum sudo timeout; do
+  command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 
 case $(uname -m) in
   x86_64) package_arch='x86_64' ;;
   aarch64 | arm64) package_arch='aarch64' ;;
-  *)
-    echo "Unsupported architecture: $(uname -m)" >&2
-    exit 1
-    ;;
+  *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 
-release_json=$(curl --fail --silent --show-error --location \
-  --header 'Accept: application/vnd.github+json' \
-  "$releases_api")
+if [[ $test_mode == true && -n ${STUDIO_OMARCHY_DOWNLOAD_DIR:-} ]]; then
+  [[ $STUDIO_OMARCHY_DOWNLOAD_DIR == /* ]] || fail 'the download directory must be absolute'
+  if [[ -e $STUDIO_OMARCHY_DOWNLOAD_DIR || -L $STUDIO_OMARCHY_DOWNLOAD_DIR ]]; then
+    [[ -d $STUDIO_OMARCHY_DOWNLOAD_DIR && ! -L $STUDIO_OMARCHY_DOWNLOAD_DIR ]] ||
+      fail 'the download directory must be a real directory, not a link or special file'
+  else
+    mkdir -p -- "$STUDIO_OMARCHY_DOWNLOAD_DIR"
+    chmod 700 "$STUDIO_OMARCHY_DOWNLOAD_DIR"
+  fi
+  download_dir=$(realpath -- "$STUDIO_OMARCHY_DOWNLOAD_DIR")
+else
+  download_dir=$(mktemp -d)
+  trap 'rm -rf -- "$download_dir"' EXIT
+fi
 
-release_tag=$(jq -er '.tag_name | select(startswith("omarchy-v"))' <<<"$release_json")
+[[ -d $download_dir && ! -L $download_dir && -w $download_dir ]] ||
+  fail 'the download directory is not a writable regular directory'
+
+release_file="$download_dir/release.json"
+download_bounded "$releases_api" "$release_file" "$release_json_max_bytes" 30
+
+asset_count=$(jq -er 'select((.assets | type) == "array") | .assets | length' "$release_file") ||
+  fail 'the GitHub release response has no asset list'
+(( asset_count > 0 && asset_count <= 64 )) || fail 'the GitHub release asset count is outside the safety budget'
+
+release_tag=$(jq -er '.tag_name | select(type == "string")' "$release_file") ||
+  fail 'the GitHub release has no tag'
+[[ $release_tag =~ ^omarchy-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'the release tag is not an Omarchy Studio version'
 version=${release_tag#omarchy-v}
+
 package_name=$(jq -er \
   --arg prefix "wordpress-studio-omarchy-$version-" \
   --arg suffix "-$package_arch.pkg.tar.zst" \
   '[
     .assets[].name
+    | select(type == "string")
     | select(startswith($prefix) and endswith($suffix))
     | { name: ., pkgrel: (ltrimstr($prefix) | rtrimstr($suffix) | tonumber) }
-  ] | max_by(.pkgrel).name' <<<"$release_json")
+  ] | select(length > 0) | max_by(.pkgrel).name' "$release_file") ||
+  fail "the release has no package for $package_arch"
+
+[[ $package_name =~ ^wordpress-studio-omarchy-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-(x86_64|aarch64)\.pkg\.tar\.zst$ ]] ||
+  fail 'the selected package name is unsafe'
 checksum_name="$package_name.sha256"
 
-asset_url=$(jq -er --arg name "$package_name" \
-  '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json")
-checksum_url=$(jq -er --arg name "$checksum_name" \
-  '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json")
+jq -e --arg package "$package_name" --arg checksum "$checksum_name" '
+  ([.assets[] | select(.name == $package)] | length) == 1 and
+  ([.assets[] | select(.name == $checksum)] | length) == 1
+' "$release_file" >/dev/null || fail 'the release must contain exactly one package and checksum pair'
 
-if [[ -n ${STUDIO_OMARCHY_DOWNLOAD_DIR:-} ]]; then
-  download_dir=$STUDIO_OMARCHY_DOWNLOAD_DIR
-  mkdir -p "$download_dir"
-else
-  download_dir=$(mktemp -d)
-  trap 'rm -rf "$download_dir"' EXIT
-fi
-
+release_url="https://github.com/$github_repo/releases/download/$release_tag"
 package_path="$download_dir/$package_name"
 checksum_path="$download_dir/$checksum_name"
 
 echo "Downloading WordPress Studio $version for Omarchy..."
-curl --fail --show-error --location --output "$package_path.part" "$asset_url"
-mv -f "$package_path.part" "$package_path"
-curl --fail --show-error --location --output "$checksum_path" "$checksum_url"
+download_bounded "$release_url/$package_name" "$package_path" "$package_max_bytes" 1800
+download_bounded "$release_url/$checksum_name" "$checksum_path" "$checksum_max_bytes" 30
 
-(
-  cd "$download_dir"
-  sha256sum --check "$checksum_name"
-)
+checksum_bytes=$(wc -c <"$checksum_path")
+(( checksum_bytes > 0 && checksum_bytes <= checksum_max_bytes )) || fail 'the checksum file is outside its byte budget'
+IFS=' ' read -r expected_hash expected_name extra <"$checksum_path" || true
+[[ ${expected_hash:-} =~ ^[0-9a-f]{64}$ && ${expected_name:-} == "$package_name" && -z ${extra:-} ]] ||
+  fail 'the checksum file has an unexpected format or filename'
 
-sudo pacman -U --needed "$package_path"
+actual_hash=$(sha256sum "$package_path" | cut -d ' ' -f 1)
+[[ $actual_hash == "$expected_hash" ]] || fail 'the package checksum does not match'
+printf '%s: OK\n' "$package_name"
+
+sudo pacman -U --needed --noconfirm -- "$package_path"
+
+if [[ $test_mode == false ]]; then
+  studio_root='/usr/lib/studio'
+  studio_binary="$studio_root/studio"
+  studio_sandbox="$studio_root/chrome-sandbox"
+
+  [[ -d $studio_root && ! -L $studio_root ]] || fail 'the installed Studio directory is unsafe'
+  if [[ ! -x $studio_root ]]; then
+    sudo chmod 755 -- "$studio_root"
+  fi
+  [[ -f $studio_binary && ! -L $studio_binary ]] || fail 'the installed Studio executable is unsafe'
+  [[ -f $studio_sandbox && ! -L $studio_sandbox ]] || fail 'the installed Studio sandbox is unsafe'
+
+  if [[ ! -r $studio_binary || ! -x $studio_binary || ! -r $studio_sandbox ]]; then
+    sudo chmod -R a+rX -- "$studio_root"
+  fi
+  sudo chmod 4755 -- "$studio_sandbox"
+fi
+
 echo "WordPress Studio $version is installed. Launch it from the app menu or run: studio"
