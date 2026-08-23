@@ -19,8 +19,9 @@ case $action in
     exec uwsm-app -- /usr/bin/studio
     ;;
   remove)
+    cleanup_user_trust=$(shell_quote "$repo_root/scripts/cleanup-user-trust.sh")
     exec omarchy-launch-floating-terminal-with-presentation \
-      "omarchy-pkg-drop wordpress-studio-omarchy"
+      "$cleanup_user_trust && omarchy-pkg-drop wordpress-studio-omarchy"
     ;;
   *)
     echo 'Usage: action.sh update|launch|remove' >&2

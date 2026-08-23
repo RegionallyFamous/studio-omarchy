@@ -2,7 +2,7 @@ pkgname=wordpress-studio-omarchy
 pkgver=1.18.0
 pkgrel=3
 pkgdesc='WordPress Studio with native Arch Linux and Omarchy integration'
-arch=('x86_64' 'aarch64')
+arch=('x86_64')
 url='https://github.com/RegionallyFamous/studio-omarchy'
 license=('GPL-2.0-or-later')
 depends=(
@@ -13,6 +13,7 @@ depends=(
   'coreutils'
   'curl'
   'desktop-file-utils'
+  'findutils'
   'gtk3'
   'jq'
   'libcap'
@@ -41,20 +42,24 @@ provides=('studio' 'wordpress-studio')
 conflicts=('studio' 'wordpress-studio' 'wordpress-studio-git')
 install=studio.install
 options=('!strip')
-source=('studio-launcher' 'studio-omarchy-update' 'studio.desktop')
+source=(
+  'studio-launcher'
+  'studio-omarchy-update'
+  'studio.desktop'
+  'cleanup-user-trust.sh'
+)
 sha256sums=(
   '089f65c42c8e3af5f6400244f6e3e842de252594fb8456929a1390bd2e140b3f'
-  '11a7f64342121964053e1587709a321cd1a29b00d776a55879df80ecb471902a'
+  'aaa48abd0f8f3af840a92960fbc065c4306903d3348fdbc756021d9a732d8514'
   '298d452505eba37ad6f5f8352f8fd39aa11824295f57eb92afc6e6edcb6f7f4c'
+  'b2ec6aa05c213736ca2f9d1d7360016b0fe20aeaae4fea0692ccf83dc6eb3022'
 )
 
 package() {
-  local electron_arch
-  case "$CARCH" in
-    x86_64) electron_arch='x64' ;;
-    aarch64) electron_arch='arm64' ;;
-    *) error "Unsupported architecture: $CARCH"; return 1 ;;
-  esac
+  [[ $CARCH == "x86_64" ]] || {
+    error "Unsupported architecture: $CARCH"
+    return 1
+  }
 
   if [[ -z ${STUDIO_SOURCE_ROOT:-} ]]; then
     error 'STUDIO_SOURCE_ROOT must point to the patched upstream Studio checkout.'
@@ -62,7 +67,7 @@ package() {
   fi
 
   local repo_root=$STUDIO_SOURCE_ROOT
-  local app_source="$repo_root/apps/studio/out/Studio-linux-$electron_arch"
+  local app_source="$repo_root/apps/studio/out/Studio-linux-x64"
 
   if [[ ! -x $app_source/studio ]]; then
     error "Packaged Studio app not found at $app_source"
@@ -78,6 +83,8 @@ package() {
   install -Dm755 "$srcdir/studio-launcher" "$pkgdir/usr/bin/studio"
   install -Dm755 "$srcdir/studio-omarchy-update" \
     "$pkgdir/usr/bin/studio-omarchy-update"
+  install -Dm755 "$srcdir/cleanup-user-trust.sh" \
+    "$pkgdir/usr/bin/studio-omarchy-cleanup-user-trust"
   install -Dm644 "$srcdir/studio.desktop" \
     "$pkgdir/usr/share/applications/studio.desktop"
   install -Dm644 "$app_source/resources/assets/studio-app-icon.png" \

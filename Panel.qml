@@ -12,6 +12,7 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
   property bool statusReady: false
+  property bool statusError: false
   property bool installed: false
   property string installedVersion: ""
   property int actionIndex: 0
@@ -28,19 +29,29 @@ Panel {
   function applyStatus(raw) {
     var value = String(raw || "").trim()
     statusReady = true
+    statusError = true
     installed = false
     installedVersion = ""
 
+    if (value === "missing") {
+      statusError = false
+      return
+    }
     if (value.length > 96) return
     var match = /^installed\t([A-Za-z0-9._+:-]{1,64})$/.exec(value)
     if (!match) return
 
+    statusError = false
     installed = true
     installedVersion = match[1]
   }
 
   function open() {
     actionIndex = 0
+    statusReady = false
+    statusError = false
+    installed = false
+    installedVersion = ""
     root.controller.show()
     refreshStatus()
   }
@@ -137,6 +148,7 @@ Panel {
 
           Text {
             text: "\uf19a"
+            textFormat: Text.PlainText
             color: root.barForeground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
@@ -150,6 +162,7 @@ Panel {
             Text {
               width: parent.width
               text: "WordPress Studio"
+              textFormat: Text.PlainText
               color: root.barForeground
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.subtitle
@@ -158,9 +171,14 @@ Panel {
 
             Text {
               width: parent.width
-              text: root.installed
-                ? "Installed " + root.installedVersion + " · Native Wayland"
-                : (root.statusReady ? "Not installed" : "Checking installation…")
+              text: !root.statusReady
+                ? "Checking installation…"
+                : (root.statusError
+                  ? "Unable to check installation"
+                  : (root.installed
+                    ? "Installed " + root.installedVersion + " · Native Wayland"
+                    : "Not installed"))
+              textFormat: Text.PlainText
               color: root.barForeground
               opacity: 0.82
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -175,7 +193,9 @@ Panel {
           width: parent.width
           bordered: true
           hasCursor: root.actionIndex === 0
-          text: root.installed ? "Update Studio" : "Install Studio"
+          text: root.installed
+            ? "Update Studio"
+            : (root.statusError ? "Install or Update Studio" : "Install Studio")
           onHovered: function(isHovered) {
             if (isHovered) root.actionIndex = 0
           }
@@ -209,6 +229,7 @@ Panel {
         Text {
           width: parent.width
           text: "↑/↓ choose · Enter run · Esc close"
+          textFormat: Text.PlainText
           color: Qt.darker(root.barForeground, 1.45)
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption

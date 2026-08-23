@@ -14,13 +14,19 @@ fail() {
   exit 1
 }
 
-if [[ ! -f /etc/arch-release ]]; then
-  [[ ${STUDIO_OMARCHY_TEST_NON_ARCH:-0} == 1 ]] ||
-    fail 'WordPress Studio for Omarchy requires Omarchy or Arch Linux'
+test_mode_request=${STUDIO_OMARCHY_TEST_MODE:-0}
+[[ $test_mode_request == 0 || $test_mode_request == 1 ]] ||
+  fail 'invalid test mode request'
+
+if [[ $test_mode_request == 1 ]]; then
+  [[ -n ${STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES:-} && -n ${STUDIO_OMARCHY_DOWNLOAD_DIR:-} ]] ||
+    fail 'test mode requires an isolated download directory and package byte budget'
   test_mode=true
+elif [[ ! -f /etc/arch-release ]]; then
+  fail 'WordPress Studio for Omarchy requires Omarchy or Arch Linux'
 fi
 
-if [[ $test_mode == true && -n ${STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES:-} ]]; then
+if [[ $test_mode == true ]]; then
   [[ $STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES =~ ^[1-9][0-9]*$ ]] ||
     fail 'invalid test package byte budget'
   package_max_bytes=$STUDIO_OMARCHY_TEST_PACKAGE_MAX_BYTES
@@ -58,13 +64,12 @@ for command_name in curl jq pacman realpath sha256sum sudo timeout; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 
-case $(uname -m) in
-  x86_64) package_arch='x86_64' ;;
-  aarch64 | arm64) package_arch='aarch64' ;;
-  *) fail "unsupported architecture: $(uname -m)" ;;
-esac
+machine_arch=$(uname -m)
+[[ $machine_arch == "x86_64" ]] ||
+  fail "unsupported architecture: $machine_arch; WordPress Studio for Omarchy releases are currently available only for x86_64"
+package_arch='x86_64'
 
-if [[ $test_mode == true && -n ${STUDIO_OMARCHY_DOWNLOAD_DIR:-} ]]; then
+if [[ $test_mode == true ]]; then
   [[ $STUDIO_OMARCHY_DOWNLOAD_DIR == /* ]] || fail 'the download directory must be absolute'
   if [[ -e $STUDIO_OMARCHY_DOWNLOAD_DIR || -L $STUDIO_OMARCHY_DOWNLOAD_DIR ]]; then
     [[ -d $STUDIO_OMARCHY_DOWNLOAD_DIR && ! -L $STUDIO_OMARCHY_DOWNLOAD_DIR ]] ||
@@ -105,7 +110,7 @@ package_name=$(jq -er \
   ] | select(length > 0) | max_by(.pkgrel).name' "$release_file") ||
   fail "the release has no package for $package_arch"
 
-[[ $package_name =~ ^wordpress-studio-omarchy-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-(x86_64|aarch64)\.pkg\.tar\.zst$ ]] ||
+[[ $package_name =~ ^wordpress-studio-omarchy-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-x86_64\.pkg\.tar\.zst$ ]] ||
   fail 'the selected package name is unsafe'
 checksum_name="$package_name.sha256"
 

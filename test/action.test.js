@@ -50,7 +50,10 @@ test('launches the fixed Studio executable under the graphical session manager',
 test('removes only the fixed Studio package through the Omarchy package helper', () => {
   const { result, log } = runAction('remove')
   assert.equal(result.status, 0, result.stderr)
-  assert.equal(log, 'omarchy-pkg-drop wordpress-studio-omarchy')
+  assert.equal(
+    log,
+    `'${path.join(root, 'scripts', 'cleanup-user-trust.sh')}' && omarchy-pkg-drop wordpress-studio-omarchy`
+  )
 })
 
 test('rejects unknown actions before spawning anything', () => {
