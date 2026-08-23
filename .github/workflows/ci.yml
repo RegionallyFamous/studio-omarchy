@@ -14,13 +14,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       value: ${{ steps.version.outputs.value }}
+      upstream_commit: ${{ steps.version.outputs.upstream_commit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - id: version
-        run: echo "value=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)" >>"$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)" >>"$GITHUB_OUTPUT"
+          echo "upstream_commit=$(<packaging/arch/upstream-commit)" >>"$GITHUB_OUTPUT"
 
   build:
     needs: version
     uses: ./.github/workflows/build-package.yml
     with:
       version: ${{ needs.version.outputs.value }}
+      upstream_commit: ${{ needs.version.outputs.upstream_commit }}

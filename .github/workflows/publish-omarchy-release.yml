@@ -9,11 +9,6 @@ on:
         description: "Upstream Studio version without the v prefix; empty uses latest stable"
         required: false
         type: string
-      force:
-        description: "Rebuild and replace assets for an existing release"
-        default: false
-        required: false
-        type: boolean
 
 permissions: {}
 
@@ -29,18 +24,31 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.release.outputs.version }}
+      pkgrel: ${{ steps.release.outputs.pkgrel }}
       upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      upstream_commit: ${{ steps.release.outputs.upstream_commit }}
       release_tag: ${{ steps.release.outputs.release_tag }}
+      package_name: ${{ steps.release.outputs.package_name }}
+      checksum_name: ${{ steps.release.outputs.checksum_name }}
+      release_exists: ${{ steps.release.outputs.release_exists }}
       should_build: ${{ steps.release.outputs.should_build }}
     env:
       GH_TOKEN: ${{ github.token }}
       INPUT_VERSION: ${{ inputs.version }}
-      FORCE_RELEASE: ${{ inputs.force || false }}
     steps:
-      - name: Resolve latest stable Studio release
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve latest stable Studio release and package revision
         id: release
         run: |
           set -euo pipefail
+
+          if [[ $GITHUB_REF != "refs/heads/main" ]]; then
+            echo 'Studio packages may be published only from the main branch.' >&2
+            exit 1
+          fi
 
           if [[ -n ${INPUT_VERSION:-} ]]; then
             version=$INPUT_VERSION
@@ -55,18 +63,59 @@ jobs:
             echo "Unsupported Studio release version: $version" >&2
             exit 1
           fi
+          upstream_commit=$(gh api "repos/Automattic/studio/commits/$upstream_tag" --jq .sha)
+          if [[ ! $upstream_commit =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unsupported Studio release commit: $upstream_commit" >&2
+            exit 1
+          fi
+
+          repo_version=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          repo_pkgrel=$(sed -n 's/^pkgrel=//p' packaging/arch/PKGBUILD)
+          if [[ ! $repo_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+            ! $repo_pkgrel =~ ^[1-9][0-9]*$ ]]; then
+            echo 'The repository package version is invalid.' >&2
+            exit 1
+          fi
+          if [[ $version == "$repo_version" ]]; then
+            pkgrel=$repo_pkgrel
+          else
+            pkgrel=1
+          fi
 
           release_tag="omarchy-v$version"
+          package_name="wordpress-studio-omarchy-$version-$pkgrel-x86_64.pkg.tar.zst"
+          checksum_name="$package_name.sha256"
+          release_exists=false
           should_build=true
-          if [[ $FORCE_RELEASE != true ]] &&
-            gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            should_build=false
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+            asset_names=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name')
+            package_count=$(grep -Fxc -- "$package_name" <<<"$asset_names" || true)
+            checksum_count=$(grep -Fxc -- "$checksum_name" <<<"$asset_names" || true)
+            if (( package_count > 1 || checksum_count > 1 )); then
+              echo "Release $release_tag contains duplicate immutable assets." >&2
+              exit 1
+            fi
+            if (( package_count != checksum_count )); then
+              echo "Release $release_tag contains an incomplete immutable package pair." >&2
+              exit 1
+            fi
+            if (( package_count == 1 )); then
+              should_build=false
+            fi
           fi
 
           {
             echo "version=$version"
+            echo "pkgrel=$pkgrel"
             echo "upstream_tag=$upstream_tag"
+            echo "upstream_commit=$upstream_commit"
             echo "release_tag=$release_tag"
+            echo "package_name=$package_name"
+            echo "checksum_name=$checksum_name"
+            echo "release_exists=$release_exists"
             echo "should_build=$should_build"
           } >>"$GITHUB_OUTPUT"
 
@@ -78,6 +127,7 @@ jobs:
     uses: ./.github/workflows/build-package.yml
     with:
       version: ${{ needs.detect.outputs.version }}
+      upstream_commit: ${{ needs.detect.outputs.upstream_commit }}
 
   tag-source:
     needs: [detect, build]
@@ -87,41 +137,54 @@ jobs:
     permissions:
       contents: write
     env:
-      FORCE_RELEASE: ${{ inputs.force || false }}
+      PKGREL: ${{ needs.detect.outputs.pkgrel }}
+      RELEASE_EXISTS: ${{ needs.detect.outputs.release_exists }}
       RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      UPSTREAM_COMMIT: ${{ needs.detect.outputs.upstream_commit }}
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
-      - name: Record package version and tag
+      - name: Record package version and immutable source tag
         run: |
           set -euo pipefail
           git config user.name 'studio-omarchy-release[bot]'
           git config user.email 'studio-omarchy-release[bot]@users.noreply.github.com'
 
-          tag_exists=false
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            tag_exists=true
-          fi
-
-          if [[ $tag_exists == true && $FORCE_RELEASE != true ]]; then
-            exit 0
-          fi
-
-          packaging/arch/set-package-version.sh "$VERSION"
+          packaging/arch/set-package-version.sh "$VERSION" "$UPSTREAM_COMMIT"
           if ! git diff --quiet; then
-            git add packaging/arch/PKGBUILD
+            git add manifest.json packaging/arch/PKGBUILD \
+              packaging/arch/build-omarchy-package.sh packaging/arch/upstream-commit
             git commit -m "Release Studio $VERSION for Omarchy"
             git push origin HEAD:main
           fi
 
-          git tag --force --annotate "$RELEASE_TAG" --message "Studio $VERSION for Omarchy"
-          if [[ $tag_exists == true ]]; then
-            git push --force origin "refs/tags/$RELEASE_TAG"
+          if [[ $RELEASE_EXISTS == true ]]; then
+            git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null ||
+              {
+                echo "Existing release $RELEASE_TAG has no immutable base tag." >&2
+                exit 1
+              }
+            source_tag="$RELEASE_TAG-r$PKGREL"
           else
-            git push origin "refs/tags/$RELEASE_TAG"
+            source_tag=$RELEASE_TAG
+          fi
+
+          expected_target=$(git rev-parse HEAD)
+          remote_target=$(git ls-remote --tags origin "refs/tags/$source_tag^{}" | awk 'NR == 1 { print $1 }')
+          if [[ -z $remote_target ]]; then
+            remote_target=$(git ls-remote --tags origin "refs/tags/$source_tag" | awk 'NR == 1 { print $1 }')
+          fi
+          if [[ -n $remote_target ]]; then
+            if [[ $remote_target != "$expected_target" ]]; then
+              echo "Refusing to move immutable source tag $source_tag." >&2
+              exit 1
+            fi
+          else
+            git tag --annotate "$source_tag" --message "Studio $VERSION-$PKGREL for Omarchy"
+            git push origin "refs/tags/$source_tag"
           fi
 
   release:
@@ -132,7 +195,11 @@ jobs:
     permissions:
       contents: write
     env:
+      CHECKSUM_NAME: ${{ needs.detect.outputs.checksum_name }}
       GH_TOKEN: ${{ github.token }}
+      PACKAGE_NAME: ${{ needs.detect.outputs.package_name }}
+      PKGREL: ${{ needs.detect.outputs.pkgrel }}
+      RELEASE_EXISTS: ${{ needs.detect.outputs.release_exists }}
       RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
       UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
       VERSION: ${{ needs.detect.outputs.version }}
@@ -142,35 +209,41 @@ jobs:
           name: wordpress-studio-omarchy-${{ needs.detect.outputs.version }}-x86_64
           path: release-assets
 
-      - name: Verify and publish release
+      - name: Verify and publish immutable package pair
         run: |
           set -euo pipefail
-          release_notes="Native Omarchy package for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG). Use the repository's direct installer or install the downloaded package with \`sudo pacman -U ./wordpress-studio-omarchy-*.pkg.tar.zst\`."
+          if [[ $RELEASE_EXISTS == true ]]; then
+            source_tag="$RELEASE_TAG-r$PKGREL"
+          else
+            source_tag=$RELEASE_TAG
+          fi
+          release_notes="Native Omarchy package revision $PKGREL for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG), built from immutable [source tag $source_tag](https://github.com/$GITHUB_REPOSITORY/tree/$source_tag). Use the repository's direct installer or install the downloaded package with sudo pacman -U."
+          package_path="release-assets/$PACKAGE_NAME"
+          checksum_path="release-assets/$CHECKSUM_NAME"
 
+          mapfile -t actual_assets < <(find release-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t expected_assets < <(printf '%s\n' "$CHECKSUM_NAME" "$PACKAGE_NAME" | sort)
+          (( ${#actual_assets[@]} == 2 )) &&
+            [[ ${actual_assets[*]} == "${expected_assets[*]}" ]] ||
+            {
+              echo 'Downloaded artifact does not contain the exact immutable package pair.' >&2
+              exit 1
+            }
           (
             cd release-assets
-            sha256sum --check ./*.sha256
+            sha256sum --check "$CHECKSUM_NAME"
           )
 
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" --clobber
-
-            while read -r asset_name; do
-              if [[ ! -e release-assets/$asset_name ]]; then
-                gh release delete-asset "$RELEASE_TAG" "$asset_name" \
-                  --repo "$GITHUB_REPOSITORY" --yes
-              fi
-            done < <(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets[].name | select(startswith("wordpress-studio-omarchy-"))')
-
+          if [[ $RELEASE_EXISTS == true ]]; then
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --latest \
               --title "Studio $VERSION for Omarchy" \
               --notes "$release_notes"
+            gh release upload "$RELEASE_TAG" "$package_path" "$checksum_path" \
+              --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" release-assets/* \
+            gh release create "$RELEASE_TAG" "$package_path" "$checksum_path" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --latest \
@@ -179,8 +252,15 @@ jobs:
           fi
 
   report-failure:
-    needs: [detect, build]
-    if: always() && needs.detect.outputs.should_build == 'true' && needs.build.result == 'failure'
+    needs: [detect, build, tag-source, release]
+    if: >-
+      always() &&
+      (needs.detect.result == 'failure' ||
+       (needs.detect.result == 'success' &&
+        needs.detect.outputs.should_build == 'true' &&
+        (needs.build.result == 'failure' ||
+         needs.tag-source.result == 'failure' ||
+         needs.release.result == 'failure')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -191,10 +271,14 @@ jobs:
     steps:
       - name: Open a single actionable issue
         run: |
-          title="Automated Omarchy release failed for Studio $VERSION"
+          if [[ -n $VERSION ]]; then
+            title="Automated Omarchy release failed for Studio $VERSION"
+          else
+            title='Automated Omarchy release detection failed'
+          fi
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "$title in:title" --json number --jq '.[0].number // empty')
           if [[ -z $existing ]]; then
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
-              --body "The automated patch, test, or package build failed. Review [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) before retrying."
+              --body "The automated patch, test, package build, source tag, or immutable asset upload failed. Review [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) before retrying."
           fi

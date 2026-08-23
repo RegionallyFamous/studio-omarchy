@@ -7,17 +7,50 @@ on:
         description: "Upstream Studio version without the v prefix"
         required: true
         type: string
+      upstream_commit:
+        description: "Full immutable commit for the upstream Studio release"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  node_version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      value: ${{ steps.resolve.outputs.value }}
+    env:
+      UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+    steps:
+      - name: Resolve pinned upstream Node version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ ! $UPSTREAM_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unsupported upstream Studio commit: $UPSTREAM_COMMIT" >&2
+            exit 1
+          fi
+
+          node_version=$(curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 30 --max-filesize 64 \
+            "https://raw.githubusercontent.com/Automattic/studio/$UPSTREAM_COMMIT/.nvmrc")
+          if [[ ! $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream Node version: $node_version" >&2
+            exit 1
+          fi
+          echo "value=$node_version" >>"$GITHUB_OUTPUT"
+
   build:
+    needs: node_version
     runs-on: ubuntu-latest
     timeout-minutes: 120
     container: archlinux:base-devel
     env:
       VERSION: ${{ inputs.version }}
+      UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
     steps:
       - name: Install Arch build and validation dependencies
         run: >-
@@ -29,6 +62,8 @@ jobs:
 
       - name: Checkout Studio for Omarchy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Prepare and validate sources
         id: source
@@ -39,8 +74,12 @@ jobs:
             echo "Unsupported Studio version: $VERSION" >&2
             exit 1
           fi
+          if [[ ! $UPSTREAM_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Unsupported upstream Studio commit: $UPSTREAM_COMMIT" >&2
+            exit 1
+          fi
 
-          packaging/arch/set-package-version.sh "$VERSION"
+          packaging/arch/set-package-version.sh "$VERSION" "$UPSTREAM_COMMIT"
           packaging/arch/test-update-script.sh
           tools/lint-manifest.sh
           shellcheck -e SC1091 install.sh scripts/*.sh test/*.sh tools/*.sh \
@@ -48,62 +87,32 @@ jobs:
             packaging/arch/studio-omarchy-update packaging/arch/studio.install
           actionlint .github/workflows/*.yml
 
-          studio_root="$RUNNER_TEMP/studio"
-          git clone --depth 1 --branch "v$VERSION" https://github.com/Automattic/studio.git "$studio_root"
-          git -C "$studio_root" apply --check "$GITHUB_WORKSPACE/patches/studio-omarchy.patch"
-          git -C "$studio_root" apply "$GITHUB_WORKSPACE/patches/studio-omarchy.patch"
-
-          actual_version=$(jq -r .version "$studio_root/apps/studio/package.json")
-          if [[ $actual_version != "$VERSION" ]]; then
-            echo "Studio tag v$VERSION contains app version $actual_version." >&2
-            exit 1
-          fi
-
-          {
-            echo "studio_root=$studio_root"
-            echo "node_version=$(<"$studio_root/.nvmrc")"
-          } >>"$GITHUB_OUTPUT"
-
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: ${{ steps.source.outputs.node_version }}
+          node-version: ${{ needs.node_version.outputs.value }}
 
       - name: Test Quattro plugin helpers
         run: node --test test/*.test.js
 
-      - name: Install Studio dependencies
-        working-directory: ${{ steps.source.outputs.studio_root }}
-        run: npm ci
-
-      - name: Lint, typecheck, and test Studio
-        working-directory: ${{ steps.source.outputs.studio_root }}
-        run: |
-          npm run lint
-          npm run typecheck
-          npm test
-
-      - name: Package Studio
-        working-directory: ${{ steps.source.outputs.studio_root }}
-        run: npm run package
-
-      - name: Build native Arch package
+      - name: Build and verify pinned Studio package
         run: |
           useradd --create-home builder
-          chown -R builder:builder "$GITHUB_WORKSPACE" "${{ steps.source.outputs.studio_root }}"
+          chown -R builder:builder "$GITHUB_WORKSPACE"
           # This expression is intentionally expanded by the child shell run as builder.
           # shellcheck disable=SC2016
           runuser -u builder -- env \
             PATH="$PATH" \
-            STUDIO_SOURCE_ROOT="${{ steps.source.outputs.studio_root }}" \
-            bash -c 'cd "$GITHUB_WORKSPACE/packaging/arch" && makepkg --force --cleanbuild --clean'
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash -c 'cd "$GITHUB_WORKSPACE" && packaging/arch/build-omarchy-package.sh --ci'
 
       - name: Verify and checksum package
         run: |
           set -euo pipefail
-          packaging/arch/verify-package.sh
-          package_path=$(find packaging/arch -maxdepth 1 \
-            -name 'wordpress-studio-omarchy-*.pkg.tar.zst' -print -quit)
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          pkgrel=$(sed -n 's/^pkgrel=//p' packaging/arch/PKGBUILD)
+          package_path="packaging/arch/wordpress-studio-omarchy-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
+          packaging/arch/verify-package.sh "$package_path"
           package_dir=$(dirname "$package_path")
           package_name=$(basename "$package_path")
           (
