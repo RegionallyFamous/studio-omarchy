@@ -33,6 +33,7 @@ test('security-sensitive shell entrypoints suppress BASH_ENV before their first 
           ...process.env,
           BASH_ENV: bashEnv,
           ENV: bashEnv,
+          STUDIO_OMARCHY_TEST_MODE: 'invalid',
           OMARCHY_PATH: '/nonexistent-studio-test-omarchy'
         },
         input: '',
