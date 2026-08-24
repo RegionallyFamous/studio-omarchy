@@ -2795,7 +2795,7 @@ diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/comm
 index c69b9ebd2..15735dbfe 100644
 --- a/packages/common/lib/tests/linux-trust-store.test.ts
 +++ b/packages/common/lib/tests/linux-trust-store.test.ts
-@@ -1,17 +1,32 @@
+@@ -1,17 +1,35 @@
 +import { execFileSync, spawnSync } from 'node:child_process';
 +import { createHash, X509Certificate } from 'node:crypto';
  import fs from 'node:fs';
@@ -2832,7 +2832,7 @@ index c69b9ebd2..15735dbfe 100644
  	describe( 'constants', () => {
  		it( 'targets the Debian/Ubuntu system trust bundle', () => {
  			expect( LINUX_SYSTEM_CA_BUNDLE ).toBe( '/etc/ssl/certs/ca-certificates.crt' );
-@@ -26,21 +41,450 @@ describe( 'linux-trust-store', () => {
+@@ -26,21 +41,453 @@ describe( 'linux-trust-store', () => {
  		} );
  	} );
  
