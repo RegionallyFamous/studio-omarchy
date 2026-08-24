@@ -19,6 +19,12 @@ const copyLimit = packageLimit + 1
 const verifiedPackage = Buffer.from('V'.repeat(packageLimit))
 const undisclosedMarker = 'ATTACK-CONTENT-MUST-NOT-BE-DISCLOSED'
 
+test('guest idempotence check recognizes the fixed absolute pacman invocation', () => {
+  const acceptance = fs.readFileSync(path.join(root, 'test', 'omarchy-acceptance.sh'), 'utf8')
+  assert.match(acceptance, /Running '\/usr\/bin\/pacman -U --needed --noconfirm/)
+  assert.doesNotMatch(acceptance, /Running 'pacman -U --needed --noconfirm/)
+})
+
 function writeExecutable(file, contents) {
   fs.writeFileSync(file, contents, { mode: 0o755 })
 }

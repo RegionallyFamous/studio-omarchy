@@ -1138,7 +1138,7 @@ same_version_update_log_is_idempotent() {
   local invocation_count
 
   tail -n "+$start_line" /var/log/pacman.log >"$segment" || return 1
-  invocation_count=$(grep -Ec "\[PACMAN\] Running 'pacman -U --needed --noconfirm -- .*/wordpress-studio-omarchy-${PLUGIN_VERSION//./\\.}-[1-9][0-9]*-x86_64\\.pkg\\.tar\\.zst'" "$segment" || true)
+  invocation_count=$(grep -Ec "\[PACMAN\] Running '/usr/bin/pacman -U --needed --noconfirm -- .*/wordpress-studio-omarchy-${PLUGIN_VERSION//./\\.}-[1-9][0-9]*-x86_64\\.pkg\\.tar\\.zst'" "$segment" || true)
   (( invocation_count == 1 )) || return 1
   ! grep -E "\[ALPM\] (installed|upgraded|downgraded) ${PACKAGE_NAME}([[:space:]]|$)" "$segment" >/dev/null
 }
