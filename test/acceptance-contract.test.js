@@ -29,6 +29,8 @@ test('guest executes the exact installer handoff as root without exposing host p
   assert.match(exercise, /\/usr\/bin\/unshare --mount --propagation private/)
   assert.match(exercise, /\/usr\/bin\/mount --bind "\$1" \/usr\/bin\/pacman/)
   assert.match(exercise, /\/usr\/bin\/cmp --silent -- "\$1" \/usr\/bin\/pacman/)
+  assert.match(exercise, /root_script=\$\(\/usr\/bin\/cat -- "\$2"\)/)
+  assert.doesNotMatch(exercise, /root_script=\$\(\/usr\/bin\/base64 --decode "\$2"\)/)
   assert.match(exercise, /\/usr\/bin\/bash -c "\$root_script" bash/)
   assert.match(exercise, /directory\|0\|0\|700/)
   assert.match(exercise, /regular file\|0\|0\|600\|1/)

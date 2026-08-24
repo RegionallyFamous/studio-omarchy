@@ -1261,7 +1261,7 @@ run_case() {
           /usr/bin/printf "%s\n" ready >"$STUDIO_HANDOFF_NAMESPACE_READY"
           /usr/bin/chown "$STUDIO_HANDOFF_ACCEPTANCE_UID:$STUDIO_HANDOFF_ACCEPTANCE_GID" \
             "$STUDIO_HANDOFF_NAMESPACE_READY"
-          root_script=$(/usr/bin/base64 --decode "$2")
+          root_script=$(/usr/bin/cat -- "$2")
           /usr/bin/bash -c "$root_script" bash "$3" "$4" "$5" "$6"
         ' bash "$root_fixture/pacman" "$root_fixture/handoff.sh" \
           "$source_path" "$package_name" "$expected_hash" "$max_bytes" || status=$?
