@@ -31,7 +31,16 @@ function writeChecksum(file, contents) {
   fs.writeFileSync(file, `${checksum(contents)}  ${packageName}\n`)
 }
 
-function createFixture({ preopenMutation = '' } = {}) {
+function commandPath(name) {
+  const result = spawnSync(`command -v ${name}`, [], {
+    shell: true,
+    encoding: 'utf8'
+  })
+  assert.equal(result.status, 0, result.stderr)
+  return result.stdout.trim()
+}
+
+function createFixture({ preopenMutation = '', holdStage = '' } = {}) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-privileged-handoff-'))
   const bin = path.join(fixtureRoot, 'bin')
   const downloads = path.join(fixtureRoot, 'downloads')
@@ -51,6 +60,7 @@ function createFixture({ preopenMutation = '' } = {}) {
   const packageFixture = path.join(fixtures, packageName)
   const checksumFixture = path.join(fixtures, checksumName)
   const preopenSymlinkTarget = path.join(fixtureRoot, 'preopen-symlink-target')
+  const caBundle = path.join(fixtureRoot, 'system-ca-bundle')
 
   for (const directory of [bin, downloads, fixtures, privilegedTmp]) {
     fs.mkdirSync(directory)
@@ -58,6 +68,7 @@ function createFixture({ preopenMutation = '' } = {}) {
   fs.chmodSync(downloads, 0o700)
   fs.writeFileSync(packageFixture, verifiedPackage)
   fs.writeFileSync(preopenSymlinkTarget, verifiedPackage)
+  fs.writeFileSync(caBundle, 'test-only CA bundle placeholder\n')
   writeChecksum(checksumFixture, verifiedPackage)
   fs.writeFileSync(
     releaseFile,
@@ -66,6 +77,8 @@ function createFixture({ preopenMutation = '' } = {}) {
       assets: [{ name: packageName }, { name: checksumName }]
     }) + '\n'
   )
+  if (preopenMutation) fs.writeFileSync(path.join(fixtureRoot, 'preopen-mutation'), preopenMutation)
+  if (holdStage) fs.writeFileSync(path.join(fixtureRoot, `hold-${holdStage}`), '')
 
   writeExecutable(
     path.join(bin, 'bash'),
@@ -80,6 +93,19 @@ exit 97
 set -euo pipefail
 shift 3
 exec "$@"
+`
+  )
+  writeExecutable(
+    path.join(bin, 'base64'),
+    `#!/bin/bash
+set -euo pipefail
+if [[ \${1:-} == "--wrap=0" && $# == 1 ]]; then
+  /usr/bin/base64 | /usr/bin/tr -d '\\n'
+elif [[ \${1:-} == "--decode" && $# == 1 ]]; then
+  /usr/bin/base64 -d
+else
+  exit 2
+fi
 `
   )
   writeExecutable(
@@ -150,15 +176,18 @@ exec /bin/chmod "$1" "$3"
     path.join(bin, 'curl'),
     `#!/bin/bash
 set -euo pipefail
+fixture_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 output=
 url=
+[[ \${1:-} == "--disable" ]]
+shift
 while (( $# > 0 )); do
   case $1 in
     --output)
       output=$2
       shift 2
       ;;
-    --connect-timeout|--max-time|--max-filesize|--proto|--proto-redir)
+    --cacert|--connect-timeout|--max-time|--max-filesize|--proto|--proto-redir)
       shift 2
       ;;
     --fail|--show-error|--location)
@@ -170,22 +199,43 @@ while (( $# > 0 )); do
       ;;
   esac
 done
-[[ -n $output && -n $url ]]
+[[ -n $url ]]
+hold_after_output() {
+  local stage=$1
+  if [[ -e $fixture_root/hold-$stage ]]; then
+    : >"$fixture_root/$stage-bytes-emitted"
+    for (( attempt = 0; attempt < 1000; attempt++ )); do
+      [[ ! -e $fixture_root/$stage-continue ]] || return 0
+      /bin/sleep 0.01
+    done
+    exit 124
+  fi
+}
+
 if [[ $url == */releases/latest ]]; then
-  cp -- "$STUDIO_HANDOFF_RELEASE_FILE" "$output"
+  [[ -z $output ]]
+  /bin/cat "$fixture_root/fixtures/release.json"
+  hold_after_output release
+elif [[ $url == */"${checksumName}" ]]; then
+  [[ -z $output ]]
+  /bin/cat "$fixture_root/fixtures/${checksumName}"
+  hold_after_output checksum
 else
-  cp -- "$STUDIO_HANDOFF_FIXTURES/\${url##*/}" "$output"
+  [[ -n $output ]]
+  /bin/cp -- "$fixture_root/fixtures/\${url##*/}" "$output"
 fi
 if [[ $url == */"${checksumName}" ]]; then
-  case \${STUDIO_HANDOFF_PREOPEN_MUTATION:-} in
+  mutation=
+  [[ ! -f $fixture_root/preopen-mutation ]] || IFS= read -r mutation <"$fixture_root/preopen-mutation"
+  case $mutation in
     '') ;;
     symlink)
-      rm -f -- "$STUDIO_HANDOFF_DOWNLOAD_PACKAGE"
-      ln -s -- "$STUDIO_HANDOFF_PREOPEN_SYMLINK_TARGET" "$STUDIO_HANDOFF_DOWNLOAD_PACKAGE"
+      /bin/rm -f -- "$fixture_root/downloads/${packageName}"
+      /bin/ln -s -- "$fixture_root/preopen-symlink-target" "$fixture_root/downloads/${packageName}"
       ;;
     fifo)
-      rm -f -- "$STUDIO_HANDOFF_DOWNLOAD_PACKAGE"
-      mkfifo "$STUDIO_HANDOFF_DOWNLOAD_PACKAGE"
+      /bin/rm -f -- "$fixture_root/downloads/${packageName}"
+      /usr/bin/mkfifo "$fixture_root/downloads/${packageName}"
       ;;
     *) exit 2 ;;
   esac
@@ -200,7 +250,7 @@ printf '%s\n' "\${1:-}" >"$STUDIO_HANDOFF_SUDO_EXECUTABLE"
 : >"$STUDIO_HANDOFF_PROMPT_MARKER"
 for (( attempt = 0; attempt < 1000; attempt++ )); do
   [[ ! -e $STUDIO_HANDOFF_PROMPT_RELEASE ]] || break
-  sleep 0.01
+  /bin/sleep 0.01
 done
 [[ -e $STUDIO_HANDOFF_PROMPT_RELEASE ]] || exit 124
 
@@ -227,7 +277,7 @@ set -euo pipefail
 printf '%s\n' "$*" >"$STUDIO_HANDOFF_PACMAN_LOG"
 package_path=\${!#}
 [[ -f $package_path && ! -L $package_path ]]
-cp -- "$package_path" "$STUDIO_HANDOFF_INSTALLED_BYTES"
+/bin/cp -- "$package_path" "$STUDIO_HANDOFF_INSTALLED_BYTES"
 `
   )
   writeExecutable(
@@ -261,21 +311,78 @@ printf '%s\n' x86_64
     packagePath: path.join(downloads, packageName),
     checksumPath: path.join(downloads, checksumName),
     preopenMutation,
-    preopenSymlinkTarget
+    preopenSymlinkTarget,
+    caBundle,
+    holdStage,
+    stageBytesEmitted: holdStage ? path.join(fixtureRoot, `${holdStage}-bytes-emitted`) : '',
+    stageContinue: holdStage ? path.join(fixtureRoot, `${holdStage}-continue`) : ''
   }
 }
 
 function sha256sumPath() {
-  const result = spawnSync('command -v sha256sum', [], {
-    shell: true,
-    encoding: 'utf8'
-  })
-  assert.equal(result.status, 0, result.stderr)
-  return result.stdout.trim()
+  return commandPath('sha256sum')
+}
+
+function adaptInstaller(installer, fixture) {
+  const source = fs.readFileSync(installer, 'utf8')
+  const handoffStart = "  /usr/bin/sudo /usr/bin/bash -c '\n"
+  const handoffEnd = `\n' bash "$source_path" "$package_name" "$expected_hash" "$max_bytes"`
+  const startIndex = source.indexOf(handoffStart)
+  const endIndex = source.indexOf(handoffEnd, startIndex)
+  assert.notEqual(startIndex, -1, 'production installer has no fixed privileged handoff start')
+  assert.notEqual(endIndex, -1, 'production installer has no fixed privileged handoff end')
+  assert.match(source, /^#!\/bin\/bash -p\n/)
+  assert.match(source, /readonly PATH='\/usr\/bin:\/usr\/sbin'/)
+  assert.match(source, /\/usr\/bin\/curl --disable --fail/)
+  assert.match(source, /\/usr\/bin\/env -i PATH="\$PATH" LC_ALL="\$LC_ALL"/)
+  assert.match(source, /\/usr\/bin\/base64 --wrap=0/)
+  assert.doesNotMatch(source, /release_file=.*release\.json/)
+  assert.doesNotMatch(source, /checksum_path=/)
+
+  const callerPaths = new Map([
+    ['/etc/ssl/certs/ca-certificates.crt', fixture.caBundle],
+    ['/usr/bin/awk', commandPath('awk')],
+    ['/usr/bin/base64', path.join(fixture.bin, 'base64')],
+    ['/usr/bin/chmod', commandPath('chmod')],
+    ['/usr/bin/curl', path.join(fixture.bin, 'curl')],
+    ['/usr/bin/cut', commandPath('cut')],
+    ['/usr/bin/env', commandPath('env')],
+    ['/usr/bin/head', commandPath('head')],
+    ['/usr/bin/jq', commandPath('jq')],
+    ['/usr/bin/mkdir', commandPath('mkdir')],
+    ['/usr/bin/mktemp', commandPath('mktemp')],
+    ['/usr/bin/mv', commandPath('mv')],
+    ['/usr/bin/pacman', path.join(fixture.bin, 'pacman')],
+    ['/usr/bin/realpath', commandPath('realpath')],
+    ['/usr/bin/rm', commandPath('rm')],
+    ['/usr/bin/sha256sum', sha256sumPath()],
+    ['/usr/bin/sudo', path.join(fixture.bin, 'sudo')],
+    ['/usr/bin/timeout', path.join(fixture.bin, 'timeout')],
+    ['/usr/bin/uname', path.join(fixture.bin, 'uname')],
+    ['/usr/bin/wc', commandPath('wc')]
+  ])
+  const replaceCallerPaths = input => {
+    let output = input
+    for (const [productionPath, testPath] of callerPaths) {
+      output = output.replaceAll(productionPath, testPath)
+    }
+    return output
+  }
+
+  const privilegedEnd = endIndex + handoffEnd.length
+  const callerPrefix = replaceCallerPaths(source.slice(0, startIndex))
+  const privilegedHandoff = source
+    .slice(startIndex, privilegedEnd)
+    .replace('/usr/bin/sudo /usr/bin/bash', `${path.join(fixture.bin, 'sudo')} /usr/bin/bash`)
+  const callerSuffix = replaceCallerPaths(source.slice(privilegedEnd))
+  const adapted = path.join(fixture.fixtureRoot, 'adapted-installer')
+  writeExecutable(adapted, callerPrefix + privilegedHandoff + callerSuffix)
+  return adapted
 }
 
 function startInstaller(installer, fixture) {
-  const child = spawn(installer, [], {
+  const adaptedInstaller = adaptInstaller(installer, fixture)
+  const child = spawn(adaptedInstaller, [], {
     env: {
       ...process.env,
       PATH: `${fixture.bin}:${process.env.PATH}`,
@@ -418,7 +525,75 @@ async function exerciseBeforePrompt(installer, preopenMutation) {
   }
 }
 
+async function exerciseDuringMemoryDownload(installer, stage, mutate) {
+  const fixture = createFixture({ holdStage: stage })
+  const { child, completion } = startInstaller(installer, fixture)
+  try {
+    await waitForFile(fixture.stageBytesEmitted, completion)
+    await mutate(fixture)
+    fs.writeFileSync(fixture.stageContinue, '')
+    return { fixture, child, completion }
+  } catch (error) {
+    child.kill('SIGKILL')
+    fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true })
+    throw error
+  }
+}
+
 for (const [label, installer] of installers) {
+  test(`${label} pins release metadata in memory before a same-UID replacement`, async () => {
+    const { fixture, child, completion } = await exerciseDuringMemoryDownload(
+      installer,
+      'release',
+      async current => {
+        assert.equal(fs.existsSync(path.join(current.downloads, 'release.json')), false)
+        const maliciousRelease = `${undisclosedMarker}: malformed release metadata\n`
+        fs.writeFileSync(current.releaseFile, maliciousRelease)
+        fs.writeFileSync(path.join(current.downloads, 'release.json'), maliciousRelease)
+      }
+    )
+    try {
+      await waitForFile(fixture.promptMarker, completion)
+      fs.writeFileSync(fixture.promptRelease, '')
+      const result = await waitForResult(completion)
+      assert.equal(result.status, 0, result.stderr)
+      assertFixedPrivilegedShell(fixture)
+      assert.deepEqual(fs.readFileSync(fixture.installedBytes), verifiedPackage)
+      assertNoDisclosure(result)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  test(`${label} rejects a package and checksum replacement before checksum parsing`, async () => {
+    const maliciousPackage = Buffer.from(
+      (undisclosedMarker + '|').repeat(3).slice(0, packageLimit)
+    )
+    const { fixture, child, completion } = await exerciseDuringMemoryDownload(
+      installer,
+      'checksum',
+      async current => {
+        assert.equal(fs.existsSync(current.checksumPath), false)
+        const replacementPackage = path.join(current.fixtureRoot, 'pre-parse-package')
+        fs.writeFileSync(replacementPackage, maliciousPackage)
+        fs.renameSync(replacementPackage, current.packagePath)
+        writeChecksum(current.checksumFixture, maliciousPackage)
+        writeChecksum(current.checksumPath, maliciousPackage)
+      }
+    )
+    try {
+      const result = await waitForResult(completion)
+      assert.notEqual(result.status, 0, 'pre-parse replacement unexpectedly installed')
+      assert.equal(fs.existsSync(fixture.promptMarker), false, 'pre-parse replacement reached sudo')
+      assertNoInstallation(fixture)
+      assertNoDisclosure(result)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      fs.rmSync(fixture.fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
   test(`${label} uses fixed sudo argv and preserves the exact package-byte boundary`, async () => {
     const { fixture, result } = await exerciseAtPrompt(installer, async () => undefined)
     try {

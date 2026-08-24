@@ -14,18 +14,32 @@ package_name="wordpress-studio-omarchy-$version-2-$package_arch.pkg.tar.zst"
 checksum_name="$package_name.sha256"
 package_fixture="$test_root/fixtures/$package_name"
 checksum_fixture="$test_root/fixtures/$checksum_name"
+ca_bundle="$test_root/system-ca-bundle"
 
 head -c 64 /dev/zero | tr '\0' x >"$package_fixture"
 (
   cd "$test_root/fixtures"
   sha256sum "$package_name" >"$checksum_name"
 )
+printf '%s\n' 'test-only CA bundle placeholder' >"$ca_bundle"
 
 cat >"$test_root/bin/timeout" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 shift 3
 exec "$@"
+EOF
+
+cat >"$test_root/bin/base64" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ ${1:-} == '--wrap=0' && $# == 1 ]]; then
+  /usr/bin/base64 | /usr/bin/tr -d '\n'
+elif [[ ${1:-} == '--decode' && $# == 1 ]]; then
+  /usr/bin/base64 -d
+else
+  exit 2
+fi
 EOF
 
 cat >"$test_root/bin/dd-no-follow" <<'EOF'
@@ -86,22 +100,42 @@ cat >"$test_root/bin/curl" <<'EOF'
 set -euo pipefail
 output=''
 url=''
+[[ ${1:-} == '--disable' ]]
+shift
 while (( $# > 0 )); do
   case $1 in
     --output) output=$2; shift 2 ;;
-    --connect-timeout | --max-time | --max-filesize | --proto | --proto-redir) shift 2 ;;
+    --cacert | --connect-timeout | --max-time | --max-filesize | --proto | --proto-redir) shift 2 ;;
     --fail | --show-error | --location) shift ;;
     *) url=$1; shift ;;
   esac
 done
 
-[[ -n $output && -n $url ]]
+[[ -n $url ]]
 if [[ ${STUDIO_CURL_FAIL:-0} == 1 ]]; then
   exit 7
 elif [[ $url == */releases/latest ]]; then
-  cp -- "$STUDIO_UPDATE_RELEASE_FILE" "$output"
+  [[ -z $output ]]
+  /bin/cat -- "$STUDIO_UPDATE_RELEASE_FILE"
+  stage=release
+elif [[ $url == */*.sha256 ]]; then
+  [[ -z $output ]]
+  /bin/cat -- "$STUDIO_UPDATE_FIXTURES/${url##*/}"
+  stage=checksum
 else
-  cp -- "$STUDIO_UPDATE_FIXTURES/${url##*/}" "$output"
+  [[ -n $output ]]
+  /bin/cp -- "$STUDIO_UPDATE_FIXTURES/${url##*/}" "$output"
+  stage=package
+fi
+
+if [[ -n ${STUDIO_UPDATE_STREAM_ADVERSARY_DIR:-} &&
+  -e $STUDIO_UPDATE_STREAM_ADVERSARY_DIR/hold-$stage ]]; then
+  : >"$STUDIO_UPDATE_STREAM_ADVERSARY_DIR/$stage-bytes-emitted"
+  for (( attempt = 0; attempt < 500; attempt++ )); do
+    [[ ! -e $STUDIO_UPDATE_STREAM_ADVERSARY_DIR/$stage-continue ]] || exit 0
+    /bin/sleep 0.01
+  done
+  exit 124
 fi
 EOF
 
@@ -115,7 +149,7 @@ if [[ -n ${STUDIO_UPDATE_ADVERSARY_DIR:-} ]]; then
   : >"$STUDIO_UPDATE_ADVERSARY_DIR/sudo-boundary"
   for (( attempt = 0; attempt < 500; attempt++ )); do
     [[ ! -e $STUDIO_UPDATE_ADVERSARY_DIR/substitution-complete ]] || break
-    sleep 0.01
+    /bin/sleep 0.01
   done
   [[ -e $STUDIO_UPDATE_ADVERSARY_DIR/substitution-complete ]]
 fi
@@ -144,7 +178,7 @@ for argument in "$@"; do
 done
 [[ -n $package_path ]]
 printf '%s\n' "$package_path" >"$STUDIO_UPDATE_RUN_ROOT/pacman-package-path"
-cp -- "$package_path" "$STUDIO_UPDATE_RUN_ROOT/pacman-package"
+/bin/cp -- "$package_path" "$STUDIO_UPDATE_RUN_ROOT/pacman-package"
 EOF
 
 cat >"$test_root/bin/uname" <<'EOF'
@@ -155,6 +189,75 @@ printf '%s\n' "${STUDIO_UPDATE_TEST_ARCH:-x86_64}"
 EOF
 
 chmod 755 "$test_root/bin"/*
+
+production_updater="$script_dir/studio-omarchy-update"
+test_updater="$test_root/instrumented-updater"
+grep -qF "readonly PATH='/usr/bin:/usr/sbin'" "$production_updater"
+# shellcheck disable=SC2016 # Assert the production script's literal variables.
+grep -qF '/usr/bin/env -i PATH="$PATH" LC_ALL="$LC_ALL"' "$production_updater"
+grep -qF '/usr/bin/curl --disable --fail' "$production_updater"
+grep -qF '/usr/bin/base64 --wrap=0' "$production_updater"
+if grep -qE 'release_file=.*release\.json|checksum_path=' "$production_updater"; then
+  echo 'The production updater writes trusted release or checksum data to a named file.' >&2
+  exit 1
+fi
+
+real_awk=$(command -v awk)
+real_chmod=$(command -v chmod)
+real_cut=$(command -v cut)
+real_env=$(command -v env)
+real_head=$(command -v head)
+real_jq=$(command -v jq)
+real_mkdir=$(command -v mkdir)
+real_mktemp=$(command -v mktemp)
+real_mv=$(command -v mv)
+real_realpath=$(command -v realpath)
+real_rm=$(command -v rm)
+real_sha256sum=$(command -v sha256sum)
+real_wc=$(command -v wc)
+
+replace_caller_paths() {
+  local line=$1
+
+  line=${line//\/usr\/bin\/env -i PATH=\"\$PATH\" LC_ALL=\"\$LC_ALL\" /}
+  line=${line//\/etc\/ssl\/certs\/ca-certificates.crt/$ca_bundle}
+  line=${line//\/usr\/bin\/awk/$real_awk}
+  line=${line//\/usr\/bin\/base64/$test_root\/bin\/base64}
+  line=${line//\/usr\/bin\/chmod/$real_chmod}
+  line=${line//\/usr\/bin\/curl/$test_root\/bin\/curl}
+  line=${line//\/usr\/bin\/cut/$real_cut}
+  line=${line//\/usr\/bin\/env/$real_env}
+  line=${line//\/usr\/bin\/head/$real_head}
+  line=${line//\/usr\/bin\/jq/$real_jq}
+  line=${line//\/usr\/bin\/mkdir/$real_mkdir}
+  line=${line//\/usr\/bin\/mktemp/$real_mktemp}
+  line=${line//\/usr\/bin\/mv/$real_mv}
+  line=${line//\/usr\/bin\/pacman/$test_root\/bin\/pacman}
+  line=${line//\/usr\/bin\/realpath/$real_realpath}
+  line=${line//\/usr\/bin\/rm/$real_rm}
+  line=${line//\/usr\/bin\/sha256sum/$real_sha256sum}
+  line=${line//\/usr\/bin\/sudo/$test_root\/bin\/sudo}
+  line=${line//\/usr\/bin\/timeout/$test_root\/bin\/timeout}
+  line=${line//\/usr\/bin\/uname/$test_root\/bin\/uname}
+  line=${line//\/usr\/bin\/wc/$real_wc}
+  printf '%s\n' "$line"
+}
+
+in_privileged_script=false
+while IFS= read -r line || [[ -n $line ]]; do
+  if [[ $in_privileged_script == true ]]; then
+    printf '%s\n' "$line"
+    [[ $line != "' bash \"\$source_path\" \"\$package_name\" \"\$expected_hash\" \"\$max_bytes\"" ]] ||
+      in_privileged_script=false
+  elif [[ $line == "  /usr/bin/sudo /usr/bin/bash -c '" ]]; then
+    printf '  %s /usr/bin/bash -c '\''\n' "$test_root/bin/sudo"
+    in_privileged_script=true
+  else
+    replace_caller_paths "$line"
+  fi
+done <"$production_updater" >"$test_updater"
+[[ $in_privileged_script == false ]]
+chmod 755 "$test_updater"
 
 write_release() {
   local output="$1"
@@ -194,12 +297,13 @@ run_installer() {
     STUDIO_UPDATE_RELEASE_FILE="$release_file" \
     STUDIO_UPDATE_RUN_ROOT="$run_root" \
     STUDIO_UPDATE_ADVERSARY_DIR="${STUDIO_UPDATE_ADVERSARY_DIR:-}" \
+    STUDIO_UPDATE_STREAM_ADVERSARY_DIR="${STUDIO_UPDATE_STREAM_ADVERSARY_DIR:-}" \
     STUDIO_UPDATE_TEST_BIN="$test_root/bin" \
     STUDIO_UPDATE_TEST_SHA256SUM="$(command -v sha256sum)" \
     STUDIO_UPDATE_TEST_ARCH="${STUDIO_UPDATE_TEST_ARCH:-x86_64}" \
     PATH="$test_root/bin:$PATH" \
     "$@" \
-    "$script_dir/studio-omarchy-update"
+    "$test_updater"
 }
 
 expect_failure() {
@@ -239,7 +343,8 @@ done
 success_root="$test_root/runs/success"
 run_installer "$success_root" "$exact_release"
 [[ -f $success_root/downloads/$package_name ]]
-[[ -f $success_root/downloads/$checksum_name ]]
+[[ ! -e $success_root/downloads/$checksum_name ]]
+[[ ! -e $success_root/downloads/release.json ]]
 resolved_success_downloads=$(realpath -- "$success_root/downloads")
 grep -qF -- "/usr/bin/bash -c" "$success_root/sudo-command"
 grep -qF -- "/usr/bin/dd" "$success_root/sudo-command"
@@ -255,6 +360,60 @@ cmp "$package_fixture" "$success_root/pacman-package"
 staged_success_package=$(<"$success_root/pacman-package-path")
 [[ $staged_success_package != "$resolved_success_downloads/$package_name" ]]
 [[ ! -e ${staged_success_package%/*} ]]
+
+release_pin_root="$test_root/runs/release-memory-pin"
+release_pin_sync="$release_pin_root/adversary"
+release_pin_source="$release_pin_root/source-release.json"
+mkdir -p "$release_pin_sync"
+cp -- "$exact_release" "$release_pin_source"
+: >"$release_pin_sync/hold-release"
+STUDIO_UPDATE_STREAM_ADVERSARY_DIR="$release_pin_sync" \
+  run_installer "$release_pin_root" "$release_pin_source" >"$release_pin_root/output" 2>&1 &
+release_pin_pid=$!
+for (( attempt = 0; attempt < 500; attempt++ )); do
+  [[ ! -e $release_pin_sync/release-bytes-emitted ]] || break
+  sleep 0.01
+done
+[[ -e $release_pin_sync/release-bytes-emitted ]]
+printf '%s\n' 'late harmless release replacement' >"$release_pin_source"
+printf '%s\n' 'late harmless release replacement' >"$release_pin_root/downloads/release.json"
+: >"$release_pin_sync/release-continue"
+wait "$release_pin_pid"
+cmp "$package_fixture" "$release_pin_root/pacman-package"
+if grep -qF 'late harmless release replacement' "$release_pin_root/output"; then
+  echo 'The updater consumed release metadata after its bounded stream was pinned.' >&2
+  exit 1
+fi
+
+checksum_pin_root="$test_root/runs/checksum-memory-pin"
+checksum_pin_sync="$checksum_pin_root/adversary"
+checksum_pin_backup="$checksum_pin_root/original-checksum"
+checksum_pin_replacement="$checksum_pin_root/replacement-package"
+mkdir -p "$checksum_pin_sync"
+cp -- "$checksum_fixture" "$checksum_pin_backup"
+head -c 64 /dev/zero | tr '\0' m >"$checksum_pin_replacement"
+: >"$checksum_pin_sync/hold-checksum"
+STUDIO_UPDATE_STREAM_ADVERSARY_DIR="$checksum_pin_sync" \
+  run_installer "$checksum_pin_root" "$exact_release" >"$checksum_pin_root/output" 2>&1 &
+checksum_pin_pid=$!
+for (( attempt = 0; attempt < 500; attempt++ )); do
+  [[ ! -e $checksum_pin_sync/checksum-bytes-emitted ]] || break
+  sleep 0.01
+done
+[[ -e $checksum_pin_sync/checksum-bytes-emitted ]]
+mv -f -- "$checksum_pin_replacement" "$checksum_pin_root/downloads/$package_name"
+replacement_hash=$(sha256sum "$checksum_pin_root/downloads/$package_name" | cut -d ' ' -f 1)
+printf '%s  %s\n' "$replacement_hash" "$package_name" >"$checksum_fixture"
+cp -- "$checksum_fixture" "$checksum_pin_root/downloads/$checksum_name"
+: >"$checksum_pin_sync/checksum-continue"
+if wait "$checksum_pin_pid"; then
+  echo 'The pre-parse package and checksum replacement unexpectedly installed.' >&2
+  exit 1
+fi
+mv -- "$checksum_pin_backup" "$checksum_fixture"
+grep -qF 'the package checksum does not match' "$checksum_pin_root/output"
+[[ ! -e $checksum_pin_root/sudo-command ]]
+[[ ! -e $checksum_pin_root/pacman-command ]]
 
 substitution_root="$test_root/runs/same-uid-substitution"
 substitution_sync="$substitution_root/adversary"
