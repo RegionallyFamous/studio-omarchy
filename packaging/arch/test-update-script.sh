@@ -62,10 +62,19 @@ format=$2
 path=$4
 
 if [[ $format == "%s" ]]; then
-  /usr/bin/stat -f '%z' "$path"
+  if /usr/bin/stat -c '%s' -- "$path" 2>/dev/null; then
+    :
+  else
+    /usr/bin/stat -f '%z' "$path"
+  fi
 elif [[ $format == "%F|%u|%g|%a|%h|%s" ]]; then
-  IFS='|' read -r type mode links size < <(/usr/bin/stat -f '%HT|%Lp|%l|%z' "$path")
-  [[ $type == "Regular File" ]]
+  if metadata=$(/usr/bin/stat -c '%F|%a|%h|%s' -- "$path" 2>/dev/null); then
+    IFS='|' read -r type mode links size <<<"$metadata"
+    [[ $type == "regular file" ]]
+  else
+    IFS='|' read -r type mode links size < <(/usr/bin/stat -f '%HT|%Lp|%l|%z' "$path")
+    [[ $type == "Regular File" ]]
+  fi
   printf 'regular file|0|0|%s|%s|%s\n' "$mode" "$links" "$size"
 else
   exit 2

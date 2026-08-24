@@ -125,8 +125,13 @@ set -euo pipefail
 format=$2
 target=$4
 if [[ $format == "%F|%u|%g|%a|%h|%s" ]]; then
-  IFS='|' read -r type mode links size < <(/usr/bin/stat -f '%HT|%Lp|%l|%z' "$target")
-  [[ $type == "Regular File" ]]
+  if metadata=$(/usr/bin/stat -c '%F|%a|%h|%s' -- "$target" 2>/dev/null); then
+    IFS='|' read -r type mode links size <<<"$metadata"
+    [[ $type == "regular file" ]]
+  else
+    IFS='|' read -r type mode links size < <(/usr/bin/stat -f '%HT|%Lp|%l|%z' "$target")
+    [[ $type == "Regular File" ]]
+  fi
   printf 'regular file|0|0|%s|%s|%s\n' "$mode" "$links" "$size"
 else
   exit 2
