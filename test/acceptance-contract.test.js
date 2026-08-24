@@ -42,6 +42,15 @@ test('guest executes the exact installer handoff as root without exposing host p
   )
 })
 
+test('guest validates the in-memory checksum handoff without requiring a checksum file', () => {
+  const verifyStart = acceptance.indexOf('verify_package_handoff_contract()')
+  const verifyEnd = acceptance.indexOf('\nextract_installer_privileged_handoff()', verifyStart)
+  const verify = acceptance.slice(verifyStart, verifyEnd)
+
+  assert.match(verify, /\[\[ \$actual_hash == "\$\{arguments\[7\]\}" \]\]/)
+  assert.doesNotMatch(verify, /checksum_path|\.sha256/)
+})
+
 test('guest verifies exact installed privileged runtime metadata, hashes, and capability', () => {
   const verifyStart = acceptance.indexOf('verify_installed_runtime_contract()')
   const verifyEnd = acceptance.indexOf('\nexercise_real_privileged_handoff()', verifyStart)

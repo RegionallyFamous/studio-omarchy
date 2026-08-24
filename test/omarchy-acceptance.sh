@@ -1013,14 +1013,13 @@ verified_package_handoff_present() {
 }
 
 verify_package_handoff_contract() {
-  local pid root_script package_path package_name checksum_path checksum_name checksum_encoded checksum_padding checksum_bytes expected_hash expected_name extra actual_hash hash_limit
+  local pid root_script package_path package_name actual_hash hash_limit
   local staged_path_literal="\$staged_path"
   local copy_limit_assignment="copy_limit=\$((max_bytes + 1))"
   local copy_limit_argument="count=\"\$copy_limit\""
   local staged_hash_guard="[[ \$staged_hash == \"\$expected_hash\" ]]"
   local metadata_guard="[[ \$staged_type == \"regular file\" && \$staged_uid == 0 && \$staged_gid == 0 &&"
   local bounded_hash_script="set -o pipefail; /usr/bin/head -c \"\$1\" \"\$2\" | /usr/bin/sha256sum | /usr/bin/cut -d \" \" -f 1"
-  local bounded_checksum_script="set -o pipefail; /usr/bin/head -c 513 \"\$1\" | /usr/bin/base64 -w 0"
   local cleanup_rm="/usr/bin/rm -rf -- \"\$staging_dir\""
   local -a arguments
 
@@ -1036,32 +1035,14 @@ verify_package_handoff_contract() {
   [[ ${package_path##*/} == "$package_name" ]] || return 1
   [[ $package_name =~ ^wordpress-studio-omarchy-([0-9]+\.[0-9]+\.[0-9]+)-[1-9][0-9]*-x86_64\.pkg\.tar\.zst$ ]] || return 1
   [[ ${BASH_REMATCH[1]} == "$PLUGIN_VERSION" ]] || return 1
-  checksum_path="$package_path.sha256"
-  checksum_name="$package_name.sha256"
-  [[ -f $package_path && ! -L $package_path && -s $package_path && -f $checksum_path && ! -L $checksum_path && -s $checksum_path ]] || return 1
-  checksum_encoded=$(
-    /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
-      /usr/bin/bash -c "$bounded_checksum_script" \
-      bash "$checksum_path"
-  ) || return 1
-  (( ${#checksum_encoded} % 4 == 0 )) || return 1
-  checksum_padding=${checksum_encoded: -2}
-  checksum_bytes=$(( ${#checksum_encoded} * 3 / 4 ))
-  [[ $checksum_padding != *'='* ]] || (( checksum_bytes -= 1 ))
-  [[ $checksum_padding != '==' ]] || (( checksum_bytes -= 1 ))
-  (( checksum_bytes > 0 && checksum_bytes <= 512 )) || return 1
-  IFS=' ' read -r expected_hash expected_name extra < <(
-    /usr/bin/printf '%s' "$checksum_encoded" | /usr/bin/base64 --decode
-  ) || return 1
-  [[ $expected_hash =~ ^[0-9a-f]{64}$ && $expected_name == "$package_name" && -z $extra ]] || return 1
+  [[ -f $package_path && ! -L $package_path && -s $package_path ]] || return 1
   hash_limit=$(( arguments[8] + 1 ))
   actual_hash=$(
     /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
       /usr/bin/bash -c "$bounded_hash_script" \
       bash "$hash_limit" "$package_path"
   ) || return 1
-  [[ $actual_hash == "$expected_hash" && ${arguments[7]} == "$expected_hash" &&
-    ${checksum_path##*/} == "$checksum_name" ]] || return 1
+  [[ $actual_hash == "${arguments[7]}" ]] || return 1
   grep -qF '/usr/bin/mktemp -d /var/tmp/studio-omarchy-install.XXXXXXXXXX' <<<"$root_script" &&
     grep -qF 'trap cleanup EXIT' <<<"$root_script" &&
     grep -qF "$cleanup_rm" <<<"$root_script" &&
