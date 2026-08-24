@@ -13,7 +13,7 @@ function writeExecutable(file, contents) {
   fs.writeFileSync(file, contents, { mode: 0o755 })
 }
 
-function createFixture({ symlinkLauncher = false } = {}) {
+function createFixture({ symlinkLauncher = false, packagedLauncher = false } = {}) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-action-'))
   const pluginRoot = path.join(fixtureRoot, 'plugin')
   const scriptsDir = path.join(pluginRoot, 'scripts')
@@ -41,6 +41,12 @@ function createFixture({ symlinkLauncher = false } = {}) {
     "readonly PROCESS_ENVIRON='/proc/self/environ'",
     `readonly PROCESS_ENVIRON='${processEnviron}'`
   )
+  if (packagedLauncher) {
+    testActionSource = testActionSource.replace(
+      "readonly PACKAGED_OMARCHY_ROOT='/usr/share/omarchy'",
+      `readonly PACKAGED_OMARCHY_ROOT='${fs.realpathSync(omarchyRoot)}'`
+    )
+  }
   assert.notEqual(testActionSource, actionSource, 'the action fixture must replace the fixed system root')
   writeExecutable(path.join(scriptsDir, 'action.sh'), testActionSource)
   fs.writeFileSync(processEnviron, 'BASH_FUNC_printf%%=fixture\0PATH=/fixture\0')
@@ -62,7 +68,9 @@ function createFixture({ symlinkLauncher = false } = {}) {
   const launcherPath = path.join(omarchyBin, 'omarchy-launch-floating-terminal-with-presentation')
   const launcherTarget = symlinkLauncher
     ? path.join(fixtureRoot, 'unsafe-launcher-target')
-    : launcherPath
+    : (packagedLauncher
+      ? path.join(systemBin, 'omarchy-launch-floating-terminal-with-presentation')
+      : launcherPath)
   writeExecutable(
     launcherTarget,
     `#!/bin/bash
@@ -75,7 +83,20 @@ fi
 /bin/bash -c "$1"
 `
   )
-  if (symlinkLauncher) fs.symlinkSync(launcherTarget, launcherPath)
+  if (symlinkLauncher || packagedLauncher) fs.symlinkSync(launcherTarget, launcherPath)
+
+  writeExecutable(
+    path.join(systemBin, 'realpath'),
+    `#!/bin/bash
+[[ $1 == '-e' && $2 == '--' && -e $3 ]] || exit 1
+if [[ -L $3 ]]; then
+  /usr/bin/readlink "$3"
+else
+  directory=$(cd -- "$(/usr/bin/dirname -- "$3")" && pwd -P) || exit
+  builtin printf '%s/%s\n' "$directory" "$(/usr/bin/basename -- "$3")"
+fi
+`
+  )
 
   writeExecutable(
     path.join(systemBin, 'uwsm-app'),
@@ -172,9 +193,10 @@ function runAction(action, {
   luaFocusFails = false,
   omarchyPath,
   symlinkLauncher = false,
+  packagedLauncher = false,
   extraEnv = {}
 } = {}) {
-  const fixture = createFixture({ symlinkLauncher })
+  const fixture = createFixture({ symlinkLauncher, packagedLauncher })
   const result = spawnSync(fixture.actionScript, [action], {
     encoding: 'utf8',
     env: {
@@ -295,6 +317,24 @@ test('rejects a symlinked fixed Omarchy terminal launcher', () => {
   const { result, log, attack } = runAction('update', { symlinkLauncher: true })
   assert.equal(result.status, 1)
   assert.match(result.stderr, /fixed Omarchy terminal launcher is unavailable or unsafe/)
+  assert.equal(log, '')
+  assert.equal(attack, '')
+})
+
+test('accepts the package-managed terminal launcher symlink to the fixed system target', () => {
+  const { result, log, attack } = runAction('update', { packagedLauncher: true })
+  assert.equal(result.status, 0, result.stderr)
+  assert.notEqual(log, '')
+  assert.equal(attack, '')
+})
+
+test('rejects a packaged terminal launcher symlink to any other target', () => {
+  const { result, log, attack } = runAction('update', {
+    packagedLauncher: true,
+    symlinkLauncher: true
+  })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /packaged Omarchy terminal launcher link has an unexpected target/)
   assert.equal(log, '')
   assert.equal(attack, '')
 })

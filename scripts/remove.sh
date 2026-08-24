@@ -25,7 +25,7 @@ cli_verified=false
 validate_omarchy_runtime() {
   local configured_path='/usr/share/omarchy' resolved_path helper_path resolved_helper
   local config_uid config_mode config_links runtime_uid runtime_mode bin_uid bin_mode
-  local helper_uid helper_mode helper_links extra package_name
+  local helper_uid helper_mode helper_links helper_link_uid helper_link_links extra package_name
 
   [[ -n ${OMARCHY_PATH:-} && $OMARCHY_PATH == /* &&
     $OMARCHY_PATH != *$'\n'* && $OMARCHY_PATH != *$'\r'* ]] || {
@@ -94,13 +94,37 @@ validate_omarchy_runtime() {
   }
 
   helper_path="$OMARCHY_PATH/bin/omarchy-pkg-drop"
+  if [[ $OMARCHY_PATH == "/usr/share/omarchy" ]]; then
+    [[ -L $helper_path ]] || {
+      echo 'The trusted Omarchy package-removal helper link is unavailable; removal was cancelled.' >&2
+      return 1
+    }
+    read -r helper_link_uid helper_link_links extra < <(
+      /usr/bin/stat -c '%u %h' -- "$helper_path"
+    ) || return 1
+    [[ $helper_link_uid == 0 && $helper_link_links == 1 && -z ${extra:-} ]] || {
+      echo 'The Omarchy package-removal helper link has unsafe metadata; removal was cancelled.' >&2
+      return 1
+    }
+    resolved_helper=$(/usr/bin/realpath -e -- "$helper_path") || return 1
+    [[ $resolved_helper == "/usr/bin/omarchy-pkg-drop" ]] || {
+      echo 'The Omarchy package-removal helper link has an unexpected target; removal was cancelled.' >&2
+      return 1
+    }
+    helper_path=$resolved_helper
+  else
+    [[ -f $helper_path && ! -L $helper_path && -x $helper_path ]] || {
+      echo 'The trusted Omarchy package-removal helper is unavailable; removal was cancelled.' >&2
+      return 1
+    }
+    resolved_helper=$(/usr/bin/realpath -e -- "$helper_path") || return 1
+    [[ $resolved_helper == "$helper_path" ]] || {
+      echo 'The Omarchy package-removal helper path is not canonical; removal was cancelled.' >&2
+      return 1
+    }
+  fi
   [[ -f $helper_path && ! -L $helper_path && -x $helper_path ]] || {
     echo 'The trusted Omarchy package-removal helper is unavailable; removal was cancelled.' >&2
-    return 1
-  }
-  resolved_helper=$(/usr/bin/realpath -e -- "$helper_path") || return 1
-  [[ $resolved_helper == "$helper_path" ]] || {
-    echo 'The Omarchy package-removal helper path is not canonical; removal was cancelled.' >&2
     return 1
   }
   read -r helper_uid helper_mode helper_links extra < <(

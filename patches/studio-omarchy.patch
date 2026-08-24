@@ -2825,6 +2825,9 @@ index c69b9ebd2..15735dbfe 100644
 +	const notACAFixture = fs.readFileSync(
 +		path.join( process.cwd(), 'packages/common/lib/tests/fixtures/not-a-ca.crt' )
 +	);
++	// Production requires root-owned trust files; substitute the fixture UID
++	// only so the non-root Arch builder can exercise the same transaction.
++	const testOwner = process.getuid?.() ?? 0;
 +
  	describe( 'constants', () => {
  		it( 'targets the Debian/Ubuntu system trust bundle', () => {
@@ -2980,6 +2983,7 @@ index c69b9ebd2..15735dbfe 100644
 +							'STUDIO_CA_FINGERPRINT_PATH="/usr/local/share/ca-certificates/studio-ca.crt.sha256"',
 +							`STUDIO_CA_FINGERPRINT_PATH="${ fingerprintPath }"`
 +						)
++						.replaceAll( "'0:1:regular file'", `'${ testOwner }:1:regular file'` )
 +						.replace( '/usr/sbin/update-ca-certificates --fresh >/dev/null', updateScript );
 +					fs.writeFileSync( removalScriptPath, removalScript, { mode: 0o755 } );
 +
@@ -3022,6 +3026,7 @@ index c69b9ebd2..15735dbfe 100644
 +						id: 'ubuntu',
 +						idLike: [ 'debian' ],
 +					} )
++						.replaceAll( "'0:1'", `'${ testOwner }:1'` )
 +						.split( '/usr/local/share/ca-certificates/' )
 +						.join( `${ trustDirectory }/` )
 +						.split( '/usr/sbin/update-ca-certificates' )
@@ -3062,6 +3067,7 @@ index c69b9ebd2..15735dbfe 100644
 +						id: 'ubuntu',
 +						idLike: [ 'debian' ],
 +					} )
++						.replaceAll( "'0:1'", `'${ testOwner }:1'` )
 +						.split( '/usr/local/share/ca-certificates/' )
 +						.join( `${ trustDirectory }/` )
 +						.split( '/usr/sbin/update-ca-certificates' )

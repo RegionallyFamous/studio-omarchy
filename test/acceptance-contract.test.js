@@ -85,7 +85,7 @@ test('removal resolves its package helper only through the validated Omarchy run
   )
   assert.match(
     remover,
-    /helper_path="\$OMARCHY_PATH\/bin\/omarchy-pkg-drop"[\s\S]*! -L \$helper_path[\s\S]*resolved_helper == "\$helper_path"[\s\S]*8#\$helper_mode & 8#022/
+    /helper_path="\$OMARCHY_PATH\/bin\/omarchy-pkg-drop"[\s\S]*\$OMARCHY_PATH == "\/usr\/share\/omarchy"[\s\S]*-L \$helper_path[\s\S]*\$helper_link_uid == 0[\s\S]*\$resolved_helper == "\/usr\/bin\/omarchy-pkg-drop"[\s\S]*! -L \$helper_path[\s\S]*8#\$helper_mode & 8#022/
   )
   assert.match(
     remover,
@@ -99,6 +99,10 @@ test('removal resolves its package helper only through the validated Omarchy run
   assert.match(
     acceptance,
     /pgrep -u "\$\(id -u\)" -f "\^\/bin\/bash -p \$PLUGIN_DIR\/scripts\/remove\[\.\]sh\( \|\$\)"/
+  )
+  assert.match(
+    acceptance,
+    /OMARCHY_PATH='\/usr\/share\/omarchy' PATH="\$run_root\/bin:\$PATH"[\s\S]*the package-absent remover accepts the configured Omarchy runtime/
   )
 })
 

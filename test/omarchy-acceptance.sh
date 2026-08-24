@@ -797,9 +797,12 @@ printf 'OMARCHY_PATH-injected helper ran\n' >>"$STUDIO_REMOVE_INJECTED_LOG"
 STUB
   chmod 755 "$run_root/injected-omarchy/bin/omarchy-pkg-drop"
 
-  PATH="$run_root/bin:$PATH" STUDIO_REMOVE_INJECTED_LOG="$run_root/injected.log" \
-    "$run_root/scripts/remove.sh" >"$run_root/path-output" 2>"$run_root/path-error" </dev/null ||
-    fail 'the package-absent remover accepts the configured Omarchy runtime'
+  if ! OMARCHY_PATH='/usr/share/omarchy' PATH="$run_root/bin:$PATH" \
+    STUDIO_REMOVE_INJECTED_LOG="$run_root/injected.log" \
+    "$run_root/scripts/remove.sh" >"$run_root/path-output" 2>"$run_root/path-error" </dev/null; then
+    fail 'the package-absent remover accepts the configured Omarchy runtime' \
+      "$(<"$run_root/path-error")"
+  fi
   [[ ! -e $run_root/injected.log ]] || fail 'the remover ignores a PATH-injected package helper'
   pass 'the remover ignores a PATH-injected package helper'
 

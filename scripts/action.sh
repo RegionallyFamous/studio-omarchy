@@ -6,6 +6,7 @@ unset BASH_ENV ENV CDPATH
 
 readonly SYSTEM_BIN='/usr/bin'
 readonly PROCESS_ENVIRON='/proc/self/environ'
+readonly PACKAGED_OMARCHY_ROOT='/usr/share/omarchy'
 export PATH="$SYSTEM_BIN:/bin"
 
 script_path=${BASH_SOURCE[0]}
@@ -49,7 +50,7 @@ sanitize_inherited_environment() {
 }
 
 run_in_terminal() {
-  local command=$1 omarchy_root launcher trusted_path quoted_path
+  local command=$1 omarchy_root launcher resolved_launcher trusted_path quoted_path
   local focus_uuid focus_title quoted_title quoted_sleep terminal_command
   local launcher_pid launcher_status=0 client='' address='' active_address='' focus_deadline
   local -a launcher_environment
@@ -65,6 +66,22 @@ run_in_terminal() {
     fail 'refusing a non-canonical OMARCHY_PATH for the terminal launcher'
   fi
   launcher="$omarchy_root/bin/omarchy-launch-floating-terminal-with-presentation"
+  if [[ $omarchy_root == "$PACKAGED_OMARCHY_ROOT" ]]; then
+    [[ -L $launcher ]] || fail 'the packaged Omarchy terminal launcher link is unavailable'
+    resolved_launcher=$("$SYSTEM_BIN/realpath" -e -- "$launcher") ||
+      fail 'the packaged Omarchy terminal launcher target is unavailable'
+    [[ $resolved_launcher == "$SYSTEM_BIN/omarchy-launch-floating-terminal-with-presentation" ]] ||
+      fail 'the packaged Omarchy terminal launcher link has an unexpected target'
+    launcher=$resolved_launcher
+  else
+    if [[ ! -f $launcher || -L $launcher || ! -x $launcher ]]; then
+      fail 'the fixed Omarchy terminal launcher is unavailable or unsafe'
+    fi
+    resolved_launcher=$("$SYSTEM_BIN/realpath" -e -- "$launcher") ||
+      fail 'the fixed Omarchy terminal launcher is unavailable or unsafe'
+    [[ $resolved_launcher == "$launcher" ]] ||
+      fail 'the fixed Omarchy terminal launcher path is not canonical'
+  fi
   if [[ ! -f $launcher || -L $launcher || ! -x $launcher ]]; then
     fail 'the fixed Omarchy terminal launcher is unavailable or unsafe'
   fi
