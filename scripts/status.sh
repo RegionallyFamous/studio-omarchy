@@ -1,6 +1,11 @@
-#!/bin/bash
+#!/bin/bash -p
 
 set -uo pipefail
+
+unset BASH_ENV ENV CDPATH
+
+export PATH=/usr/bin
+readonly PATH
 
 readonly package_name='wordpress-studio-omarchy'
 readonly raw_limit=96
@@ -16,11 +21,11 @@ version=''
 # exact one-line grammar are checked.
 # shellcheck disable=SC2016
 raw_hex=$(
-  timeout --signal=TERM --kill-after=1s 3s \
-    bash -c '
+  /usr/bin/timeout --signal=TERM --kill-after=1s 3s \
+    /usr/bin/bash -p -c '
       set -o pipefail
       trap "" HUP INT TERM
-      LC_ALL=C pacman -Q -- "$1" 2>/dev/null | head -c "$2" | od -An -v -tx1 | tr -d " \n"
+      LC_ALL=C /usr/bin/pacman -Q -- "$1" 2>/dev/null | /usr/bin/head -c "$2" | /usr/bin/od -An -v -tx1 | /usr/bin/tr -d " \n"
     ' studio-status-query "$package_name" "$((raw_limit + 1))"
 )
 query_status=$?

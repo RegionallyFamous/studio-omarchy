@@ -4,10 +4,102 @@ const path = require('node:path')
 const test = require('node:test')
 
 const acceptance = fs.readFileSync(path.join(__dirname, 'omarchy-acceptance.sh'), 'utf8')
+const remover = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'remove.sh'), 'utf8')
 
 test('guest idempotence check recognizes the fixed absolute pacman invocation', () => {
   assert.match(acceptance, /Running '\/usr\/bin\/pacman -U --needed --noconfirm/)
   assert.doesNotMatch(acceptance, /Running 'pacman -U --needed --noconfirm/)
+})
+
+test('guest executes the exact installer handoff as root without exposing host pacman', () => {
+  const extractionStart = acceptance.indexOf('extract_installer_privileged_handoff()')
+  const exerciseStart = acceptance.indexOf('exercise_real_privileged_handoff()')
+  const exerciseEnd = acceptance.indexOf('\nstudio_updater_process_absent()', exerciseStart)
+  const extraction = acceptance.slice(extractionStart, exerciseStart)
+  const exercise = acceptance.slice(exerciseStart, exerciseEnd)
+
+  assert.match(extraction, /line == "  \/usr\/bin\/sudo \/usr\/bin\/bash -c '"/)
+  assert.match(
+    extraction,
+    /line == "' bash \\"\\\$source_path\\" \\"\\\$package_name\\" \\"\\\$expected_hash\\" \\"\\\$max_bytes\\""/
+  )
+  assert.doesNotMatch(extraction, /sed|replace|sub\(/)
+  assert.match(exercise, /handoff_script=\$\(extract_installer_privileged_handoff "\$installer"\)/)
+  assert.match(exercise, /\/usr\/bin\/sudo \/usr\/bin\/bash -p -s --/)
+  assert.match(exercise, /\/usr\/bin\/unshare --mount --propagation private/)
+  assert.match(exercise, /\/usr\/bin\/mount --bind "\$1" \/usr\/bin\/pacman/)
+  assert.match(exercise, /\/usr\/bin\/cmp --silent -- "\$1" \/usr\/bin\/pacman/)
+  assert.match(exercise, /\/usr\/bin\/bash -c "\$root_script" bash/)
+  assert.match(exercise, /directory\|0\|0\|700/)
+  assert.match(exercise, /regular file\|0\|0\|600\|1/)
+  assert.match(exercise, /expect_rejection "\$run_root\/symlink\/\$package_name"/)
+  assert.match(exercise, /expect_rejection "\$run_root\/fifo\/\$package_name"/)
+  assert.match(exercise, /expect_rejection "\$run_root\/oversize\/\$package_name"/)
+  assert.match(exercise, /\$status == 1 && ! -e \$marker && ! -L \$marker/)
+  assert.match(
+    exercise,
+    /\[\[ \$\(\/usr\/bin\/sha256sum \/usr\/bin\/pacman\) == "\$host_pacman_hash  \/usr\/bin\/pacman" \]\]/
+  )
+})
+
+test('guest verifies exact installed privileged runtime metadata, hashes, and capability', () => {
+  const verifyStart = acceptance.indexOf('verify_installed_runtime_contract()')
+  const verifyEnd = acceptance.indexOf('\nexercise_real_privileged_handoff()', verifyStart)
+  const verify = acceptance.slice(verifyStart, verifyEnd)
+
+  assert.match(verify, /regular file\|0\|0\|4755\|1/)
+  assert.match(verify, /regular file\|0\|0\|755\|1/)
+  assert.match(verify, /regular file\|0\|0\|644\|1/)
+  assert.match(verify, /\^\(\[0-9a-f\]\{64\}\).*chrome-sandbox/)
+  assert.match(verify, /\^\(\[0-9a-f\]\{64\}\).*resources\/bin\/node/)
+  assert.match(verify, /\/usr\/bin\/sha256sum -- \/usr\/lib\/studio\/chrome-sandbox/)
+  assert.match(verify, /\/usr\/bin\/sha256sum -- "\$BUNDLED_NODE"/)
+  assert.match(verify, /\/usr\/bin\/getcap "\$BUNDLED_NODE"/)
+  assert.match(verify, /\$BUNDLED_NODE cap_net_bind_service=ep/)
+  assert.match(verify, /getcap \/usr\/lib\/studio\/studio/)
+  assert.match(verify, /getcap \/usr\/lib\/studio\/chrome-sandbox/)
+  assert.match(acceptance, /verify_installed_runtime_contract 'the installer'/)
+  assert.match(acceptance, /verify_installed_runtime_contract 'the same-version updater'/)
+})
+
+test('status containment rewrites only disposable copies of the fixed pacman path', () => {
+  assert.match(
+    acceptance,
+    /exercise_status_containment\(\)[\s\S]*sed "s\|\/usr\/bin\/pacman\|\$run_root\/bin\/pacman\|"[\s\S]*"\$run_root\/status\.sh"/
+  )
+  assert.match(
+    acceptance,
+    /exercise_status_pre_ready_containment\(\)[\s\S]*sed "s\|\/usr\/bin\/pacman\|\$run_root\/bin\/pacman\|"[\s\S]*"\$run_root\/status\.base\.sh"/
+  )
+})
+
+test('removal resolves its package helper only through the validated Omarchy runtime', () => {
+  assert.match(remover, /export PATH=\/usr\/bin\nreadonly PATH\nunset BASH_ENV ENV CDPATH/)
+  assert.match(
+    remover,
+    /omarchy_config='\/etc\/omarchy\.conf'[\s\S]*validate_omarchy_runtime\(\)[\s\S]*config_uid == 0[\s\S]*8#\$config_mode & 8#022[\s\S]*\$OMARCHY_PATH == "\$configured_path"/
+  )
+  assert.match(
+    remover,
+    /resolved_path=\$\(\/usr\/bin\/realpath -e -- "\$OMARCHY_PATH"\)[\s\S]*\$resolved_path == "\$OMARCHY_PATH"/
+  )
+  assert.match(
+    remover,
+    /helper_path="\$OMARCHY_PATH\/bin\/omarchy-pkg-drop"[\s\S]*! -L \$helper_path[\s\S]*resolved_helper == "\$helper_path"[\s\S]*8#\$helper_mode & 8#022/
+  )
+  assert.match(
+    remover,
+    /\$OMARCHY_PATH == "\/usr\/share\/omarchy"[\s\S]*\$helper_uid == 0[\s\S]*\/usr\/bin\/pacman -Qq -- omarchy-dev[\s\S]*\$helper_uid == "\$current_uid"/
+  )
+  assert.match(
+    remover,
+    /\/usr\/bin\/env -i PATH=\/usr\/bin TERM="\$\{TERM:-dumb\}"[\s\\]*"\$omarchy_pkg_drop" wordpress-studio-omarchy\s*$/
+  )
+  assert.doesNotMatch(remover, /\nomarchy-pkg-drop wordpress-studio-omarchy/)
+  assert.match(
+    acceptance,
+    /pgrep -u "\$\(id -u\)" -f "\^\/bin\/bash -p \$PLUGIN_DIR\/scripts\/remove\[\.\]sh\( \|\$\)"/
+  )
 })
 
 test('custom-domain entry lets the field mount before tabbing into it', () => {

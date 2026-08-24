@@ -1,13 +1,19 @@
-#!/bin/bash
+#!/bin/bash -p
 
 set -Eeuo pipefail
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export PATH=/usr/bin
+readonly PATH
+unset BASH_ENV ENV CDPATH
+
+script_dir=$(cd -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd)
 studio_root='/usr/lib/studio'
 studio_process_pattern='^/usr/lib/studio/'
 bundled_node="$studio_root/resources/bin/node"
 bundled_cli="$studio_root/resources/cli/main.mjs"
-current_uid=$(id -u)
+current_uid=$(/usr/bin/id -u)
+omarchy_config='/etc/omarchy.conf'
+omarchy_pkg_drop=''
 cli_runtime_root=''
 cli_ready_file=''
 cli_go_file=''
@@ -15,6 +21,119 @@ cli_controller_pid=''
 cli_unit=''
 cli_control_group=''
 cli_verified=false
+
+validate_omarchy_runtime() {
+  local configured_path='/usr/share/omarchy' resolved_path helper_path resolved_helper
+  local config_uid config_mode config_links runtime_uid runtime_mode bin_uid bin_mode
+  local helper_uid helper_mode helper_links extra package_name
+
+  [[ -n ${OMARCHY_PATH:-} && $OMARCHY_PATH == /* &&
+    $OMARCHY_PATH != *$'\n'* && $OMARCHY_PATH != *$'\r'* ]] || {
+    echo 'The trusted Omarchy runtime path is unavailable; removal was cancelled.' >&2
+    return 1
+  }
+
+  if [[ -e $omarchy_config || -L $omarchy_config ]]; then
+    [[ -f $omarchy_config && ! -L $omarchy_config ]] || {
+      echo 'The Omarchy runtime configuration is not a regular file; removal was cancelled.' >&2
+      return 1
+    }
+    read -r config_uid config_mode config_links extra < <(
+      /usr/bin/stat -Lc '%u %a %h' -- "$omarchy_config"
+    ) || return 1
+    [[ $config_uid == 0 && $config_links == 1 && -z ${extra:-} &&
+      $config_mode =~ ^[0-7]{3,4}$ ]] || {
+      echo 'The Omarchy runtime configuration has unsafe metadata; removal was cancelled.' >&2
+      return 1
+    }
+    (( (8#$config_mode & 8#022) == 0 )) || {
+      echo 'The Omarchy runtime configuration is writable by an untrusted account; removal was cancelled.' >&2
+      return 1
+    }
+    # shellcheck disable=SC2016
+    configured_path=$(/usr/bin/env -i PATH=/usr/bin /usr/bin/bash --noprofile --norc -c '
+      set -Eeuo pipefail
+      OMARCHY_PATH=/usr/share/omarchy
+      source "$1"
+      printf "%s" "$OMARCHY_PATH"
+    ' studio-remove-config "$omarchy_config") || {
+      echo 'The Omarchy runtime configuration could not be read safely; removal was cancelled.' >&2
+      return 1
+    }
+  fi
+
+  [[ -n $configured_path && $configured_path == /* &&
+    $configured_path != *$'\n'* && $configured_path != *$'\r'* &&
+    $OMARCHY_PATH == "$configured_path" ]] || {
+    echo 'The running Omarchy session does not match its system configuration; removal was cancelled.' >&2
+    return 1
+  }
+  resolved_path=$(/usr/bin/realpath -e -- "$OMARCHY_PATH") || {
+    echo 'The configured Omarchy runtime does not exist; removal was cancelled.' >&2
+    return 1
+  }
+  [[ $resolved_path == "$OMARCHY_PATH" ]] || {
+    echo 'The configured Omarchy runtime path is not canonical; removal was cancelled.' >&2
+    return 1
+  }
+  read -r runtime_uid runtime_mode extra < <(
+    /usr/bin/stat -Lc '%u %a' -- "$OMARCHY_PATH"
+  ) || return 1
+  [[ -z ${extra:-} && $runtime_mode =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$runtime_mode & 8#022) == 0 )) || {
+    echo 'The Omarchy runtime directory is writable by an untrusted account; removal was cancelled.' >&2
+    return 1
+  }
+  read -r bin_uid bin_mode extra < <(
+    /usr/bin/stat -Lc '%u %a' -- "$OMARCHY_PATH/bin"
+  ) || return 1
+  [[ -z ${extra:-} && $bin_mode =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$bin_mode & 8#022) == 0 )) || {
+    echo 'The Omarchy command directory is writable by an untrusted account; removal was cancelled.' >&2
+    return 1
+  }
+
+  helper_path="$OMARCHY_PATH/bin/omarchy-pkg-drop"
+  [[ -f $helper_path && ! -L $helper_path && -x $helper_path ]] || {
+    echo 'The trusted Omarchy package-removal helper is unavailable; removal was cancelled.' >&2
+    return 1
+  }
+  resolved_helper=$(/usr/bin/realpath -e -- "$helper_path") || return 1
+  [[ $resolved_helper == "$helper_path" ]] || {
+    echo 'The Omarchy package-removal helper path is not canonical; removal was cancelled.' >&2
+    return 1
+  }
+  read -r helper_uid helper_mode helper_links extra < <(
+    /usr/bin/stat -Lc '%u %a %h' -- "$helper_path"
+  ) || return 1
+  [[ $helper_links == 1 && -z ${extra:-} && $helper_mode =~ ^[0-7]{3,4}$ ]] || {
+    echo 'The Omarchy package-removal helper has unsafe metadata; removal was cancelled.' >&2
+    return 1
+  }
+  (( (8#$helper_mode & 8#022) == 0 )) || {
+    echo 'The Omarchy package-removal helper is writable by an untrusted account; removal was cancelled.' >&2
+    return 1
+  }
+
+  if [[ $OMARCHY_PATH == "/usr/share/omarchy" ]]; then
+    [[ $runtime_uid == 0 && $bin_uid == 0 && $helper_uid == 0 ]] || {
+      echo 'The packaged Omarchy runtime is not root-owned; removal was cancelled.' >&2
+      return 1
+    }
+  else
+    package_name=$(/usr/bin/pacman -Qq -- omarchy-dev 2>/dev/null) || {
+      echo 'A custom Omarchy runtime is allowed only in the explicit development channel; removal was cancelled.' >&2
+      return 1
+    }
+    [[ $package_name == "omarchy-dev" && $runtime_uid == "$current_uid" &&
+      $bin_uid == "$current_uid" && $helper_uid == "$current_uid" ]] || {
+      echo 'The development Omarchy runtime is not owned by the current user; removal was cancelled.' >&2
+      return 1
+    }
+  fi
+
+  omarchy_pkg_drop=$helper_path
+}
 
 systemctl_user() {
   timeout --signal=TERM --kill-after=1s 3s systemctl --user "$@"
@@ -359,6 +478,8 @@ run_bounded_stop_cli() {
 
 trap show_failure ERR
 
+validate_omarchy_runtime
+
 if studio_app_running; then
   echo 'Quit WordPress Studio normally before removing it so active Sync work can finish or be cancelled safely.' >&2
   false
@@ -373,4 +494,5 @@ if studio_processes_present; then
 fi
 
 "$script_dir/cleanup-user-trust.sh"
-omarchy-pkg-drop wordpress-studio-omarchy
+/usr/bin/env -i PATH=/usr/bin TERM="${TERM:-dumb}" \
+  "$omarchy_pkg_drop" wordpress-studio-omarchy

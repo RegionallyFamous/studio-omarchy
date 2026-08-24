@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 
 set -euo pipefail
 
@@ -6,13 +6,56 @@ readonly STUDIO_CA_NICKNAME='WordPress Studio CA'
 readonly CALL_TIMEOUT='6s'
 readonly CALL_KILL_GRACE='2s'
 readonly MAX_FIREFOX_PROFILE_DBS=24
+readonly TRUSTED_PATH='/usr/bin:/usr/sbin'
+readonly TIMEOUT_BIN='/usr/bin/timeout'
+readonly FIND_BIN='/usr/bin/find'
+readonly MKTEMP_BIN='/usr/bin/mktemp'
+readonly CHMOD_BIN='/usr/bin/chmod'
+readonly RM_BIN='/usr/bin/rm'
+readonly CERTUTIL_BIN='/usr/bin/certutil'
+readonly OPENSSL_BIN='/usr/bin/openssl'
+readonly ID_BIN='/usr/bin/id'
+readonly GETENT_BIN='/usr/bin/getent'
+readonly HEAD_BIN='/usr/bin/head'
+readonly STAT_BIN='/usr/bin/stat'
+readonly TRUST_TEMP_PARENT='/tmp'
+readonly MAX_PASSWD_RECORD_BYTES=4096
+readonly MAX_CERTIFICATE_BYTES=65536
+
+PATH=$TRUSTED_PATH
+LC_ALL=C
+export PATH LC_ALL
+readonly PATH LC_ALL
 
 warn() {
   printf 'WordPress Studio: %s\n' "$1" >&2
 }
 
 run_bounded() {
-  timeout --foreground --signal=TERM --kill-after="$CALL_KILL_GRACE" "$CALL_TIMEOUT" "$@"
+  "$TIMEOUT_BIN" --foreground --signal=TERM --kill-after="$CALL_KILL_GRACE" "$CALL_TIMEOUT" "$@"
+}
+
+require_tool() {
+  local tool=$1 label=$2
+
+  if [[ ! -f $tool || ! -x $tool ]]; then
+    warn "cannot clean browser trust because the trusted $label tool is unavailable"
+    exit 1
+  fi
+}
+
+cleanup_private_temp() {
+  if [[ ! -e $cleanup_temp_real && ! -L $cleanup_temp_real ]]; then
+    return
+  fi
+
+  if [[ $cleanup_temp_real != "$temp_parent_real/wordpress-studio-trust."* ||
+    ! -d $cleanup_temp_real || -L $cleanup_temp_real || ! -O $cleanup_temp_real ]]; then
+    warn 'refusing an unsafe browser trust cleanup trap target'
+    return
+  fi
+
+  "$RM_BIN" -rf -- "$cleanup_temp_real"
 }
 
 take_nul_records() {
@@ -29,7 +72,7 @@ write_bounded_firefox_profiles() {
   local -a pipeline_status
 
   set +e
-  run_bounded find "$root" -mindepth 1 -maxdepth 1 \
+  run_bounded "$FIND_BIN" "$root" -mindepth 1 -maxdepth 1 \
     \( -name '*.default' -o -name '*.default-*' \) -print0 |
     take_nul_records "$limit" >"$output"
   pipeline_status=("${PIPESTATUS[@]}")
@@ -49,6 +92,34 @@ normalize_fingerprint() {
 
   [[ $fingerprint =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
   printf '%s\n' "$fingerprint"
+}
+
+bounded_file_size() {
+  local file=$1 size
+
+  if ! size=$(run_bounded "$STAT_BIN" -c '%s' -- "$file") || [[ ! $size =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "$size"
+}
+
+snapshot_bounded_certificate() {
+  local source=$1 destination=$2 label=$3 size
+
+  if ! run_bounded "$HEAD_BIN" -c "$((MAX_CERTIFICATE_BYTES + 1))" -- "$source" \
+    >"$destination"; then
+    warn "cannot read a bounded $label snapshot"
+    return 1
+  fi
+  if [[ ! -f $destination || -L $destination || ! -O $destination ]] ||
+    ! size=$(bounded_file_size "$destination"); then
+    warn "cannot validate the bounded $label snapshot"
+    return 1
+  fi
+  if (( size > MAX_CERTIFICATE_BYTES )); then
+    warn "refusing a $label larger than $MAX_CERTIFICATE_BYTES bytes"
+    return 1
+  fi
 }
 
 validate_nss_db() {
@@ -114,48 +185,141 @@ validate_firefox_root() {
 }
 
 nss_db_is_readable() {
-  run_bounded certutil -L -d "sql:$1" >/dev/null 2>&1
+  run_bounded "$CERTUTIL_BIN" -L -d "sql:$1" >/dev/null 2>&1
 }
 
 nss_has_studio_ca() {
-  run_bounded certutil -L -d "sql:$1" -n "$STUDIO_CA_NICKNAME" >/dev/null 2>&1
+  local status
+
+  if run_bounded "$CERTUTIL_BIN" -L -d "sql:$1" -n "$STUDIO_CA_NICKNAME" \
+    >/dev/null 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+
+  if (( status == 1 || status == 255 )); then
+    return 1
+  fi
+  return 2
 }
 
 nss_studio_fingerprint() {
-  local output
+  local output certificate_file="$cleanup_temp/nss-studio-ca.pem" size
+  local producer_status consumer_status
+  local -a pipeline_status
 
-  output=$(
-    set -o pipefail
-    run_bounded certutil -L -d "sql:$1" -n "$STUDIO_CA_NICKNAME" -a 2>/dev/null |
-      run_bounded openssl x509 -noout -fingerprint -sha256 2>/dev/null
-  ) || return 1
+  set +e
+  run_bounded "$CERTUTIL_BIN" -L -d "sql:$1" -n "$STUDIO_CA_NICKNAME" -a 2>/dev/null |
+    run_bounded "$HEAD_BIN" -c "$((MAX_CERTIFICATE_BYTES + 1))" >"$certificate_file"
+  pipeline_status=("${PIPESTATUS[@]}")
+  producer_status=${pipeline_status[0]}
+  consumer_status=${pipeline_status[1]}
+  set -e
+
+  (( consumer_status == 0 )) || return 1
+  if [[ ! -f $certificate_file || -L $certificate_file || ! -O $certificate_file ]] ||
+    ! size=$(bounded_file_size "$certificate_file"); then
+    return 1
+  fi
+  if (( size > MAX_CERTIFICATE_BYTES )); then
+    warn "refusing a browser Studio certificate larger than $MAX_CERTIFICATE_BYTES bytes"
+    return 1
+  fi
+  (( producer_status == 0 )) || return 1
+
+  output=$(run_bounded "$OPENSSL_BIN" x509 -noout -fingerprint -sha256 \
+    <"$certificate_file" 2>/dev/null) || return 1
 
   normalize_fingerprint "$output"
 }
 
-if [[ -z ${HOME:-} || $HOME != /* || $HOME == "/" || ! -d $HOME || -L $HOME || ! -O $HOME ]]; then
-  warn 'refusing to guess or use an unsafe current-user home directory'
+for tool_spec in \
+  "$TIMEOUT_BIN:timeout" \
+  "$FIND_BIN:find" \
+  "$MKTEMP_BIN:mktemp" \
+  "$CHMOD_BIN:chmod" \
+  "$RM_BIN:rm" \
+  "$ID_BIN:id" \
+  "$GETENT_BIN:getent" \
+  "$HEAD_BIN:head" \
+  "$STAT_BIN:stat"; do
+  require_tool "${tool_spec%%:*}" "${tool_spec#*:}"
+done
+
+if ! current_uid=$(run_bounded "$ID_BIN" -u) || [[ ! $current_uid =~ ^[0-9]+$ ]]; then
+  warn 'cannot determine the current user ID safely'
   exit 1
 fi
 
-home_real=$(cd -- "$HOME" 2>/dev/null && pwd -P) || {
-  warn 'unable to resolve the current-user home directory'
+passwd_record=$(
+  run_bounded "$GETENT_BIN" passwd "$current_uid" |
+    "$HEAD_BIN" -c "$((MAX_PASSWD_RECORD_BYTES + 1))"
+) || {
+  warn 'cannot resolve the current user through the system account database'
+  exit 1
+}
+if (( ${#passwd_record} == 0 || ${#passwd_record} > MAX_PASSWD_RECORD_BYTES )) ||
+  [[ $passwd_record == *$'\n'* ]]; then
+  warn 'refusing an invalid or oversized current-user account record'
+  exit 1
+fi
+IFS=: read -r -a passwd_fields <<<"$passwd_record"
+if (( ${#passwd_fields[@]} != 7 )); then
+  warn 'refusing a malformed current-user account record'
+  exit 1
+fi
+passwd_uid=${passwd_fields[2]}
+passwd_home=${passwd_fields[5]}
+if [[ $passwd_uid != "$current_uid" || $passwd_home != /* ||
+  $passwd_home == "/" || ! -d $passwd_home || -L $passwd_home || ! -O $passwd_home ]]; then
+  warn 'refusing an unsafe current-user home from the system account database'
+  exit 1
+fi
+
+home_real=$(cd -- "$passwd_home" 2>/dev/null && pwd -P) || {
+  warn 'unable to resolve the system current-user home directory'
+  exit 1
+}
+if [[ $home_real != /* || $home_real == "/" || ! -d $home_real || -L $home_real ||
+  ! -O $home_real ]]; then
+  warn 'refusing an unsafe canonical current-user home directory'
+  exit 1
+fi
+HOME=$home_real
+export HOME
+readonly HOME home_real
+
+if [[ ! -d $TRUST_TEMP_PARENT || -L $TRUST_TEMP_PARENT ]]; then
+  warn 'cannot use the fixed browser trust cleanup directory parent'
+  exit 1
+fi
+temp_parent_real=$(cd -- "$TRUST_TEMP_PARENT" 2>/dev/null && pwd -P) || {
+  warn 'cannot resolve the fixed browser trust cleanup directory parent'
   exit 1
 }
 
-for dependency in timeout find mktemp; do
-  if ! command -v "$dependency" >/dev/null 2>&1; then
-    warn "cannot enumerate browser trust databases because $dependency is unavailable"
-    exit 1
-  fi
-done
-
-cleanup_temp=$(mktemp -d) || {
+cleanup_temp=$("$MKTEMP_BIN" -d --tmpdir="$temp_parent_real" \
+  'wordpress-studio-trust.XXXXXXXXXX') || {
   warn 'cannot create a private browser trust cleanup directory'
   exit 1
 }
-chmod 700 "$cleanup_temp"
-trap 'rm -rf -- "$cleanup_temp"' EXIT
+if [[ $cleanup_temp != "$temp_parent_real/wordpress-studio-trust."* ||
+  ! -d $cleanup_temp || -L $cleanup_temp || ! -O $cleanup_temp ]]; then
+  warn 'refusing an unsafe private browser trust cleanup directory'
+  exit 1
+fi
+cleanup_temp_real=$(cd -- "$cleanup_temp" 2>/dev/null && pwd -P) || {
+  warn 'cannot resolve the private browser trust cleanup directory'
+  exit 1
+}
+if [[ $cleanup_temp_real != "$cleanup_temp" ]]; then
+  warn 'refusing a non-canonical private browser trust cleanup directory'
+  exit 1
+fi
+readonly temp_parent_real cleanup_temp cleanup_temp_real
+"$CHMOD_BIN" 700 "$cleanup_temp_real"
+trap cleanup_private_temp EXIT
 
 failures=0
 nss_candidates=(
@@ -233,20 +397,23 @@ if (( ${#nss_dbs[@]} == 0 )); then
   exit 0
 fi
 
-for dependency in timeout certutil; do
-  if ! command -v "$dependency" >/dev/null 2>&1; then
-    warn "cannot clean browser trust because $dependency is unavailable"
-    exit 1
-  fi
-done
+require_tool "$CERTUTIL_BIN" certutil
 
 studio_dbs=()
 for db in "${nss_dbs[@]}"; do
   if nss_has_studio_ca "$db"; then
     studio_dbs+=("$db")
-  elif ! nss_db_is_readable "$db"; then
-    warn "cannot inspect NSS database: $db"
-    ((failures += 1))
+  else
+    lookup_status=$?
+    if (( lookup_status == 1 )); then
+      if ! nss_db_is_readable "$db"; then
+        warn "cannot inspect NSS database: $db"
+        ((failures += 1))
+      fi
+    else
+      warn "Studio certificate lookup timed out or failed in NSS database: $db"
+      ((failures += 1))
+    fi
   fi
 done
 
@@ -274,11 +441,12 @@ if [[ $ca_dir_real != "$home_real/"* || ! -f $ca_file || -L $ca_file || ! -O $ca
   exit 1
 fi
 
-if ! command -v openssl >/dev/null 2>&1; then
-  warn 'cannot clean browser trust because openssl is unavailable'
+require_tool "$OPENSSL_BIN" openssl
+ca_snapshot="$cleanup_temp/studio-ca.crt"
+if ! snapshot_bounded_certificate "$ca_file" "$ca_snapshot" 'Studio CA'; then
   exit 1
 fi
-if ! ca_output=$(run_bounded openssl x509 -in "$ca_file" -noout -fingerprint -sha256 2>/dev/null) ||
+if ! ca_output=$(run_bounded "$OPENSSL_BIN" x509 -in "$ca_snapshot" -noout -fingerprint -sha256 2>/dev/null) ||
   ! ca_fingerprint=$(normalize_fingerprint "$ca_output"); then
   warn 'cannot read a valid SHA-256 fingerprint from the Studio CA file'
   exit 1
@@ -297,15 +465,22 @@ for db in "${studio_dbs[@]}"; do
     continue
   fi
 
-  if ! run_bounded certutil -D -d "sql:$db" -n "$STUDIO_CA_NICKNAME" >/dev/null 2>&1; then
+  if ! run_bounded "$CERTUTIL_BIN" -D -d "sql:$db" -n "$STUDIO_CA_NICKNAME" >/dev/null 2>&1; then
     warn "failed to remove the matching Studio trust entry from: $db"
     ((failures += 1))
     continue
   fi
-  if nss_has_studio_ca "$db" || ! nss_db_is_readable "$db"; then
+  if nss_has_studio_ca "$db"; then
     warn "could not verify Studio trust removal from: $db"
     ((failures += 1))
     continue
+  else
+    lookup_status=$?
+    if (( lookup_status != 1 )) || ! nss_db_is_readable "$db"; then
+      warn "could not verify Studio trust removal from: $db"
+      ((failures += 1))
+      continue
+    fi
   fi
 
   ((removed += 1))

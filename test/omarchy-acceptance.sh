@@ -273,7 +273,7 @@ studio_processes_absent() {
 }
 
 studio_remover_process_absent() {
-  ! pgrep -u "$(id -u)" -f "^/bin/bash $PLUGIN_DIR/scripts/remove[.]sh( |$)" >/dev/null
+  ! pgrep -u "$(id -u)" -f "^/bin/bash -p $PLUGIN_DIR/scripts/remove[.]sh( |$)" >/dev/null
 }
 
 pointer_is_near() {
@@ -706,8 +706,11 @@ printf '%s\n' "$$" >"$STUDIO_STATUS_CHILD_PID"
 while :; do sleep 1; done
 STUB
   chmod 755 "$run_root/bin/pacman"
+  sed "s|/usr/bin/pacman|$run_root/bin/pacman|" \
+    "$FIXTURE/scripts/status.sh" >"$run_root/status.sh"
+  chmod 755 "$run_root/status.sh"
   PATH="$run_root/bin:$PATH" STUDIO_STATUS_CHILD_PID="$run_root/child.pid" \
-    "$FIXTURE/scripts/status.sh" >"$run_root/output" 2>"$run_root/error" &
+    "$run_root/status.sh" >"$run_root/output" 2>"$run_root/error" &
   controller_pid=$!
   printf '%s\n' "$controller_pid" >"$run_root/controller.pid"
   wait_until "the $mode containment worker starts" 5 test -s "$run_root/child.pid"
@@ -731,6 +734,8 @@ exercise_status_pre_ready_containment() {
 
   mkdir -p "$run_root/bin"
   mkfifo "$run_root/hold-before-query"
+  sed "s|/usr/bin/pacman|$run_root/bin/pacman|" \
+    "$FIXTURE/scripts/status.sh" >"$run_root/status.base.sh"
   awk '
     $0 == "raw_hex=$(" {
       print "if [[ -n ${STUDIO_STATUS_HOLD_BEFORE_QUERY:-} ]]; then"
@@ -739,7 +744,7 @@ exercise_status_pre_ready_containment() {
       print "fi"
     }
     { print }
-  ' "$FIXTURE/scripts/status.sh" >"$run_root/status.sh"
+  ' "$run_root/status.base.sh" >"$run_root/status.sh"
   chmod 755 "$run_root/status.sh"
   cat >"$run_root/bin/pacman" <<'STUB'
 #!/bin/bash
@@ -770,6 +775,47 @@ STUB
   [[ ! -e $run_root/child.pid ]] || fail 'pre-query status controller death never starts pacman'
   pass 'pre-query status controller death remains fail-closed'
   : >"$run_root/controller.pid"
+}
+
+exercise_remove_runtime_resolution() {
+  local run_root="$containment_root/remove-runtime-resolution"
+  local injected_status=0
+
+  mkdir -p "$run_root/scripts" "$run_root/bin" "$run_root/injected-omarchy/bin"
+  cp -- "$FIXTURE/scripts/remove.sh" "$run_root/scripts/remove.sh"
+  chmod 755 "$run_root/scripts/remove.sh"
+  printf '%s\n' '#!/bin/bash' 'exit 0' >"$run_root/scripts/cleanup-user-trust.sh"
+  chmod 755 "$run_root/scripts/cleanup-user-trust.sh"
+  cat >"$run_root/bin/omarchy-pkg-drop" <<'STUB'
+#!/bin/bash
+printf 'PATH-injected helper ran\n' >>"$STUDIO_REMOVE_INJECTED_LOG"
+STUB
+  chmod 755 "$run_root/bin/omarchy-pkg-drop"
+  cat >"$run_root/injected-omarchy/bin/omarchy-pkg-drop" <<'STUB'
+#!/bin/bash
+printf 'OMARCHY_PATH-injected helper ran\n' >>"$STUDIO_REMOVE_INJECTED_LOG"
+STUB
+  chmod 755 "$run_root/injected-omarchy/bin/omarchy-pkg-drop"
+
+  PATH="$run_root/bin:$PATH" STUDIO_REMOVE_INJECTED_LOG="$run_root/injected.log" \
+    "$run_root/scripts/remove.sh" >"$run_root/path-output" 2>"$run_root/path-error" </dev/null ||
+    fail 'the package-absent remover accepts the configured Omarchy runtime'
+  [[ ! -e $run_root/injected.log ]] || fail 'the remover ignores a PATH-injected package helper'
+  pass 'the remover ignores a PATH-injected package helper'
+
+  if OMARCHY_PATH="$run_root/injected-omarchy" PATH="$run_root/bin:$PATH" \
+    STUDIO_REMOVE_INJECTED_LOG="$run_root/injected.log" \
+    "$run_root/scripts/remove.sh" >"$run_root/config-output" 2>"$run_root/config-error" </dev/null; then
+    fail 'the remover rejects an OMARCHY_PATH that differs from the root-managed configuration'
+  else
+    injected_status=$?
+  fi
+  (( injected_status == 130 )) ||
+    fail 'the OMARCHY_PATH-injected remover returns its fail-closed status'
+  grep -qF 'does not match its system configuration' "$run_root/config-error" ||
+    fail 'the OMARCHY_PATH-injected remover reports its configuration mismatch'
+  [[ ! -e $run_root/injected.log ]] || fail 'the remover never executes an OMARCHY_PATH-injected helper'
+  pass 'the remover rejects an OMARCHY_PATH-injected package helper'
 }
 
 exercise_remove_pre_ready_containment() {
@@ -1027,6 +1073,272 @@ verify_package_handoff_contract() {
     grep -qF "/usr/bin/sha256sum \"$staged_path_literal\"" <<<"$root_script" &&
     grep -qF "$staged_hash_guard" <<<"$root_script" &&
     grep -qF "/usr/bin/pacman -U --needed --noconfirm -- \"$staged_path_literal\"" <<<"$root_script"
+}
+
+extract_installer_privileged_handoff() {
+  local installer=$1 line collecting=false complete=false
+
+  while IFS= read -r line; do
+    if [[ $collecting == "false" ]]; then
+      if [[ $line == "  /usr/bin/sudo /usr/bin/bash -c '" ]]; then
+        collecting=true
+      fi
+    elif [[ $line == "' bash \"\$source_path\" \"\$package_name\" \"\$expected_hash\" \"\$max_bytes\"" ]]; then
+      complete=true
+      break
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$installer"
+
+  [[ $collecting == "true" && $complete == "true" ]]
+}
+
+verify_installed_runtime_contract() {
+  local operation=$1 integrity='/usr/lib/studio/.omarchy-runtime-integrity'
+  local sandbox_metadata node_metadata integrity_metadata sandbox_hash node_hash capability
+  local -a records=()
+
+  [[ -f /usr/lib/studio/chrome-sandbox && ! -L /usr/lib/studio/chrome-sandbox &&
+    -f $BUNDLED_NODE && ! -L $BUNDLED_NODE &&
+    -f $integrity && ! -L $integrity ]] ||
+    fail "$operation installs only regular privileged runtime files"
+  sandbox_metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- /usr/lib/studio/chrome-sandbox) ||
+    fail "$operation exposes the Chromium sandbox metadata"
+  node_metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$BUNDLED_NODE") ||
+    fail "$operation exposes the bundled Node metadata"
+  integrity_metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$integrity") ||
+    fail "$operation exposes the runtime integrity metadata"
+  [[ $sandbox_metadata == 'regular file|0|0|4755|1' &&
+    $node_metadata == 'regular file|0|0|755|1' &&
+    $integrity_metadata == 'regular file|0|0|644|1' ]] ||
+    fail "$operation preserves exact root ownership, modes, and single links for privileged runtime files"
+
+  mapfile -t records <"$integrity"
+  (( ${#records[@]} == 2 )) || fail "$operation installs exactly two runtime integrity records"
+  [[ ${records[0]} =~ ^([0-9a-f]{64})\ \ chrome-sandbox$ ]] ||
+    fail "$operation installs the exact Chromium sandbox integrity record"
+  sandbox_hash=${BASH_REMATCH[1]}
+  [[ ${records[1]} =~ ^([0-9a-f]{64})\ \ resources/bin/node$ ]] ||
+    fail "$operation installs the exact bundled Node integrity record"
+  node_hash=${BASH_REMATCH[1]}
+  [[ $(/usr/bin/sha256sum -- /usr/lib/studio/chrome-sandbox) == "$sandbox_hash  /usr/lib/studio/chrome-sandbox" &&
+    $(/usr/bin/sha256sum -- "$BUNDLED_NODE") == "$node_hash  $BUNDLED_NODE" ]] ||
+    fail "$operation privileged runtime bytes match the root-owned integrity manifest"
+
+  capability=$(/usr/bin/getcap "$BUNDLED_NODE") ||
+    fail "$operation reads the bundled Node file capability"
+  [[ $capability == "$BUNDLED_NODE cap_net_bind_service=ep" ]] ||
+    fail "$operation grants only the exact privileged-port capability to bundled Node"
+  [[ -z $(/usr/bin/getcap /usr/lib/studio/studio) &&
+    -z $(/usr/bin/getcap /usr/lib/studio/chrome-sandbox) ]] ||
+    fail "$operation does not grant file capabilities to Electron or the Chromium sandbox"
+  pass "$operation installs exact root-owned runtime bytes and the bounded Node capability"
+}
+
+exercise_real_privileged_handoff() {
+  local run_root="$containment_root/privileged-handoff" installer="$PLUGIN_DIR/install.sh"
+  local package_name='wordpress-studio-omarchy-0.0.1-1-x86_64.pkg.tar.zst'
+  local safe_source safe_bytes safe_hash oversize_hash handoff_script handoff_encoded handoff_hash
+  local fake_pacman fake_pacman_encoded root_driver root_driver_encoded terminal_command result
+  local acceptance_uid acceptance_gid installed_package_before_handoff
+
+  safe_source="$run_root/safe/$package_name"
+  result="$run_root/result"
+  mkdir -p "$run_root/safe" "$run_root/symlink" "$run_root/fifo" "$run_root/oversize"
+  chmod 700 "$run_root" "$run_root/safe" "$run_root/symlink" "$run_root/fifo" "$run_root/oversize"
+  printf '%s' 'exact-root-handoff' >"$safe_source"
+  safe_bytes=$(/usr/bin/wc -c <"$safe_source")
+  safe_hash=$(/usr/bin/sha256sum "$safe_source")
+  safe_hash=${safe_hash%% *}
+  /usr/bin/ln -s -- "$safe_source" "$run_root/symlink/$package_name"
+  /usr/bin/mkfifo "$run_root/fifo/$package_name"
+  /usr/bin/cp -- "$safe_source" "$run_root/oversize/$package_name"
+  printf 'x' >>"$run_root/oversize/$package_name"
+  oversize_hash=$(/usr/bin/sha256sum "$run_root/oversize/$package_name")
+  oversize_hash=${oversize_hash%% *}
+
+  handoff_script=$(extract_installer_privileged_handoff "$installer") ||
+    fail 'the guest extracts the exact installer privileged handoff without rewriting it'
+  # shellcheck disable=SC2016 # Match the literal production staged-path variable.
+  [[ $handoff_script == *'/usr/bin/dd'* &&
+    $handoff_script == *'iflag=nofollow,nonblock,fullblock,count_bytes'* &&
+    $handoff_script == *'/usr/bin/pacman -U --needed --noconfirm -- "$staged_path"'* ]] ||
+    fail 'the extracted installer handoff retains its nofollow copy and fixed package boundary'
+  handoff_encoded=$(printf '%s\n' "$handoff_script" | /usr/bin/base64 --wrap=0)
+  handoff_hash=$(printf '%s\n' "$handoff_script" | /usr/bin/sha256sum)
+  handoff_hash=${handoff_hash%% *}
+
+  IFS= read -r -d '' fake_pacman <<'FAKE_PACMAN' || true
+#!/bin/bash -p
+set -Eeuo pipefail
+readonly PATH='/usr/bin:/usr/sbin'
+export PATH
+unset BASH_ENV ENV CDPATH
+
+[[ $# == 5 && $1 == '-U' && $2 == '--needed' && $3 == '--noconfirm' && $4 == '--' ]]
+staged_path=$5
+staging_dir=${staged_path%/*}
+[[ $staging_dir == /var/tmp/studio-omarchy-install.* &&
+  $staged_path == "$staging_dir/$STUDIO_HANDOFF_PACKAGE_NAME" ]]
+directory_metadata=$(/usr/bin/stat -c '%F|%u|%g|%a' -- "$staging_dir")
+file_metadata=$(/usr/bin/stat -c '%F|%u|%g|%a|%h|%s' -- "$staged_path")
+actual_hash=$(/usr/bin/sha256sum -- "$staged_path")
+actual_hash=${actual_hash%% *}
+[[ $directory_metadata == 'directory|0|0|700' &&
+  $file_metadata == "regular file|0|0|600|1|$STUDIO_HANDOFF_EXPECTED_BYTES" &&
+  $actual_hash == "$STUDIO_HANDOFF_EXPECTED_HASH" ]]
+printf 'safe|%s|%s|%s|%s\n' \
+  "$directory_metadata" "$file_metadata" "$actual_hash" "$staged_path" \
+  >"$STUDIO_HANDOFF_RESULT"
+/usr/bin/chown "$STUDIO_HANDOFF_ACCEPTANCE_UID:$STUDIO_HANDOFF_ACCEPTANCE_GID" \
+  "$STUDIO_HANDOFF_RESULT"
+FAKE_PACMAN
+  fake_pacman_encoded=$(printf '%s\n' "$fake_pacman" | /usr/bin/base64 --wrap=0)
+
+  IFS= read -r -d '' root_driver <<'ROOT_DRIVER' || true
+set -Eeuo pipefail
+readonly PATH='/usr/bin:/usr/sbin'
+export PATH
+unset BASH_ENV ENV CDPATH
+
+run_root=$1
+handoff_encoded=$2
+handoff_hash=$3
+fake_pacman_encoded=$4
+acceptance_uid=$5
+acceptance_gid=$6
+package_name=$7
+safe_hash=$8
+safe_bytes=$9
+oversize_hash=${10}
+result="$run_root/result"
+root_fixture=''
+
+report_exit() {
+  local status=$? line=${BASH_LINENO[0]:-0} command=${BASH_COMMAND:-unknown}
+
+  if (( status != 0 )); then
+    /usr/bin/printf 'FAIL status=%s line=%s command=%q\n' "$status" "$line" "$command" >"$result" || true
+    /usr/bin/chown "$acceptance_uid:$acceptance_gid" "$result" 2>/dev/null || true
+  fi
+  if [[ -n $root_fixture && $root_fixture == /var/tmp/studio-omarchy-handoff-test.* ]]; then
+    /usr/bin/rm -rf -- "$root_fixture"
+  fi
+  exit "$status"
+}
+trap report_exit EXIT
+
+[[ $run_root == /tmp/studio-status-containment-*/privileged-handoff &&
+  $acceptance_uid =~ ^[1-9][0-9]*$ && $acceptance_gid =~ ^[0-9]+$ &&
+  $package_name =~ ^wordpress-studio-omarchy-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-x86_64\.pkg\.tar\.zst$ &&
+  $safe_hash =~ ^[0-9a-f]{64}$ && $oversize_hash =~ ^[0-9a-f]{64}$ &&
+  $handoff_hash =~ ^[0-9a-f]{64}$ && $safe_bytes =~ ^[1-9][0-9]*$ ]]
+root_fixture=$(/usr/bin/mktemp -d /var/tmp/studio-omarchy-handoff-test.XXXXXXXXXX)
+[[ $root_fixture == /var/tmp/studio-omarchy-handoff-test.* &&
+  $(/usr/bin/stat -c '%F|%u|%g|%a' -- "$root_fixture") == 'directory|0|0|700' ]]
+/usr/bin/printf '%s' "$handoff_encoded" | /usr/bin/base64 --decode >"$root_fixture/handoff.sh"
+/usr/bin/printf '%s' "$fake_pacman_encoded" | /usr/bin/base64 --decode >"$root_fixture/pacman"
+/usr/bin/chmod 700 "$root_fixture/handoff.sh" "$root_fixture/pacman"
+[[ $(/usr/bin/sha256sum "$root_fixture/handoff.sh") == "$handoff_hash  $root_fixture/handoff.sh" &&
+  $(/usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$root_fixture/handoff.sh") == 'regular file|0|0|700|1' &&
+  $(/usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$root_fixture/pacman") == 'regular file|0|0|700|1' ]]
+host_pacman_hash=$(/usr/bin/sha256sum /usr/bin/pacman)
+host_pacman_hash=${host_pacman_hash%% *}
+
+run_case() {
+  local source_path=$1 expected_hash=$2 max_bytes=$3 marker=$4 ready="$4.namespace-ready"
+  local status=0
+
+  /usr/bin/rm -f -- "$marker" "$ready"
+  # shellcheck disable=SC2016 # Expanded only by the isolated namespace Bash.
+  /usr/bin/timeout --signal=TERM --kill-after=2s 20s \
+    /usr/bin/env -i \
+      PATH=/usr/bin:/usr/sbin \
+      LC_ALL=C \
+      STUDIO_HANDOFF_ACCEPTANCE_GID="$acceptance_gid" \
+      STUDIO_HANDOFF_ACCEPTANCE_UID="$acceptance_uid" \
+      STUDIO_HANDOFF_EXPECTED_BYTES="$safe_bytes" \
+      STUDIO_HANDOFF_EXPECTED_HASH="$expected_hash" \
+      STUDIO_HANDOFF_NAMESPACE_READY="$ready" \
+      STUDIO_HANDOFF_PACKAGE_NAME="$package_name" \
+      STUDIO_HANDOFF_RESULT="$marker" \
+      /usr/bin/unshare --mount --propagation private \
+        /usr/bin/bash -p -c '
+          set -Eeuo pipefail
+          /usr/bin/mount --bind "$1" /usr/bin/pacman
+          /usr/bin/cmp --silent -- "$1" /usr/bin/pacman
+          /usr/bin/printf "%s\n" ready >"$STUDIO_HANDOFF_NAMESPACE_READY"
+          /usr/bin/chown "$STUDIO_HANDOFF_ACCEPTANCE_UID:$STUDIO_HANDOFF_ACCEPTANCE_GID" \
+            "$STUDIO_HANDOFF_NAMESPACE_READY"
+          root_script=$(/usr/bin/base64 --decode "$2")
+          /usr/bin/bash -c "$root_script" bash "$3" "$4" "$5" "$6"
+        ' bash "$root_fixture/pacman" "$root_fixture/handoff.sh" \
+          "$source_path" "$package_name" "$expected_hash" "$max_bytes" || status=$?
+  [[ -f $ready && ! -L $ready &&
+    $(/usr/bin/stat -c '%u:%g:%h:%F' -- "$ready") == "$acceptance_uid:$acceptance_gid:1:regular file" ]] ||
+    return 90
+  /usr/bin/rm -f -- "$ready"
+  return "$status"
+}
+
+safe_marker="$run_root/safe-pacman"
+run_case "$run_root/safe/$package_name" "$safe_hash" "$safe_bytes" "$safe_marker"
+IFS='|' read -r label directory_type directory_uid directory_gid directory_mode \
+  file_type file_uid file_gid file_mode file_links file_bytes recorded_hash staged_path \
+  <"$safe_marker"
+[[ $label == 'safe' && $directory_type == 'directory' && $directory_uid == 0 &&
+  $directory_gid == 0 && $directory_mode == 700 && $file_type == 'regular file' &&
+  $file_uid == 0 && $file_gid == 0 && $file_mode == 600 && $file_links == 1 &&
+  $file_bytes == "$safe_bytes" && $recorded_hash == "$safe_hash" &&
+  $staged_path == /var/tmp/studio-omarchy-install.*/* &&
+  ! -e $staged_path && ! -L $staged_path ]]
+
+expect_rejection() {
+  local source_path=$1 expected_hash=$2 max_bytes=$3 marker=$4 status=0
+
+  run_case "$source_path" "$expected_hash" "$max_bytes" "$marker" || status=$?
+  [[ $status == 1 && ! -e $marker && ! -L $marker ]]
+}
+
+expect_rejection "$run_root/symlink/$package_name" "$safe_hash" "$safe_bytes" \
+  "$run_root/symlink-pacman"
+expect_rejection "$run_root/fifo/$package_name" "$safe_hash" "$safe_bytes" \
+  "$run_root/fifo-pacman"
+expect_rejection "$run_root/oversize/$package_name" "$oversize_hash" "$safe_bytes" \
+  "$run_root/oversize-pacman"
+[[ $(/usr/bin/sha256sum /usr/bin/pacman) == "$host_pacman_hash  /usr/bin/pacman" ]]
+
+/usr/bin/printf '%s\n' PASS >"$result"
+/usr/bin/chown "$acceptance_uid:$acceptance_gid" "$result"
+ROOT_DRIVER
+  root_driver_encoded=$(printf '%s\n' "$root_driver" | /usr/bin/base64 --wrap=0)
+  acceptance_uid=$(id -u)
+  acceptance_gid=$(id -g)
+  installed_package_before_handoff=$(pacman -Q "$PACKAGE_NAME")
+  printf -v terminal_command \
+    "/usr/bin/printf '%%s' %q | /usr/bin/base64 --decode | /usr/bin/sudo /usr/bin/bash -p -s -- %q %q %q %q %q %q %q %q %q %q" \
+    "$root_driver_encoded" "$run_root" "$handoff_encoded" "$handoff_hash" \
+    "$fake_pacman_encoded" "$acceptance_uid" "$acceptance_gid" "$package_name" \
+    "$safe_hash" "$safe_bytes" "$oversize_hash"
+
+  sudo -K
+  "$OMARCHY_PATH/bin/omarchy-launch-floating-terminal-with-presentation" "$terminal_command" \
+    >/dev/null 2>&1
+  wait_until 'the real-root installer handoff terminal opens' 30 window_present "$TERMINAL_CLASS"
+  wait_until 'the real-root installer handoff terminal owns focus' 30 active_window_matches "$TERMINAL_CLASS"
+  wtype 'omarchy'
+  wtype -k Return
+  wait_until 'the exact installer handoff completes its isolated real-root cases' 90 test -s "$result"
+  [[ $(<"$result") == 'PASS' ]] ||
+    fail 'the exact installer handoff passes its isolated real-root cases' "$(<"$result")"
+  pass 'the exact installer handoff uses real root-owned staging and rejects unsafe inputs'
+  wait_until 'the real-root installer handoff presents its completion screen' 30 screen_contains 'Done! Press any key'
+  screenshot 'success-studio-03b-real-root-handoff'
+  wtype -k space
+  wait_until 'the real-root installer handoff terminal closes' 30 window_absent "$TERMINAL_CLASS"
+  [[ $(pacman -Q "$PACKAGE_NAME") == "$installed_package_before_handoff" ]] ||
+    fail 'the isolated real-root handoff leaves the installed package state unchanged'
 }
 
 studio_updater_process_absent() {
@@ -1576,6 +1888,7 @@ pass 'WordPress Studio passes the host validator'
 exercise_status_containment term
 exercise_status_containment sigkill
 exercise_status_pre_ready_containment
+exercise_remove_runtime_resolution
 exercise_remove_pre_ready_containment
 exercise_remove_containment term
 exercise_remove_containment sigkill
@@ -1600,6 +1913,7 @@ record_package_handoff_baseline
 click_screen_phrase 'Install Studio' '70 0 100 40' 'the Install Studio button is clicked with the pointer'
 wait_until 'the visible Studio installer terminal opens' 30 window_present "$TERMINAL_CLASS"
 finish_package_install_or_update 'installer' 'success-studio-02-installed-terminal'
+verify_installed_runtime_contract 'the installer'
 
 click_bar_widget
 wait_until 'the installed Studio panel opens' 20 layer_on_screen omarchy-keyboard-panel
@@ -1612,6 +1926,7 @@ park_pointer
 wait_until 'the escaped Studio panel clears visually' 20 screen_absent 'Launch Studio'
 wait_until 'the escaped Studio bar tooltip clears visually' 20 screen_absent 'WordPress Studio'
 screenshot 'success-studio-03a-escape-closed'
+exercise_real_privileged_handoff
 click_bar_widget
 wait_until 'the installed Studio panel reopens after Escape' 20 layer_on_screen omarchy-keyboard-panel
 wait_until 'the reopened Studio panel reports its version' 20 screen_contains "Installed $PLUGIN_VERSION"
@@ -1630,10 +1945,9 @@ record_package_handoff_baseline
 click_screen_phrase 'Update Studio' '70 0 100 40' 'the Update Studio button is clicked with the pointer'
 wait_until 'the visible Studio updater terminal opens' 30 window_present "$TERMINAL_CLASS"
 finish_package_install_or_update 'updater' 'success-studio-04-updated-terminal'
+verify_installed_runtime_contract 'the same-version updater'
 [[ $(pacman -Q "$PACKAGE_NAME") == "$installed_package_before_update" ]] || fail 'the same-version update preserves the exact installed package version'
 [[ $(sha256sum /usr/lib/studio/studio) == "$studio_hash_before_update" ]] || fail 'the same-version update preserves the installed Studio binary checksum'
-[[ -f /usr/lib/studio/chrome-sandbox && ! -L /usr/lib/studio/chrome-sandbox && $(stat -c %a /usr/lib/studio/chrome-sandbox) == "4755" ]] ||
-  fail 'the same-version update preserves the regular setuid Chromium sandbox helper'
 same_version_update_log_is_idempotent || fail 'the same-version --needed update logs its invocation without an ALPM package-state change'
 pass 'the same-version checksum-verified update is idempotent'
 
