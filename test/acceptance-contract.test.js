@@ -10,14 +10,13 @@ test('guest idempotence check recognizes the fixed absolute pacman invocation', 
   assert.doesNotMatch(acceptance, /Running 'pacman -U --needed --noconfirm/)
 })
 
-test('custom-domain entry waits for and focuses the mounted field before typing', () => {
-  const fieldReady = acceptance.indexOf('custom-domain field renders')
-  const fieldFocused = acceptance.indexOf('custom-domain field is focused')
-  const domainTyped = acceptance.indexOf('wtype -d 75 "$domain"')
+test('custom-domain entry lets the field mount before tabbing into it', () => {
+  const functionStart = acceptance.indexOf('create_https_site_with_pointer()')
+  const functionEnd = acceptance.indexOf('\n}\n', functionStart)
+  const createHttpsSite = acceptance.slice(functionStart, functionEnd)
 
-  assert.notEqual(fieldReady, -1)
-  assert.notEqual(fieldFocused, -1)
-  assert.notEqual(domainTyped, -1)
-  assert.ok(fieldReady < fieldFocused)
-  assert.ok(fieldFocused < domainTyped)
+  assert.match(
+    createHttpsSite,
+    /click_active_phrase 'Use custom domain'[\s\S]*sleep 1\n  wtype -k tab[\s\S]*wtype -d 75 "\$domain"/
+  )
 })

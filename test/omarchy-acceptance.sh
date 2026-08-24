@@ -1373,9 +1373,11 @@ create_https_site_with_pointer() {
   wait_until "the $ordinal advanced custom-domain control renders" 20 screen_contains 'Use custom domain'
   click_active_phrase 'Use custom domain' '20 45 100 100' \
     "the $ordinal custom-domain checkbox is clicked with the pointer"
-  wait_until "the $ordinal custom-domain field renders" 20 screen_contains 'Domain name'
-  click_active_phrase 'Domain name' '20 65 100 100' \
-    "the $ordinal custom-domain field is focused"
+  # The field mounts below the fold after the checkbox state commits. Let that
+  # reflow settle before tabbing from the focused checkbox into the new input;
+  # OCR cannot reliably see the clipped label at the bottom of the viewport.
+  sleep 1
+  wtype -k tab
   wtype -M ctrl -k a -m ctrl
   wtype -d 75 "$domain"
   wait_until "the $ordinal custom domain is entered exactly" 15 \
