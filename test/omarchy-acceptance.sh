@@ -149,6 +149,55 @@ active_window_matches() {
   hyprctl -j activewindow | jq -e --arg class "$1" '(.class // "") | test($class)'
 }
 
+active_studio_update_notice() {
+  hyprctl -j activewindow | jq -e --arg class "$STUDIO_CLASS" --arg title 'New Version Available' '
+    .xwayland == false and .floating == true and
+    ((.class // "") | test($class)) and (.title // "") == $title
+  ' >/dev/null
+}
+
+studio_update_notice_present() {
+  hyprctl -j clients | jq -e --arg class "$STUDIO_CLASS" --arg title 'New Version Available' '
+    any(.[];
+      .xwayland == false and .floating == true and
+      ((.class // "") | test($class)) and (.title // "") == $title
+    )
+  ' >/dev/null
+}
+
+studio_update_notice_absent() {
+  ! studio_update_notice_present
+}
+
+studio_welcome_or_update_notice_present() {
+  studio_update_notice_present || screen_contains 'WordPress Studio'
+}
+
+dismiss_studio_update_notice_if_present() {
+  local address
+
+  if ! studio_update_notice_present; then
+    return 0
+  fi
+
+  address=$(hyprctl -j clients | jq -er --arg class "$STUDIO_CLASS" --arg title 'New Version Available' '
+    [.[] | select(
+      .xwayland == false and .floating == true and
+      ((.class // "") | test($class)) and (.title // "") == $title
+    )]
+    | if length == 1 then .[0].address else empty end
+  ') || fail 'Studio exposes one update notice'
+  hyprctl dispatch focuswindow "address:$address" >/dev/null ||
+    fail 'the Studio update notice receives focus'
+  wait_until 'the Studio update notice receives focus' 10 active_studio_update_notice
+  active_region_contains 'New Version Available' '20 0 80 30' ||
+    fail 'the Studio update notice paints its exact heading'
+  click_active_phrase 'Later' '50 70 100 100' \
+    'the optional Studio update notice Later button is clicked with the pointer'
+  wait_until 'the Studio update notice closes through its safe Later action' 20 studio_update_notice_absent
+  wait_until 'focus returns to Studio after the update notice' 20 active_window_matches "$STUDIO_CLASS"
+}
+
 active_chromium_browser() {
   local active pid executable
 
@@ -1612,8 +1661,17 @@ hyprctl -j clients | jq -e '[.[] | select((.class // "") | test("(?i)studio")) |
   fail 'WordPress Studio runs as a native Wayland client'
 pass 'WordPress Studio runs as a native Wayland client'
 wait_until 'the Studio app receives focus' 30 active_window_matches "$STUDIO_CLASS"
+# The upstream release endpoint can advance while an exact-tree VM run is in
+# flight. Give its launch-time request a short settle, then dismiss only the
+# exact native update child through its visible Later action before onboarding.
+wait_until 'fresh Studio renders onboarding or its native update notice' 60 studio_welcome_or_update_notice_present
+sleep 5
+dismiss_studio_update_notice_if_present
 wait_until 'fresh Studio shows its welcome title' 60 screen_contains 'WordPress Studio'
 wait_until 'fresh Studio shows its top-right Skip control' 20 screen_contains 'Skip'
+dismiss_studio_update_notice_if_present
+wait_until 'fresh Studio still shows its welcome title after update handling' 20 screen_contains 'WordPress Studio'
+wait_until 'fresh Studio still shows its top-right Skip control after update handling' 20 screen_contains 'Skip'
 screenshot 'success-studio-05-fresh-welcome'
 
 click_active_phrase 'anonymous' '20 45 100 100' 'the analytics checkbox is toggled through its visible label'
