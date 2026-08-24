@@ -1373,7 +1373,9 @@ create_https_site_with_pointer() {
   wait_until "the $ordinal advanced custom-domain control renders" 20 screen_contains 'Use custom domain'
   click_active_phrase 'Use custom domain' '20 45 100 100' \
     "the $ordinal custom-domain checkbox is clicked with the pointer"
-  wtype -k tab
+  wait_until "the $ordinal custom-domain field renders" 20 screen_contains 'Domain name'
+  click_active_phrase 'Domain name' '20 65 100 100' \
+    "the $ordinal custom-domain field is focused"
   wtype -M ctrl -k a -m ctrl
   wtype -d 75 "$domain"
   wait_until "the $ordinal custom domain is entered exactly" 15 \
