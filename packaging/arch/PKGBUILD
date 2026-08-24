@@ -1,6 +1,6 @@
 pkgname=wordpress-studio-omarchy
-pkgver=1.18.0
-pkgrel=5
+pkgver=1.19.0
+pkgrel=1
 pkgdesc='WordPress Studio with native Arch Linux and Omarchy integration'
 arch=('x86_64')
 url='https://github.com/RegionallyFamous/studio-omarchy'

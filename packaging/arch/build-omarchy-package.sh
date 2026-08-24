@@ -5,7 +5,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 version=$(sed -n 's/^pkgver=//p' "$script_dir/PKGBUILD")
-readonly upstream_commit='121b18d77f96e4362c7d22bdcd4c428022503f8b'
+readonly upstream_commit='d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84'
 upstream_commit_file="$script_dir/upstream-commit"
 cleanup_source="$repo_root/scripts/cleanup-user-trust.sh"
 
@@ -51,9 +51,9 @@ trap 'rm -rf "$build_root"' EXIT
 
 git init --quiet "$studio_root"
 git -C "$studio_root" remote add origin https://github.com/Automattic/studio.git
-git -C "$studio_root" fetch --depth 1 origin 121b18d77f96e4362c7d22bdcd4c428022503f8b
+git -C "$studio_root" fetch --depth 1 origin d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84
 set +e
-git -C "$studio_root" checkout --detach 121b18d77f96e4362c7d22bdcd4c428022503f8b &&
+git -C "$studio_root" checkout --detach d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84 &&
   [[ $(git -C "$studio_root" rev-parse HEAD) == "$upstream_commit" ]] &&
   git -C "$studio_root" apply --check "$repo_root/patches/studio-omarchy.patch" &&
   git -C "$studio_root" apply "$repo_root/patches/studio-omarchy.patch" &&
