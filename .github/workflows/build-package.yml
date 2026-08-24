@@ -33,10 +33,15 @@ jobs:
             exit 1
           fi
 
-          node_version=$(curl --fail --silent --show-error --location \
-            --proto '=https' --proto-redir '=https' \
-            --connect-timeout 10 --max-time 30 --max-filesize 64 \
-            "https://raw.githubusercontent.com/Automattic/studio/$UPSTREAM_COMMIT/.nvmrc")
+          node_version=$(
+            /usr/bin/timeout --signal=TERM --kill-after=5s 40s \
+              /usr/bin/env -i LC_ALL=C PATH=/usr/bin \
+              /usr/bin/curl --disable --fail --silent --show-error --location \
+                --proto '=https' --proto-redir '=https' \
+                --cacert /etc/ssl/certs/ca-certificates.crt \
+                --connect-timeout 10 --max-time 30 --max-filesize 64 \
+                "https://raw.githubusercontent.com/Automattic/studio/$UPSTREAM_COMMIT/.nvmrc"
+          )
           if [[ ! $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Unsupported upstream Node version: $node_version" >&2
             exit 1
@@ -47,8 +52,9 @@ jobs:
     needs: node_version
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    container: archlinux:base-devel
+    container: archlinux:base-devel@sha256:714acd1eef9ae997d95691b1c5220ada0076185b77857c1813f02de0fa83cf7b
     env:
+      PINNED_NODE_VERSION: ${{ needs.node_version.outputs.value }}
       VERSION: ${{ inputs.version }}
       UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
     steps:
@@ -57,7 +63,7 @@ jobs:
           pacman -Syu --noconfirm
           actionlint alsa-lib at-spi2-core ca-certificates-utils curl desktop-file-utils git gtk3 jq
           libcap libdrm libnotify libsecret libxcb libxkbcommon libxss libxtst
-          mesa nss openssl polkit shellcheck sudo util-linux
+          mesa nss openssl polkit procps-ng shellcheck sudo util-linux
           util-linux-libs wayland xdg-utils
 
       - name: Checkout Studio for Omarchy
@@ -95,26 +101,299 @@ jobs:
       - name: Test Quattro plugin helpers
         run: node --test test/*.test.js
 
-      - name: Build and verify pinned Studio package
-        run: |
-          useradd --create-home builder
-          chown -R builder:builder "$GITHUB_WORKSPACE"
-          # This expression is intentionally expanded by the child shell run as builder.
-          # shellcheck disable=SC2016
-          runuser -u builder -- env \
-            PATH="$PATH" \
-            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
-            bash -c 'cd "$GITHUB_WORKSPACE" && packaging/arch/build-omarchy-package.sh --ci'
-
-      - name: Verify and checksum package
+      - name: Build pinned Studio package across isolated trust boundaries
+        id: package
         run: |
           set -euo pipefail
+
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+
+          terminate_user_processes() {
+            local account=$1 account_uid attempt
+
+            account_uid=$(id -u "$account")
+            for (( attempt = 0; attempt < 50; attempt++ )); do
+              pkill --signal KILL --uid "$account_uid" 2>/dev/null || true
+              if ! pgrep --uid "$account_uid" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            pgrep --list-full --uid "$account_uid" >&2 || true
+            fail "Processes owned by isolated account $account survived forced cleanup."
+          }
+
+          download_root_bounded() {
+            local url=$1 output=$2 max_bytes=$3 max_seconds=$4 partial size
+
+            partial="$output.partial"
+            [[ $url == https://* ]] || fail 'A pinned source URL is not HTTPS.'
+            [[ ! -e $output && ! -L $output && ! -e $partial && ! -L $partial ]] ||
+              fail 'A pinned source download path already exists.'
+            /usr/bin/timeout --signal=TERM --kill-after=5s "$((max_seconds + 10))s" \
+              /usr/bin/env -i LC_ALL=C PATH=/usr/bin \
+              /usr/bin/curl --disable --fail --show-error --location \
+                --proto '=https' --proto-redir '=https' \
+                --cacert /etc/ssl/certs/ca-certificates.crt \
+                --connect-timeout 10 --max-time "$max_seconds" \
+                --max-filesize "$max_bytes" --output "$partial" "$url"
+            [[ -f $partial && ! -L $partial ]] ||
+              fail 'A pinned source download did not produce a regular file.'
+            size=$(wc -c <"$partial")
+            (( size > 0 && size <= max_bytes )) ||
+              fail 'A pinned source download exceeded its byte budget.'
+            mv -- "$partial" "$output"
+          }
+
+          read_official_archive_hash() {
+            local checksum_file=$1 archive_name=$2
+
+            awk -v expected_name="$archive_name" '
+              length($0) == 66 + length(expected_name) &&
+              substr($0, 1, 64) ~ /^[0-9a-f]{64}$/ &&
+              (substr($0, 65, 2) == "  " || substr($0, 65, 2) == " *") &&
+              substr($0, 67) == expected_name {
+                matches++
+                archive_hash=substr($0, 1, 64)
+              }
+              END {
+                if (matches != 1) exit 1
+                print archive_hash
+              }
+            ' "$checksum_file"
+          }
+
+          extract_official_member() {
+            local archive=$1 member=$2 output=$3 member_count
+
+            member_count=$(
+              bsdtar -tf "$archive" |
+                awk -v expected_member="$member" '$0 == expected_member { count++ } END { print count + 0 }'
+            ) || fail "Official archive member listing failed: $member"
+            (( member_count == 1 )) || fail "Official archive member is not unique: $member"
+            bsdtar -xOf "$archive" "$member" >"$output" ||
+              fail "Official archive member extraction failed: $member"
+            [[ -s $output && -f $output && ! -L $output ]] ||
+              fail "Official archive member is not a regular non-empty file: $member"
+          }
+
+          useradd --create-home builder
+          useradd --create-home packager
+          builder_uid=$(id -u builder)
+          packager_uid=$(id -u packager)
+          trap 'pkill --signal KILL --uid "$builder_uid" 2>/dev/null || true; pkill --signal KILL --uid "$packager_uid" 2>/dev/null || true' EXIT
+
+          chown -R root:root "$GITHUB_WORKSPACE"
+          chmod -R go-w "$GITHUB_WORKSPACE"
+          unsafe_checkout_owner=$(
+            find -P "$GITHUB_WORKSPACE" -xdev ! -type l ! -user root -print -quit
+          )
+          unsafe_checkout_mode=$(
+            find -P "$GITHUB_WORKSPACE" -xdev ! -type l -perm /022 -print -quit
+          )
+          if [[ -n $unsafe_checkout_owner || -n $unsafe_checkout_mode ]]; then
+            fail 'The trusted plugin checkout is not root-owned and read-only to build users.'
+          fi
+
+          isolation_root="$RUNNER_TEMP/studio-isolated-build"
+          upstream_root="$isolation_root/upstream"
+          package_root="$isolation_root/package"
+          [[ ! -e $isolation_root && ! -L $isolation_root ]] ||
+            fail 'The isolated build root already exists.'
+          install -d -m 0755 "$isolation_root"
+          install -d -m 0700 -o builder -g builder "$upstream_root"
+          install -d -m 0711 "$package_root"
+
+          metadata_root="$isolation_root/pinned-metadata"
+          metadata_lock="$metadata_root/package-lock.json"
+          metadata_nvmrc="$metadata_root/.nvmrc"
+          install -d -m 0700 "$metadata_root"
+          upstream_raw_url="https://raw.githubusercontent.com/Automattic/studio/$UPSTREAM_COMMIT"
+          download_root_bounded "$upstream_raw_url/package-lock.json" "$metadata_lock" 8388608 60
+          download_root_bounded "$upstream_raw_url/.nvmrc" "$metadata_nvmrc" 64 30
+          electron_version=$(
+            jq -er '
+              .packages["node_modules/electron"].version |
+              select(type == "string" and
+                test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$"))
+            ' "$metadata_lock"
+          ) || fail 'Pinned Studio does not declare one safe Electron version.'
+          (( ${#electron_version} <= 64 )) || fail 'Pinned Studio declares an oversized Electron version.'
+          mapfile -t node_version_lines <"$metadata_nvmrc"
+          (( ${#node_version_lines[@]} == 1 )) || fail 'Pinned Studio does not declare one Node version.'
+          node_version=${node_version_lines[0]#v}
+          [[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ &&
+            $node_version == "$PINNED_NODE_VERSION" ]] ||
+            fail 'Pinned Studio declares an unexpected Node version.'
+
+          node_bin_dir=$(dirname "$(command -v node)")
+          build_path="$node_bin_dir:/usr/local/sbin:/usr/local/bin:/usr/bin"
+          upstream_status=0
+          runuser -u builder -- /usr/bin/env -i \
+            CI=true \
+            HOME=/home/builder \
+            LC_ALL=C \
+            PATH="$build_path" \
+            /usr/bin/bash -s -- \
+              "$upstream_root/studio" \
+              "$GITHUB_WORKSPACE/patches/studio-omarchy.patch" \
+              "$UPSTREAM_COMMIT" \
+              "$VERSION" \
+              "$node_version" \
+              "$electron_version" <<'BUILD_UPSTREAM' || upstream_status=$?
+          set -euo pipefail
+          studio_root=$1
+          patch_path=$2
+          upstream_commit=$3
+          version=$4
+          node_version=$5
+          electron_version=$6
+
+          git init --quiet "$studio_root"
+          git -C "$studio_root" remote add origin https://github.com/Automattic/studio.git
+          git -C "$studio_root" fetch --depth 1 origin "$upstream_commit"
+          git -C "$studio_root" checkout --detach "$upstream_commit"
+          [[ $(git -C "$studio_root" rev-parse HEAD) == "$upstream_commit" ]]
+          git -C "$studio_root" apply --check "$patch_path"
+          git -C "$studio_root" apply "$patch_path"
+          declared_node_version=$(sed 's/^v//' "$studio_root/.nvmrc")
+          current_node_version=$(node -p 'process.versions.node')
+          [[ $declared_node_version == "$node_version" && $current_node_version == "$node_version" ]]
+          declared_electron_version=$(
+            node -p "require('$studio_root/package-lock.json').packages['node_modules/electron'].version"
+          )
+          [[ $declared_electron_version == "$electron_version" ]]
+          app_version=$(node -p "require('$studio_root/apps/studio/package.json').version")
+          [[ $app_version == "$version" ]]
+          npm --prefix "$studio_root" ci
+          npm --prefix "$studio_root" run lint
+          npm --prefix "$studio_root" run typecheck
+          npm --prefix "$studio_root" test -- --maxWorkers=1
+          npm --prefix "$studio_root" run package
+          BUILD_UPSTREAM
+          terminate_user_processes builder
+          (( upstream_status == 0 )) || fail 'Pinned Studio validation or build failed.'
+
+          chown -R root:root "$upstream_root"
+          chmod -R a+rX,go-w "$upstream_root"
+          studio_app="$upstream_root/studio/apps/studio/out/Studio-linux-x64/studio"
+          [[ -x $studio_app && ! -L $studio_app ]] ||
+            fail 'The isolated upstream build did not produce a safe Studio executable.'
+
+          runtime_root="$isolation_root/official-runtime"
+          install -d -m 0700 "$runtime_root"
+          electron_archive_name="electron-v$electron_version-linux-x64.zip"
+          electron_archive="$runtime_root/$electron_archive_name"
+          electron_checksums="$runtime_root/electron-SHASUMS256.txt"
+          electron_base_url="https://github.com/electron/electron/releases/download/v$electron_version"
+          download_root_bounded "$electron_base_url/SHASUMS256.txt" "$electron_checksums" 1048576 60
+          download_root_bounded "$electron_base_url/$electron_archive_name" \
+            "$electron_archive" 536870912 600
+          electron_archive_hash=$(
+            read_official_archive_hash "$electron_checksums" "$electron_archive_name"
+          ) || fail 'The official Electron checksum list has no unique archive entry.'
+          [[ $(sha256sum "$electron_archive" | cut -d ' ' -f 1) == "$electron_archive_hash" ]] ||
+            fail 'The official Electron archive checksum does not match.'
+
+          node_archive_name="node-v$node_version-linux-x64.tar.gz"
+          node_archive="$runtime_root/$node_archive_name"
+          node_checksums="$runtime_root/node-SHASUMS256.txt"
+          node_base_url="https://nodejs.org/dist/v$node_version"
+          download_root_bounded "$node_base_url/SHASUMS256.txt" "$node_checksums" 1048576 60
+          download_root_bounded "$node_base_url/$node_archive_name" "$node_archive" 268435456 600
+          node_archive_hash=$(
+            read_official_archive_hash "$node_checksums" "$node_archive_name"
+          ) || fail 'The official Node checksum list has no unique archive entry.'
+          [[ $(sha256sum "$node_archive" | cut -d ' ' -f 1) == "$node_archive_hash" ]] ||
+            fail 'The official Node archive checksum does not match.'
+
+          chrome_sandbox_source="$runtime_root/chrome-sandbox"
+          node_source="$runtime_root/node"
+          extract_official_member "$electron_archive" chrome-sandbox "$chrome_sandbox_source"
+          extract_official_member "$node_archive" \
+            "node-v$node_version-linux-x64/bin/node" "$node_source"
+          chown root:root "$chrome_sandbox_source" "$node_source"
+          chmod 0444 "$chrome_sandbox_source" "$node_source"
+          [[ $(stat -c '%h:%u:%g:%a' "$chrome_sandbox_source") == '1:0:0:444' &&
+            $(stat -c '%h:%u:%g:%a' "$node_source") == '1:0:0:444' ]] ||
+            fail 'Official runtime sources are not immutable root-owned single-link files.'
+          chrome_sandbox_hash=$(sha256sum "$chrome_sandbox_source" | cut -d ' ' -f 1)
+          node_hash=$(sha256sum "$node_source" | cut -d ' ' -f 1)
+          [[ $chrome_sandbox_hash =~ ^[0-9a-f]{64}$ && $node_hash =~ ^[0-9a-f]{64}$ ]] ||
+            fail 'Official runtime source hashes are invalid.'
+          chmod 0555 "$runtime_root"
+
+          package_build_root="$package_root/build"
+          package_output_root="$package_root/output"
+          package_log_root="$package_root/logs"
+          package_source_root="$package_root/sources"
+          package_srcpkg_root="$package_root/srcpkg"
+          install -d -m 0700 -o packager -g packager \
+            "$package_build_root" "$package_output_root" "$package_log_root" \
+            "$package_source_root" "$package_srcpkg_root"
+          install -m 0444 "$GITHUB_WORKSPACE/packaging/arch/studio-launcher" \
+            "$package_source_root/studio-launcher"
+          install -m 0444 "$GITHUB_WORKSPACE/packaging/arch/studio-omarchy-update" \
+            "$package_source_root/studio-omarchy-update"
+          install -m 0444 "$GITHUB_WORKSPACE/packaging/arch/studio.desktop" \
+            "$package_source_root/studio.desktop"
+          install -m 0444 "$GITHUB_WORKSPACE/scripts/cleanup-user-trust.sh" \
+            "$package_source_root/cleanup-user-trust.sh"
+          chown root:root "$package_source_root"/*
+
+          package_status=0
+          # shellcheck disable=SC2016 # $1 is intentionally expanded by the isolated child shell.
+          runuser -u packager -- /usr/bin/env -i \
+            BUILDDIR="$package_build_root" \
+            HOME=/home/packager \
+            LC_ALL=C \
+            LOGDEST="$package_log_root" \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/bin \
+            PKGDEST="$package_output_root" \
+            SRCDEST="$package_source_root" \
+            SRCPKGDEST="$package_srcpkg_root" \
+            STUDIO_CHROME_SANDBOX_SHA256="$chrome_sandbox_hash" \
+            STUDIO_CHROME_SANDBOX_SOURCE="$chrome_sandbox_source" \
+            STUDIO_NODE_SHA256="$node_hash" \
+            STUDIO_NODE_SOURCE="$node_source" \
+            STUDIO_SOURCE_ROOT="$upstream_root/studio" \
+            /usr/bin/bash -c 'cd "$1" && makepkg --force --cleanbuild --clean' \
+              bash "$GITHUB_WORKSPACE/packaging/arch" || package_status=$?
+          terminate_user_processes packager
+          (( package_status == 0 )) || fail 'Trusted Studio packaging failed.'
+
+          chown -R root:root "$package_root"
+          chmod -R go-w "$package_root"
           pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
           pkgrel=$(sed -n 's/^pkgrel=//p' packaging/arch/PKGBUILD)
-          package_path="packaging/arch/wordpress-studio-omarchy-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
-          packaging/arch/verify-package.sh "$package_path"
-          package_dir=$(dirname "$package_path")
-          package_name=$(basename "$package_path")
+          package_name="wordpress-studio-omarchy-$pkgver-$pkgrel-x86_64.pkg.tar.zst"
+          package_path="$package_output_root/$package_name"
+          [[ -f $package_path && ! -L $package_path ]] ||
+            fail "The isolated package output is missing: $package_name"
+          mapfile -t package_outputs < <(
+            find "$package_output_root" -mindepth 1 -maxdepth 1 -type f -printf '%f\n'
+          )
+          (( ${#package_outputs[@]} == 1 )) && [[ ${package_outputs[0]} == "$package_name" ]] ||
+            fail 'The isolated packager produced unexpected outputs.'
+          {
+            echo "package_path=$package_path"
+            echo "chrome_sandbox_sha256=$chrome_sandbox_hash"
+            echo "node_sha256=$node_hash"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify and checksum package
+        env:
+          PACKAGE_PATH: ${{ steps.package.outputs.package_path }}
+          STUDIO_EXPECTED_CHROME_SANDBOX_SHA256: ${{ steps.package.outputs.chrome_sandbox_sha256 }}
+          STUDIO_EXPECTED_NODE_SHA256: ${{ steps.package.outputs.node_sha256 }}
+        run: |
+          set -euo pipefail
+          packaging/arch/verify-package.sh "$PACKAGE_PATH"
+          package_dir=$(dirname "$PACKAGE_PATH")
+          package_name=$(basename "$PACKAGE_PATH")
           (
             cd "$package_dir"
             sha256sum "$package_name" >"$package_name.sha256"
@@ -125,6 +404,6 @@ jobs:
         with:
           name: wordpress-studio-omarchy-${{ inputs.version }}-x86_64
           path: |
-            packaging/arch/wordpress-studio-omarchy-*.pkg.tar.zst
-            packaging/arch/wordpress-studio-omarchy-*.pkg.tar.zst.sha256
+            ${{ steps.package.outputs.package_path }}
+            ${{ steps.package.outputs.package_path }}.sha256
           if-no-files-found: error

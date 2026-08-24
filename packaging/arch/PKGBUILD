@@ -49,13 +49,19 @@ source=(
   'cleanup-user-trust.sh'
 )
 sha256sums=(
-  '089f65c42c8e3af5f6400244f6e3e842de252594fb8456929a1390bd2e140b3f'
+  '152c98df0fa21a59e44e2d2b59d652068d505f0498717fec44da9a812d45b545'
   'f67e9a6913f1b6229ed551987db98e3eae78a8bd2f3a70db32234850e3a5b41f'
   '298d452505eba37ad6f5f8352f8fd39aa11824295f57eb92afc6e6edcb6f7f4c'
-  'b2ec6aa05c213736ca2f9d1d7360016b0fe20aeaae4fea0692ccf83dc6eb3022'
+  '3bc70c2cb355a724257ab6986e307a795ad721260a41328cce09faff89d99b08'
 )
 
 package() {
+  local repo_root app_source sandbox_source node_source
+  local sandbox_hash node_hash actual_hash metadata
+
+  PATH=/usr/bin
+  export PATH
+
   [[ $CARCH == "x86_64" ]] || {
     error "Unsupported architecture: $CARCH"
     return 1
@@ -66,19 +72,93 @@ package() {
     return 1
   fi
 
-  local repo_root=$STUDIO_SOURCE_ROOT
-  local app_source="$repo_root/apps/studio/out/Studio-linux-x64"
+  repo_root=$STUDIO_SOURCE_ROOT
+  app_source="$repo_root/apps/studio/out/Studio-linux-x64"
+  sandbox_source=${STUDIO_CHROME_SANDBOX_SOURCE:-}
+  sandbox_hash=${STUDIO_CHROME_SANDBOX_SHA256:-}
+  node_source=${STUDIO_NODE_SOURCE:-}
+  node_hash=${STUDIO_NODE_SHA256:-}
 
-  if [[ ! -x $app_source/studio ]]; then
+  if [[ ! -f $app_source/studio || -L $app_source/studio || ! -x $app_source/studio ]]; then
     error "Packaged Studio app not found at $app_source"
     error "Run packaging/arch/build-omarchy-package.sh from an Arch Linux system first."
     return 1
   fi
 
+  for runtime_source in "$sandbox_source" "$node_source"; do
+    if [[ $runtime_source != /* || ! -f $runtime_source || -L $runtime_source ]]; then
+      error "Trusted runtime input is missing or unsafe: $runtime_source"
+      return 1
+    fi
+    metadata=$(stat -c '%h %s %a' -- "$runtime_source") || return 1
+    read -r runtime_links runtime_size runtime_mode <<<"$metadata"
+    if (( runtime_links != 1 || runtime_size < 1 )) ||
+      (( (8#$runtime_mode & 0022) != 0 )); then
+      error "Trusted runtime input has unsafe metadata: $runtime_source"
+      return 1
+    fi
+  done
+  if [[ ! $sandbox_hash =~ ^[0-9a-f]{64}$ || ! $node_hash =~ ^[0-9a-f]{64}$ ]]; then
+    error 'Trusted runtime hashes must be 64-character lowercase SHA-256 values.'
+    return 1
+  fi
+  actual_hash=$(sha256sum -- "$sandbox_source")
+  actual_hash=${actual_hash%% *}
+  [[ $actual_hash == "$sandbox_hash" ]] || {
+    error 'The trusted Electron chrome-sandbox input failed identity verification.'
+    return 1
+  }
+  actual_hash=$(sha256sum -- "$node_source")
+  actual_hash=${actual_hash%% *}
+  [[ $actual_hash == "$node_hash" ]] || {
+    error 'The trusted Node input failed identity verification.'
+    return 1
+  }
+
   install -d "$pkgdir/usr/lib/studio"
   cp -a "$app_source/." "$pkgdir/usr/lib/studio/"
-  chmod -R a+rX "$pkgdir/usr/lib/studio"
-  chmod 4755 "$pkgdir/usr/lib/studio/chrome-sandbox"
+  chmod -R a+rX,go-w "$pkgdir/usr/lib/studio"
+
+  for runtime_directory in \
+    "$pkgdir/usr/lib/studio" \
+    "$pkgdir/usr/lib/studio/resources" \
+    "$pkgdir/usr/lib/studio/resources/bin"; do
+    if [[ ! -d $runtime_directory || -L $runtime_directory ]]; then
+      error "The app build supplied an unsafe runtime directory: $runtime_directory"
+      return 1
+    fi
+  done
+
+  rm -f -- "$pkgdir/usr/lib/studio/chrome-sandbox" \
+    "$pkgdir/usr/lib/studio/resources/bin/node"
+  [[ ! -e $pkgdir/usr/lib/studio/chrome-sandbox &&
+    ! -L $pkgdir/usr/lib/studio/chrome-sandbox &&
+    ! -e $pkgdir/usr/lib/studio/resources/bin/node &&
+    ! -L $pkgdir/usr/lib/studio/resources/bin/node ]] || {
+    error 'Unable to remove untrusted privileged runtime files from the app build.'
+    return 1
+  }
+  install -Dm4755 "$sandbox_source" "$pkgdir/usr/lib/studio/chrome-sandbox"
+  install -Dm755 "$node_source" "$pkgdir/usr/lib/studio/resources/bin/node"
+
+  actual_hash=$(sha256sum -- "$pkgdir/usr/lib/studio/chrome-sandbox")
+  actual_hash=${actual_hash%% *}
+  [[ $actual_hash == "$sandbox_hash" ]] || {
+    error 'The packaged Electron chrome-sandbox changed during installation.'
+    return 1
+  }
+  actual_hash=$(sha256sum -- "$pkgdir/usr/lib/studio/resources/bin/node")
+  actual_hash=${actual_hash%% *}
+  [[ $actual_hash == "$node_hash" ]] || {
+    error 'The packaged Node runtime changed during installation.'
+    return 1
+  }
+
+  install -Dm644 /dev/null "$pkgdir/usr/lib/studio/.omarchy-runtime-integrity"
+  printf '%s  %s\n%s  %s\n' \
+    "$sandbox_hash" 'chrome-sandbox' \
+    "$node_hash" 'resources/bin/node' \
+    >"$pkgdir/usr/lib/studio/.omarchy-runtime-integrity"
 
   install -Dm755 "$srcdir/studio-launcher" "$pkgdir/usr/bin/studio"
   install -Dm755 "$srcdir/studio-omarchy-update" \
@@ -91,4 +171,18 @@ package() {
     "$pkgdir/usr/share/icons/hicolor/512x512/apps/studio.png"
   install -Dm644 "$repo_root/LICENSE.md" \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+
+  chown -R 0:0 "$pkgdir/usr"
+  [[ $(stat -c '%u:%g:%h:%a' -- "$pkgdir/usr/lib/studio/chrome-sandbox") == '0:0:1:4755' ]] || {
+    error 'The packaged Electron chrome-sandbox has unsafe final metadata.'
+    return 1
+  }
+  [[ $(stat -c '%u:%g:%h:%a' -- "$pkgdir/usr/lib/studio/resources/bin/node") == '0:0:1:755' ]] || {
+    error 'The packaged Node runtime has unsafe final metadata.'
+    return 1
+  }
+  [[ $(stat -c '%u:%g:%h:%a' -- "$pkgdir/usr/lib/studio/.omarchy-runtime-integrity") == '0:0:1:644' ]] || {
+    error 'The packaged runtime integrity manifest has unsafe final metadata.'
+    return 1
+  }
 }

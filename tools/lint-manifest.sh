@@ -33,7 +33,7 @@ grep -qxF "readonly upstream_commit='$upstream_commit'" \
   "$plugin_root/packaging/arch/build-omarchy-package.sh"
 grep -qxF "git -C \"\$studio_root\" fetch --depth 1 origin $upstream_commit" \
   "$plugin_root/packaging/arch/build-omarchy-package.sh"
-grep -qxF "git -C \"\$studio_root\" checkout --detach $upstream_commit &&" \
+grep -qxF "git -C \"\$studio_root\" checkout --detach $upstream_commit ||" \
   "$plugin_root/packaging/arch/build-omarchy-package.sh"
 
 updater_hash=$(sha256sum "$plugin_root/packaging/arch/studio-omarchy-update" | cut -d ' ' -f 1)

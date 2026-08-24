@@ -65,22 +65,42 @@ jobs:
           }
 
           resolve_revision_source() {
-            local expected_version=$1 expected_pkgrel=$2 candidate_tag candidate_target
+            local expected_version=$1 expected_pkgrel=$2 base_target base_pkgbuild
+            local base_pkgrel base_version shadow_target candidate_tag candidate_target
             local pkgbuild_file tag_pkgrel tag_version
 
-            candidate_tag="$release_tag-r$expected_pkgrel"
-            candidate_target=$(resolve_remote_tag "$candidate_tag" || true)
-            if [[ -z $candidate_target ]]; then
+            base_target=$(resolve_remote_tag "$release_tag") ||
+              fail "Release $release_tag has no immutable base source tag."
+            base_pkgbuild=$(mktemp "$RUNNER_TEMP/studio-base-pkgbuild.XXXXXXXXXX")
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$base_target" \
+              >"$base_pkgbuild"
+            (( $(wc -c <"$base_pkgbuild") <= 65536 )) ||
+              fail "Base source tag $release_tag has an oversized package recipe."
+            base_version=$(sed -n 's/^pkgver=//p' "$base_pkgbuild")
+            base_pkgrel=$(sed -n 's/^pkgrel=//p' "$base_pkgbuild")
+            [[ $base_version == "$expected_version" && $base_pkgrel =~ ^[1-9][0-9]*$ ]] ||
+              fail "Base source tag $release_tag does not declare Studio $expected_version with one package revision."
+
+            shadow_target=$(resolve_remote_tag "$release_tag-r$base_pkgrel" || true)
+            [[ -z $shadow_target ]] ||
+              fail "Base source tag $release_tag has forbidden revision shadow $release_tag-r$base_pkgrel."
+
+            if [[ $expected_pkgrel == "$base_pkgrel" ]]; then
               candidate_tag=$release_tag
+              candidate_target=$base_target
+              pkgbuild_file=$base_pkgbuild
+            else
+              candidate_tag="$release_tag-r$expected_pkgrel"
               candidate_target=$(resolve_remote_tag "$candidate_tag") ||
                 fail "Release $release_tag package revision $expected_pkgrel has no immutable source tag."
+              pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-source-pkgbuild.XXXXXXXXXX")
+              gh api -H 'Accept: application/vnd.github.raw+json' \
+                "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
+                >"$pkgbuild_file"
+              (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
+                fail "Source tag $candidate_tag has an oversized package recipe."
             fi
-            pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-source-pkgbuild.XXXXXXXXXX")
-            gh api -H 'Accept: application/vnd.github.raw+json' \
-              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
-              >"$pkgbuild_file"
-            (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
-              fail "Source tag $candidate_tag has an oversized package recipe."
             tag_version=$(sed -n 's/^pkgver=//p' "$pkgbuild_file")
             tag_pkgrel=$(sed -n 's/^pkgrel=//p' "$pkgbuild_file")
             [[ $tag_version == "$expected_version" && $tag_pkgrel == "$expected_pkgrel" ]] ||
@@ -436,22 +456,42 @@ jobs:
           }
 
           resolve_revision_source() {
-            local expected_version=$1 expected_pkgrel=$2 candidate_tag candidate_target
+            local expected_version=$1 expected_pkgrel=$2 base_target base_pkgbuild
+            local base_pkgrel base_version shadow_target candidate_tag candidate_target
             local pkgbuild_file tag_pkgrel tag_version
 
-            candidate_tag="$RELEASE_TAG-r$expected_pkgrel"
-            candidate_target=$(resolve_remote_tag "$candidate_tag" || true)
-            if [[ -z $candidate_target ]]; then
+            base_target=$(resolve_remote_tag "$RELEASE_TAG") ||
+              fail "Release $RELEASE_TAG has no immutable base source tag."
+            base_pkgbuild=$(mktemp "$RUNNER_TEMP/studio-published-base-pkgbuild.XXXXXXXXXX")
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$base_target" \
+              >"$base_pkgbuild"
+            (( $(wc -c <"$base_pkgbuild") <= 65536 )) ||
+              fail "Base source tag $RELEASE_TAG has an oversized package recipe."
+            base_version=$(sed -n 's/^pkgver=//p' "$base_pkgbuild")
+            base_pkgrel=$(sed -n 's/^pkgrel=//p' "$base_pkgbuild")
+            [[ $base_version == "$expected_version" && $base_pkgrel =~ ^[1-9][0-9]*$ ]] ||
+              fail "Base source tag $RELEASE_TAG does not declare Studio $expected_version with one package revision."
+
+            shadow_target=$(resolve_remote_tag "$RELEASE_TAG-r$base_pkgrel" || true)
+            [[ -z $shadow_target ]] ||
+              fail "Base source tag $RELEASE_TAG has forbidden revision shadow $RELEASE_TAG-r$base_pkgrel."
+
+            if [[ $expected_pkgrel == "$base_pkgrel" ]]; then
               candidate_tag=$RELEASE_TAG
+              candidate_target=$base_target
+              pkgbuild_file=$base_pkgbuild
+            else
+              candidate_tag="$RELEASE_TAG-r$expected_pkgrel"
               candidate_target=$(resolve_remote_tag "$candidate_tag") ||
                 fail "Release $RELEASE_TAG package revision $expected_pkgrel has no immutable source tag."
+              pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-published-pkgbuild.XXXXXXXXXX")
+              gh api -H 'Accept: application/vnd.github.raw+json' \
+                "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
+                >"$pkgbuild_file"
+              (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
+                fail "Source tag $candidate_tag has an oversized package recipe."
             fi
-            pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-published-pkgbuild.XXXXXXXXXX")
-            gh api -H 'Accept: application/vnd.github.raw+json' \
-              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
-              >"$pkgbuild_file"
-            (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
-              fail "Source tag $candidate_tag has an oversized package recipe."
             tag_version=$(sed -n 's/^pkgver=//p' "$pkgbuild_file")
             tag_pkgrel=$(sed -n 's/^pkgrel=//p' "$pkgbuild_file")
             [[ $tag_version == "$expected_version" && $tag_pkgrel == "$expected_pkgrel" ]] ||
@@ -557,6 +597,10 @@ jobs:
           [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]] || fail 'The packaged source commit is invalid.'
           [[ $(resolve_remote_tag "$SOURCE_TAG") == "$SOURCE_COMMIT" ]] ||
             fail "Source tag $SOURCE_TAG moved or disappeared before publication."
+          resolve_revision_source "$VERSION" "$PKGREL"
+          [[ $resolved_source_tag == "$SOURCE_TAG" &&
+            $resolved_source_commit == "$SOURCE_COMMIT" ]] ||
+            fail "Package revision $PKGREL has an ambiguous source tag before publication."
           remote_main=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
             refs/heads/main | awk 'NR == 1 { print $1 }')
           [[ $remote_main == "$SOURCE_COMMIT" ]] ||

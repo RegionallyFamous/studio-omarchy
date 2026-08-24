@@ -39,5 +39,5 @@ grep -qxF "readonly upstream_commit='$upstream_commit'" \
   "$script_dir/build-omarchy-package.sh"
 grep -qxF "git -C \"\$studio_root\" fetch --depth 1 origin $upstream_commit" \
   "$script_dir/build-omarchy-package.sh"
-grep -qxF "git -C \"\$studio_root\" checkout --detach $upstream_commit &&" \
+grep -qxF "git -C \"\$studio_root\" checkout --detach $upstream_commit ||" \
   "$script_dir/build-omarchy-package.sh"

@@ -1,29 +1,155 @@
 # shellcheck shell=bash
 
 _studio_node='/usr/lib/studio/resources/bin/node'
+_studio_sandbox='/usr/lib/studio/chrome-sandbox'
+_studio_integrity='/usr/lib/studio/.omarchy-runtime-integrity'
 _studio_ca='/etc/ca-certificates/trust-source/anchors/studio-ca.crt'
 _studio_ca_lock='/run/lock/wordpress-studio-ca.lock'
+_studio_sandbox_hash=''
+_studio_node_hash=''
 
-_set_studio_capability() {
-  if [[ -x $_studio_node ]]; then
-    setcap 'cap_net_bind_service=+ep' "$_studio_node" ||
-      echo 'WordPress Studio: unable to grant ports 80/443 to the bundled Node runtime.' >&2
+_verify_studio_directory() {
+  local directory=$1 metadata file_type uid gid mode links
+
+  [[ -d $directory && ! -L $directory ]] || return 1
+  metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$directory") || return 1
+  IFS='|' read -r file_type uid gid mode links <<<"$metadata"
+  [[ $file_type == "directory" ]] || return 1
+  (( uid == 0 && gid == 0 && links >= 1 )) || return 1
+  (( (8#$mode & 0022) == 0 ))
+}
+
+_load_studio_integrity() {
+  local metadata file_type uid gid mode links size
+  local -a records=()
+
+  _studio_sandbox_hash=''
+  _studio_node_hash=''
+  [[ -f $_studio_integrity && ! -L $_studio_integrity ]] || return 1
+  metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h|%s' -- "$_studio_integrity") ||
+    return 1
+  IFS='|' read -r file_type uid gid mode links size <<<"$metadata"
+  [[ $file_type == "regular file" && $mode == "644" ]] || return 1
+  (( uid == 0 && gid == 0 && links == 1 && size == 166 )) || return 1
+
+  mapfile -t records <"$_studio_integrity"
+  (( ${#records[@]} == 2 )) || return 1
+  (( ${#records[0]} == 80 && ${#records[1]} == 84 )) || return 1
+  [[ ${records[0]:64:2} == "  " && ${records[0]:66} == "chrome-sandbox" ]] ||
+    return 1
+  [[ ${records[1]:64:2} == "  " && ${records[1]:66} == "resources/bin/node" ]] ||
+    return 1
+  _studio_sandbox_hash=${records[0]:0:64}
+  _studio_node_hash=${records[1]:0:64}
+  [[ $_studio_sandbox_hash =~ ^[0-9a-f]{64}$ &&
+    $_studio_node_hash =~ ^[0-9a-f]{64}$ ]]
+}
+
+_verify_studio_runtime_file() {
+  local runtime_path=$1 expected_mode=$2 expected_hash=$3 max_size=$4
+  local metadata file_type uid gid mode links size actual_hash
+
+  [[ -f $runtime_path && ! -L $runtime_path ]] || return 1
+  metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h|%s' -- "$runtime_path") ||
+    return 1
+  IFS='|' read -r file_type uid gid mode links size <<<"$metadata"
+  [[ $file_type == "regular file" && $mode == "$expected_mode" ]] || return 1
+  (( uid == 0 && gid == 0 && links == 1 && size > 0 && size <= max_size )) || return 1
+  actual_hash=$(/usr/bin/sha256sum -- "$runtime_path") || return 1
+  actual_hash=${actual_hash%% *}
+  [[ $actual_hash == "$expected_hash" ]]
+}
+
+_disable_studio_privilege() {
+  local metadata file_type uid gid mode links
+
+  _verify_studio_directory '/usr/lib/studio' || return 1
+  _verify_studio_directory '/usr/lib/studio/resources' || return 1
+  _verify_studio_directory '/usr/lib/studio/resources/bin' || return 1
+
+  if [[ -f $_studio_sandbox && ! -L $_studio_sandbox ]]; then
+    metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$_studio_sandbox") ||
+      metadata=''
+    IFS='|' read -r file_type uid gid mode links <<<"$metadata"
+    if [[ $file_type == "regular file" ]] &&
+      (( uid == 0 && gid == 0 && links == 1 )); then
+      /usr/bin/chmod 0755 "$_studio_sandbox" || true
+    fi
+  fi
+  if [[ -f $_studio_node && ! -L $_studio_node ]]; then
+    metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$_studio_node") ||
+      metadata=''
+    IFS='|' read -r file_type uid gid mode links <<<"$metadata"
+    if [[ $file_type == "regular file" ]] &&
+      (( uid == 0 && gid == 0 && links == 1 )); then
+      /usr/bin/setcap -r "$_studio_node" 2>/dev/null || true
+    fi
   fi
 }
 
+_set_studio_capability() {
+  local actual_capability
+
+  if ! _verify_studio_directory '/usr/lib/studio' ||
+    ! _verify_studio_directory '/usr/lib/studio/resources' ||
+    ! _verify_studio_directory '/usr/lib/studio/resources/bin' ||
+    ! _load_studio_integrity ||
+    ! _verify_studio_runtime_file "$_studio_sandbox" '4755' \
+      "$_studio_sandbox_hash" 5242880 ||
+    ! _verify_studio_runtime_file "$_studio_node" '755' \
+      "$_studio_node_hash" 209715200; then
+    _disable_studio_privilege
+    echo 'WordPress Studio: refusing privileged runtime setup because package identity or metadata is unsafe.' >&2
+    return 1
+  fi
+
+  /usr/bin/setcap 'cap_net_bind_service=+ep' "$_studio_node" || {
+    /usr/bin/setcap -r "$_studio_node" 2>/dev/null || true
+    echo 'WordPress Studio: unable to grant ports 80/443 to the bundled Node runtime.' >&2
+    return 1
+  }
+  if ! actual_capability=$(/usr/bin/getcap "$_studio_node"); then
+    /usr/bin/setcap -r "$_studio_node" 2>/dev/null || true
+    echo 'WordPress Studio: unable to verify the bundled Node capability.' >&2
+    return 1
+  fi
+  [[ $actual_capability == "$_studio_node cap_net_bind_service=ep" ]] || {
+    /usr/bin/setcap -r "$_studio_node" 2>/dev/null || true
+    echo 'WordPress Studio: bundled Node capability verification failed.' >&2
+    return 1
+  }
+}
+
 post_install() {
-  _set_studio_capability
-  update-desktop-database -q
+  local status=0
+
+  _set_studio_capability || status=$?
+  PATH=/usr/bin:/usr/sbin update-desktop-database -q || status=$?
+  return "$status"
 }
 
 post_upgrade() {
-  _set_studio_capability
-  update-desktop-database -q
+  local status=0
+
+  _set_studio_capability || status=$?
+  PATH=/usr/bin:/usr/sbin update-desktop-database -q || status=$?
+  return "$status"
 }
 
 pre_remove() {
-  if [[ -e $_studio_node ]]; then
-    setcap -r "$_studio_node" 2>/dev/null || true
+  local metadata file_type uid gid mode links
+
+  if _verify_studio_directory '/usr/lib/studio' &&
+    _verify_studio_directory '/usr/lib/studio/resources' &&
+    _verify_studio_directory '/usr/lib/studio/resources/bin' &&
+    [[ -f $_studio_node && ! -L $_studio_node ]]; then
+    metadata=$(LC_ALL=C /usr/bin/stat -c '%F|%u|%g|%a|%h' -- "$_studio_node") ||
+      metadata=''
+    IFS='|' read -r file_type uid gid mode links <<<"$metadata"
+    if [[ $file_type == "regular file" ]] &&
+      (( uid == 0 && gid == 0 && links == 1 )); then
+      /usr/bin/setcap -r "$_studio_node" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -33,11 +159,11 @@ post_remove() {
     exec 9>"$_studio_ca_lock" || exit 1
     /usr/bin/flock -x 9 || exit 1
     if [[ -f $_studio_ca ]]; then
-      rm -f "$_studio_ca" || exit 1
+      /bin/rm -f "$_studio_ca" || exit 1
     fi
-    update-ca-trust extract || exit 1
+    PATH=/usr/bin:/usr/sbin update-ca-trust extract || exit 1
   ); then
-    update-desktop-database -q
+    PATH=/usr/bin:/usr/sbin update-desktop-database -q
   else
     echo 'WordPress Studio: unable to remove the system trust anchor safely.' >&2
     return 1
