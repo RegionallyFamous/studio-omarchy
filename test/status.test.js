@@ -13,23 +13,20 @@ const rawLimit = 96
 function runStatus(output, pacmanStatus = 0) {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-status-'))
   const binDir = path.join(fixtureRoot, 'bin')
+  const outputFile = path.join(fixtureRoot, 'pacman-output')
   fs.mkdirSync(binDir)
+  fs.writeFileSync(outputFile, output)
 
   fs.writeFileSync(
-    path.join(binDir, 'setsid'),
-    '#!/bin/bash\nexec "$@"\n',
-    { mode: 0o755 }
-  )
-  fs.writeFileSync(
-    path.join(binDir, 'ps'),
-    '#!/bin/bash\nprintf \'%s\\n\' "${@: -1}"\n',
+    path.join(binDir, 'timeout'),
+    '#!/bin/bash\nshift 3\nexec "$@"\n',
     { mode: 0o755 }
   )
   fs.writeFileSync(
     path.join(binDir, 'pacman'),
     [
       '#!/bin/bash',
-      'printf \'%s\' "${STUDIO_STATUS_OUTPUT:-}"',
+      'cat -- "$STUDIO_STATUS_OUTPUT_FILE"',
       'exit "${STUDIO_STATUS_EXIT:-0}"',
       ''
     ].join('\n'),
@@ -41,7 +38,7 @@ function runStatus(output, pacmanStatus = 0) {
     env: {
       ...process.env,
       PATH: `${binDir}:${process.env.PATH}`,
-      STUDIO_STATUS_OUTPUT: output,
+      STUDIO_STATUS_OUTPUT_FILE: outputFile,
       STUDIO_STATUS_EXIT: String(pacmanStatus)
     }
   })
@@ -92,6 +89,26 @@ test('rejects status output one byte over the raw ceiling without partial data',
 
 test('counts multibyte status input by bytes and returns no partial value', () => {
   const result = runStatus(statusLineAtBytes(rawLimit, true))
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, 'error\n')
+})
+
+test('rejects a valid-looking line padded past the byte ceiling with trailing newlines', () => {
+  const validLine = `${packageName} v\n`
+  const output = validLine + '\n'.repeat(rawLimit + 1 - Buffer.byteLength(validLine))
+  assert.equal(Buffer.byteLength(output), rawLimit + 1)
+  const result = runStatus(output)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.stdout, 'error\n')
+})
+
+test('rejects an embedded NUL instead of normalizing it away', () => {
+  const output = Buffer.concat([
+    Buffer.from(`${packageName} v`),
+    Buffer.from([0]),
+    Buffer.from('\n')
+  ])
+  const result = runStatus(output)
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.stdout, 'error\n')
 })

@@ -24,6 +24,7 @@ jq -e --arg version "$package_version" '
 [[ -x $plugin_root/scripts/status.sh ]]
 [[ -x $plugin_root/scripts/action.sh ]]
 [[ -x $plugin_root/scripts/cleanup-user-trust.sh ]]
+[[ -x $plugin_root/scripts/remove.sh ]]
 cmp "$plugin_root/install.sh" "$plugin_root/packaging/arch/studio-omarchy-update"
 
 upstream_commit=$(<"$plugin_root/packaging/arch/upstream-commit")

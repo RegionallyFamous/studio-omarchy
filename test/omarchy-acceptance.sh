@@ -15,7 +15,7 @@ PACKAGE_NAME='wordpress-studio-omarchy'
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 TERMINAL_CLASS='org\.omarchy\.terminal|foot|Alacritty'
 STUDIO_CLASS='(?i)studio'
-BROWSER_CLASS='(?i)chromium'
+CHROMIUM_EXE='/usr/lib/chromium/chromium'
 STUDIO_CONFIG="$HOME/.studio/cli.json"
 BUNDLED_NODE='/usr/lib/studio/resources/bin/node'
 BUNDLED_CLI='/usr/lib/studio/resources/cli/main.mjs'
@@ -29,26 +29,56 @@ SITE_ONE_PORT=''
 SITE_TWO_ID=''
 SITE_TWO_PATH=''
 SITE_TWO_PORT=''
+SITE_REMOVAL_NAME='Omarchy Removal Preserve'
+SITE_REMOVAL_PATH=''
+SITE_REMOVAL_PORT=''
+SITE_REMOVAL_RECORD_INVARIANTS=''
+SITE_REMOVAL_SENTINEL_HASH=''
+SITE_REMOVAL_WP_CONFIG_HASH=''
+SITE_REMOVAL_WP_LOAD_HASH=''
+SITE_REMOVAL_DATABASE_HASH=''
 installed_package_before_update=''
 studio_hash_before_update=''
 pacman_log_line_before_update=''
 bar_widget_click_index=0
 : "${QMLLINT_BIN:=/usr/lib/qt6/bin/qmllint}"
 
-screen_absent() {
-  ! screen_contains "$1"
+# Visual evidence is part of the acceptance contract. Capture atomically and
+# fail a passing step if its required screenshot cannot be written.
+screenshot() {
+  local name=$1 target="$ARTIFACTS/$1.png" temporary="$ARTIFACTS/.$1-${BASHPID}.png"
+
+  rm -f "$temporary"
+  if timeout 10 grim "$temporary" 2>/dev/null && [[ -s $temporary ]]; then
+    mv -- "$temporary" "$target"
+  else
+    rm -f "$temporary"
+    printf 'required screenshot failed: %s\n' "$name" >&2
+    return 1
+  fi
 }
 
-browser_cleanup_success_visible() {
-  screen_contains 'no current-user browser NSS database needs cleanup' ||
-    screen_contains 'no matching current-user browser trust entry found' ||
-    screen_contains 'matching current-user browser trust entr'
+# Preserve the shared failure format while ensuring a screenshot failure never
+# hides the actual assertion that failed.
+fail() {
+  local description=$1 detail=${2:-} step=${1,,}
+
+  step=${step// /-}
+  step=${step//[^a-z0-9-]/}
+  [[ -n $detail ]] && printf '%s\n' "$detail" >&2
+  screenshot "failure-$step" || true
+  printf 'not ok - %s\n' "$description" >&2
+  exit 1
+}
+
+screen_absent() {
+  ! screen_contains "$1"
 }
 
 active_region_contains() {
   local text=$1 region=$2
   local left_pct top_pct right_pct bottom_pct window win_x win_y win_w win_h
-  local crop_x crop_y crop_w crop_h snapshot status
+  local crop_x crop_y crop_w crop_h snapshot scaled_snapshot status psm
 
   read -r left_pct top_pct right_pct bottom_pct <<<"$region"
   window=$(hyprctl -j activewindow | jq -ce '{at,size}') || return 1
@@ -59,15 +89,30 @@ active_region_contains() {
   crop_h=$((win_h * (bottom_pct - top_pct) / 100))
   (( crop_w > 0 && crop_h > 0 )) || return 1
   snapshot="/tmp/omarchy-acceptance-active-region-${BASHPID}.png"
+  scaled_snapshot="/tmp/omarchy-acceptance-active-region-scaled-${BASHPID}.png"
 
   if ! timeout 10 grim -g "$crop_x,$crop_y ${crop_w}x${crop_h}" "$snapshot" 2>/dev/null; then
-    rm -f "$snapshot"
+    rm -f "$snapshot" "$scaled_snapshot"
     return 1
   fi
-  tesseract "$snapshot" stdout --psm 11 2>/dev/null | grep -Fi -- "$text" >/dev/null
-  status=$?
-  rm -f "$snapshot"
+
+  status=1
+  if tesseract "$snapshot" stdout --psm 11 2>/dev/null | grep -Fi -- "$text" >/dev/null; then
+    status=0
+  elif timeout 10 magick "$snapshot" -resize 200% "$scaled_snapshot" 2>/dev/null; then
+    for psm in 11 6; do
+      if tesseract "$scaled_snapshot" stdout --psm "$psm" 2>/dev/null | grep -Fi -- "$text" >/dev/null; then
+        status=0
+        break
+      fi
+    done
+  fi
+  rm -f "$snapshot" "$scaled_snapshot"
   return "$status"
+}
+
+active_region_absent() {
+  ! active_region_contains "$1" "$2"
 }
 
 plugin_absent() {
@@ -93,16 +138,82 @@ active_window_matches() {
   hyprctl -j activewindow | jq -e --arg class "$1" '(.class // "") | test($class)'
 }
 
+active_chromium_browser() {
+  local active pid executable
+
+  active=$(hyprctl -j activewindow) || return 1
+  pid=$(jq -er '.pid // empty' <<<"$active") || return 1
+  executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  [[ $executable == "$CHROMIUM_EXE" ]]
+}
+
+browser_window_present() {
+  local pid executable
+
+  while read -r pid; do
+    executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    [[ $executable == "$CHROMIUM_EXE" ]] && return 0
+  done < <(hyprctl -j clients | jq -r '.[] | .pid // empty')
+  return 1
+}
+
+browser_window_absent() {
+  ! browser_window_present
+}
+
+active_chromium_terms() {
+  active_chromium_browser &&
+    hyprctl -j activewindow | jq -e '
+      .xwayland == false and (.title // "") == "Chromium Additional Terms of Service"
+    ' >/dev/null
+}
+
+chromium_terms_absent() {
+  ! active_chromium_terms
+}
+
+dismiss_chromium_terms_if_needed() {
+  local site_name=$1
+
+  wait_until 'the browser activates its first-run terms or the requested site' 30 \
+    browser_terms_or_site_active "$site_name"
+  if active_chromium_terms; then
+    click_active_bottom_right_control 'the Chromium first-run terms are accepted with the pointer'
+    wait_until 'the Chromium first-run terms close' 30 chromium_terms_absent
+  fi
+}
+
 active_native_browser_for_site() {
   local site_name=$1
 
-  hyprctl -j activewindow | jq -e --arg class "$BROWSER_CLASS" --arg site "$site_name" '
-    ((.class // "") | test($class)) and .xwayland == false and ((.title // "") | contains($site))
-  '
+  active_chromium_browser &&
+    hyprctl -j activewindow | jq -e --arg site "$site_name" '
+      .xwayland == false and ((.title // "") | contains($site))
+    ' >/dev/null
+}
+
+browser_terms_or_site_active() {
+  active_chromium_terms || active_native_browser_for_site "$1"
+}
+
+close_browser_windows() {
+  local address pid executable
+
+  while IFS=$'\t' read -r address pid; do
+    executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    if [[ $executable == "$CHROMIUM_EXE" ]]; then
+      hyprctl dispatch "hl.dsp.window.close({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+        hyprctl dispatch closewindow "address:$address" >/dev/null 2>&1 || true
+    fi
+  done < <(hyprctl -j clients | jq -r '.[] | [(.address // ""), (.pid // 0)] | @tsv')
 }
 
 studio_processes_absent() {
   ! pgrep -f '^/usr/lib/studio/' >/dev/null
+}
+
+studio_remover_process_absent() {
+  ! pgrep -u "$(id -u)" -f "^/bin/bash $PLUGIN_DIR/scripts/remove[.]sh( |$)" >/dev/null
 }
 
 pointer_is_near() {
@@ -266,6 +377,9 @@ click_phrase() {
   screenshot "ready-studio-$ready_name-$button"
   [[ $button == "right" ]] && click_code='0xC1'
   ydotool click "$click_code" >/dev/null || fail "$label"
+  if [[ $button == "right" ]]; then
+    park_pointer
+  fi
   pass "$label"
 }
 
@@ -277,6 +391,57 @@ click_active_phrase() {
   click_phrase active "$1" "${2:-0 0 100 100}" "$3"
 }
 
+# The agentic Studio sidebar uses source-fixed 34px rows with a 1px gap. Target
+# the stable body of each row after exact visible-name waits, while keeping OCR
+# for controls whose position or order can change.
+click_active_site_row() {
+  local row_index=$1 label=$2 button=${3:-left} park_after_click=${4:-true}
+  local window win_x win_y win_w win_h target_x target_y click_code='0xC0' ready_name
+
+  window=$(hyprctl -j activewindow | jq -ce '{at,size}') || fail "$label"
+  read -r win_x win_y win_w win_h < <(jq -r '.at[0],.at[1],.size[0],.size[1]' <<<"$window" | xargs)
+  (( row_index >= 0 && row_index < 20 && win_w >= 320 && win_h >= 180 )) ||
+    fail "$label" 'the active Studio geometry or row index is outside the acceptance contract'
+  target_x=$((win_x + 150))
+  target_y=$((win_y + 49 + row_index * 35))
+  move_pointer_exactly "$target_x" "$target_y" "$label"
+  pointer_is_near "$target_x" "$target_y" || fail "$label" 'cursor assertion failed immediately before click'
+  ready_name=${label,,}
+  ready_name=${ready_name// /-}
+  ready_name=${ready_name//[^a-z0-9-]/}
+  screenshot "ready-studio-$ready_name-$button"
+  [[ $button == "right" ]] && click_code='0xC1'
+  ydotool click "$click_code" >/dev/null || fail "$label"
+  if [[ $button == "right" && $park_after_click == "true" ]]; then
+    park_pointer
+  fi
+  pass "$label"
+}
+
+# The destructive menu label is red and can disappear from Tesseract even when
+# it is plainly rendered. The source-fixed site menu is anchored to the row and
+# places Delete site in its final 35px item, centered 355px below that anchor.
+click_active_site_delete_action() {
+  local row_index=$1 label=$2
+  local window win_x win_y win_w win_h target_x target_y ready_name
+
+  window=$(hyprctl -j activewindow | jq -ce '{at,size}') || fail "$label"
+  read -r win_x win_y win_w win_h < <(jq -r '.at[0],.at[1],.size[0],.size[1]' <<<"$window" | xargs)
+  (( row_index >= 0 && row_index < 20 && win_w >= 320 && win_h >= 500 )) ||
+    fail "$label" 'the active Studio geometry or row index is outside the acceptance contract'
+  target_x=$((win_x + 190))
+  target_y=$((win_y + 49 + row_index * 35 + 355))
+  (( target_y <= win_y + win_h )) || fail "$label" 'the Delete site target falls outside the active window'
+  move_pointer_exactly "$target_x" "$target_y" "$label"
+  pointer_is_near "$target_x" "$target_y" || fail "$label" 'cursor assertion failed immediately before click'
+  ready_name=${label,,}
+  ready_name=${ready_name// /-}
+  ready_name=${ready_name//[^a-z0-9-]/}
+  screenshot "ready-studio-$ready_name-left"
+  ydotool click 0xC0 >/dev/null || fail "$label"
+  pass "$label"
+}
+
 click_active_centered_control() {
   local x_offset=$1 y_offset=$2 label=$3
   local window win_x win_y win_w win_h target_x target_y ready_name
@@ -285,6 +450,46 @@ click_active_centered_control() {
   read -r win_x win_y win_w win_h < <(jq -r '.at[0],.at[1],.size[0],.size[1]' <<<"$window" | xargs)
   target_x=$((win_x + win_w / 2 + x_offset))
   target_y=$((win_y + win_h / 2 + y_offset))
+  move_pointer_exactly "$target_x" "$target_y" "$label"
+  pointer_is_near "$target_x" "$target_y" || fail "$label" 'cursor assertion failed immediately before click'
+  ready_name=${label,,}
+  ready_name=${ready_name// /-}
+  ready_name=${ready_name//[^a-z0-9-]/}
+  screenshot "ready-studio-$ready_name-left"
+  ydotool click 0xC0 >/dev/null || fail "$label"
+  pass "$label"
+}
+
+click_active_relative_control() {
+  local x_percent=$1 y_percent=$2 label=$3
+  local window win_x win_y win_w win_h target_x target_y ready_name
+
+  window=$(hyprctl -j activewindow | jq -ce '{at,size}') || fail "$label"
+  read -r win_x win_y win_w win_h < <(jq -r '.at[0],.at[1],.size[0],.size[1]' <<<"$window" | xargs)
+  target_x=$((win_x + win_w * x_percent / 100))
+  target_y=$((win_y + win_h * y_percent / 100))
+  move_pointer_exactly "$target_x" "$target_y" "$label"
+  pointer_is_near "$target_x" "$target_y" || fail "$label" 'cursor assertion failed immediately before click'
+  ready_name=${label,,}
+  ready_name=${ready_name// /-}
+  ready_name=${ready_name//[^a-z0-9-]/}
+  screenshot "ready-studio-$ready_name-left"
+  ydotool click 0xC0 >/dev/null || fail "$label"
+  pass "$label"
+}
+
+# KeyboardPanel's layer surface intentionally spans the monitor, while its
+# source-fixed 330px card is anchored at the top-right. Target the center of
+# the third 40px action row directly: dark monospace button text is not a
+# reliable Tesseract target even when the control is plainly rendered.
+click_quattro_remove_control() {
+  local label=$1
+  local monitor target_x target_y ready_name
+
+  monitor=$(hyprctl -j monitors | jq -ce 'if length == 1 then .[0] else empty end') ||
+    fail "$label" 'the Quattro action requires exactly one guest monitor'
+  target_x=$(jq -nr --argjson m "$monitor" '$m.x + ($m.width / $m.scale) - 170 | round')
+  target_y=$(jq -nr --argjson m "$monitor" '$m.y + 188 | round')
   move_pointer_exactly "$target_x" "$target_y" "$label"
   pointer_is_near "$target_x" "$target_y" || fail "$label" 'cursor assertion failed immediately before click'
   ready_name=${label,,}
@@ -318,6 +523,7 @@ right_click_active_phrase() {
 }
 
 click_bar_widget() {
+  local verify_tooltip=${1:-true}
   local slot layer monitor target_x target_y
 
   bar_widget_click_index=$((bar_widget_click_index + 1))
@@ -333,9 +539,11 @@ click_bar_widget() {
   target_y=$(jq -nr --argjson s "$slot" --argjson l "$layer" --argjson m "$monitor" '$m.y + $l.y + $s.y + $s.height / 2 | round')
   move_pointer_exactly "$target_x" "$target_y" 'the pointer reaches the Studio bar widget'
   pointer_is_near "$target_x" "$target_y" || fail 'the Studio bar widget cursor coordinate is asserted'
-  sleep 1
-  resolve_phrase screen 'WordPress Studio' '80 0 100 10' 'the real Studio bar widget exposes its tooltip' >/dev/null
-  pass 'the real Studio bar widget exposes its tooltip'
+  if [[ $verify_tooltip == "true" ]]; then
+    sleep 1
+    resolve_phrase screen 'WordPress Studio' '80 0 100 10' 'the real Studio bar widget exposes its tooltip' >/dev/null
+    pass 'the real Studio bar widget exposes its tooltip'
+  fi
   screenshot "ready-studio-bar-widget-$bar_widget_click_index"
   pointer_is_near "$target_x" "$target_y" || fail 'the Studio bar widget cursor coordinate is asserted immediately before click'
   ydotool click 0xC0 >/dev/null || fail 'the real Studio bar widget is clicked'
@@ -377,22 +585,51 @@ click_active_tooltip() {
   pass "$label"
 }
 
-hover_theme_thumbnail_and_open() {
-  local theme_x theme_y hover_x label='the external Open site control is clicked with the pointer'
-
-  read -r theme_x theme_y < <(resolve_phrase active 'Theme' '25 10 85 75' 'the Theme row locates the site thumbnail')
-  hover_x=$((theme_x - 55))
-  move_pointer_exactly "$hover_x" "$theme_y" 'the pointer hovers the site thumbnail'
-  wait_until 'the thumbnail reveals its Open site control' 10 screen_contains 'Open site'
-  pointer_is_near "$hover_x" "$theme_y" || fail "$label" 'cursor moved after the thumbnail control appeared'
-  screenshot 'ready-studio-the-external-open-site-control-is-clicked-with-the-pointer-left'
-  ydotool click 0xC0 >/dev/null || fail "$label"
-  pass "$label"
-}
-
 group_nonrunnable() {
   local pgid=$1
   ! ps -eo pgid=,stat= | awk -v target="$pgid" '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+pid_nonrunnable() {
+  local pid=$1 state
+
+  state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  [[ -z $state || $state == Z* ]]
+}
+
+pids_nonrunnable() {
+  local pid
+
+  for pid in "$@"; do
+    pid_nonrunnable "$pid" || return 1
+  done
+}
+
+pid_cmdline_has_argument() {
+  local pid=$1 expected=$2 argument
+
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  while IFS= read -r -d '' argument; do
+    [[ $argument == "$expected" ]] && return 0
+  done <"/proc/$pid/cmdline"
+  return 1
+}
+
+find_remove_outer_controller_pid() {
+  local parent_pid=$1 candidate executable
+
+  while read -r candidate; do
+    [[ $candidate =~ ^[0-9]+$ ]] || continue
+    executable=$(readlink -f "/proc/$candidate/exe" 2>/dev/null || true)
+    [[ $executable == "/usr/bin/timeout" ]] || continue
+    pid_cmdline_has_argument "$candidate" '--signal=TERM' || continue
+    pid_cmdline_has_argument "$candidate" '--kill-after=2s' || continue
+    pid_cmdline_has_argument "$candidate" '80s' || continue
+    pid_cmdline_has_argument "$candidate" 'systemd-run' || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(pgrep -P "$parent_pid" || true)
+  return 1
 }
 
 exercise_status_containment() {
@@ -422,6 +659,200 @@ STUB
   fi
   wait "$controller_pid" 2>/dev/null || true
   wait_until "the $mode containment group becomes non-runnable" 8 group_nonrunnable "$child_pgid"
+}
+
+exercise_status_pre_ready_containment() {
+  local run_root="$containment_root/status-pre-ready-sigkill"
+  local controller_pid controller_status
+
+  mkdir -p "$run_root/bin"
+  mkfifo "$run_root/hold-before-query"
+  awk '
+    $0 == "raw_hex=$(" {
+      print "if [[ -n ${STUDIO_STATUS_HOLD_BEFORE_QUERY:-} ]]; then"
+      print "  printf \"%s\\n\" \"$$\" >\"$STUDIO_STATUS_CONTROLLER_HELD\""
+      print "  IFS= read -r _ <\"$STUDIO_STATUS_HOLD_BEFORE_QUERY\""
+      print "fi"
+    }
+    { print }
+  ' "$FIXTURE/scripts/status.sh" >"$run_root/status.sh"
+  chmod 755 "$run_root/status.sh"
+  cat >"$run_root/bin/pacman" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$$" >"$STUDIO_STATUS_CHILD_PID"
+while :; do sleep 1; done
+STUB
+  chmod 755 "$run_root/bin/pacman"
+
+  PATH="$run_root/bin:$PATH" \
+    STUDIO_STATUS_HOLD_BEFORE_QUERY="$run_root/hold-before-query" \
+    STUDIO_STATUS_CONTROLLER_HELD="$run_root/controller-held" \
+    STUDIO_STATUS_CHILD_PID="$run_root/child.pid" \
+    "$run_root/status.sh" >"$run_root/output" 2>"$run_root/error" &
+  controller_pid=$!
+  printf '%s\n' "$controller_pid" >"$run_root/controller.pid"
+  wait_until 'the status controller is held before its bounded query starts' 5 \
+    test -s "$run_root/controller-held"
+  ps -o pid,ppid,pgid,sid,stat,comm -p "$controller_pid" \
+    >>"$ARTIFACTS/studio-status-topology.log"
+
+  kill -KILL "$controller_pid"
+  if wait "$controller_pid" 2>/dev/null; then
+    controller_status=0
+  else
+    controller_status=$?
+  fi
+  (( controller_status == 137 )) || fail 'the pre-query status SIGKILL records its controller death'
+  [[ ! -e $run_root/child.pid ]] || fail 'pre-query status controller death never starts pacman'
+  pass 'pre-query status controller death remains fail-closed'
+}
+
+exercise_remove_pre_ready_containment() {
+  local run_root="$containment_root/remove-pre-ready-sigkill"
+  local controller_pid controller_status outer_pid worker_cgroup worker_pid
+
+  mkdir -p "$run_root/scripts" "$run_root/studio/resources/bin" "$run_root/studio/resources/cli" "$run_root/bin"
+  sed -e "s|studio_root='/usr/lib/studio'|studio_root='$run_root/studio'|" \
+    -e 's/RuntimeMaxSec=70s/RuntimeMaxSec=8s/' \
+    -e 's/TimeoutStopSec=5s/TimeoutStopSec=1s/' \
+    -e 's/--kill-after=5s 60s/--kill-after=1s 4s/' \
+    "$FIXTURE/scripts/remove.sh" >"$run_root/scripts/remove.base.sh"
+  awk '
+    { print }
+    $0 == "    umask 077" {
+      print "    if [[ -n ${STUDIO_REMOVE_TEST_PRE_READY_PID:-} ]]; then"
+      print "      printf \"%s\\n\" \"$$\" >\"$STUDIO_REMOVE_TEST_PRE_READY_PID\""
+      print "      while :; do sleep 1; done"
+      print "    fi"
+    }
+  ' "$run_root/scripts/remove.base.sh" >"$run_root/scripts/remove.sh"
+  chmod 755 "$run_root/scripts/remove.sh"
+  printf '%s\n' '#!/bin/bash' 'exit 0' >"$run_root/scripts/cleanup-user-trust.sh"
+  chmod 755 "$run_root/scripts/cleanup-user-trust.sh"
+  : >"$run_root/studio/resources/cli/main.mjs"
+  cat >"$run_root/studio/resources/bin/node" <<'STUB'
+#!/bin/bash
+printf 'unexpected node start\n' >"$STUDIO_REMOVE_TEST_NODE_STARTED"
+while :; do sleep 1; done
+STUB
+  chmod 755 "$run_root/studio/resources/bin/node"
+  cat >"$run_root/bin/omarchy-pkg-drop" <<'STUB'
+#!/bin/bash
+printf 'unexpected package removal\n' >>"$STUDIO_REMOVE_PACKAGE_LOG"
+STUB
+  chmod 755 "$run_root/bin/omarchy-pkg-drop"
+
+  PATH="$run_root/bin:$PATH" \
+    STUDIO_REMOVE_TEST_PRE_READY_PID="$run_root/worker.pid" \
+    STUDIO_REMOVE_TEST_NODE_STARTED="$run_root/node-started" \
+    STUDIO_REMOVE_PACKAGE_LOG="$run_root/package.log" \
+    "$run_root/scripts/remove.sh" >"$run_root/output" 2>"$run_root/error" </dev/null &
+  controller_pid=$!
+  printf '%s\n' "$controller_pid" >"$run_root/controller.pid"
+  wait_until 'the pre-ready removal worker starts behind its closed gate' 12 test -s "$run_root/worker.pid"
+  worker_pid=$(<"$run_root/worker.pid")
+  wait_until 'the pre-ready removal controller owns its bounded direct child' 5 \
+    find_remove_outer_controller_pid "$controller_pid"
+  outer_pid=$(find_remove_outer_controller_pid "$controller_pid")
+  worker_cgroup=$(awk -F: '$1 == "0" { print $3 }' "/proc/$worker_pid/cgroup")
+  [[ $worker_cgroup == /user.slice/*/studio-remove-*.scope ]] ||
+    fail 'the pre-ready removal worker is contained before its gate can open'
+  pass 'the pre-ready removal worker is contained before its gate can open'
+  ps -o pid,ppid,pgid,sid,stat,comm -p "$controller_pid,$outer_pid,$worker_pid" \
+    >>"$ARTIFACTS/studio-remove-topology.log"
+  printf '%s %s\n' "$worker_pid" "$worker_cgroup" >>"$ARTIFACTS/studio-remove-cgroups.log"
+
+  kill -KILL "$controller_pid"
+  if wait "$controller_pid" 2>/dev/null; then
+    controller_status=0
+  else
+    controller_status=$?
+  fi
+  (( controller_status == 137 )) || fail 'the pre-ready SIGKILL records its controller death'
+  wait_until 'pre-ready controller death leaves no runnable removal worker or direct child' 15 \
+    pids_nonrunnable "$worker_pid" "$outer_pid"
+  [[ ! -e $run_root/node-started ]] || fail 'pre-ready controller death never opens the Node start gate'
+  [[ ! -e $run_root/package.log ]] || fail 'pre-ready controller death never reaches package removal'
+  pass 'pre-ready controller death remains fail-closed'
+}
+
+exercise_remove_containment() {
+  local mode=$1 run_root="$containment_root/remove-$1"
+  local controller_pid node_pid nested_pid detached_pid controller_status pid
+  local expected_cgroup='' worker_cgroup
+
+  mkdir -p "$run_root/scripts" "$run_root/studio/resources/bin" "$run_root/studio/resources/cli" "$run_root/bin"
+  sed -e "s|studio_root='/usr/lib/studio'|studio_root='$run_root/studio'|" \
+    -e 's/RuntimeMaxSec=70s/RuntimeMaxSec=8s/' \
+    -e 's/TimeoutStopSec=5s/TimeoutStopSec=1s/' \
+    -e 's/--kill-after=5s 60s/--kill-after=1s 4s/' \
+    "$FIXTURE/scripts/remove.sh" >"$run_root/scripts/remove.sh"
+  chmod 755 "$run_root/scripts/remove.sh"
+  printf '%s\n' '#!/bin/bash' 'exit 0' >"$run_root/scripts/cleanup-user-trust.sh"
+  chmod 755 "$run_root/scripts/cleanup-user-trust.sh"
+  : >"$run_root/studio/resources/cli/main.mjs"
+  cat >"$run_root/studio/resources/bin/node" <<'STUB'
+#!/bin/bash
+trap '' HUP INT TERM
+set -m
+bash -c 'trap "" HUP INT TERM; while :; do sleep 1; done' &
+nested_pid=$!
+set +m
+setsid bash -c 'trap "" HUP INT TERM; while :; do sleep 1; done' &
+detached_pid=$!
+printf '%s %s %s\n' "$$" "$nested_pid" "$detached_pid" >"$STUDIO_REMOVE_TEST_PIDS"
+while :; do sleep 1; done
+STUB
+  chmod 755 "$run_root/studio/resources/bin/node"
+  cat >"$run_root/bin/omarchy-pkg-drop" <<'STUB'
+#!/bin/bash
+printf 'unexpected package removal\n' >>"$STUDIO_REMOVE_PACKAGE_LOG"
+STUB
+  chmod 755 "$run_root/bin/omarchy-pkg-drop"
+
+  PATH="$run_root/bin:$PATH" STUDIO_REMOVE_TEST_PIDS="$run_root/pids" \
+    STUDIO_REMOVE_PACKAGE_LOG="$run_root/package.log" \
+    "$run_root/scripts/remove.sh" >"$run_root/output" 2>"$run_root/error" </dev/null &
+  controller_pid=$!
+  printf '%s\n' "$controller_pid" >"$run_root/controller.pid"
+  wait_until "the remover $mode containment worker starts" 12 test -s "$run_root/pids"
+  read -r node_pid nested_pid detached_pid <"$run_root/pids"
+  ps -o pid,ppid,pgid,sid,stat,comm -p "$controller_pid,$node_pid,$nested_pid,$detached_pid" \
+    >>"$ARTIFACTS/studio-remove-topology.log"
+  for pid in "$node_pid" "$nested_pid" "$detached_pid"; do
+    printf '%s ' "$pid" >>"$ARTIFACTS/studio-remove-cgroups.log"
+    cat "/proc/$pid/cgroup" >>"$ARTIFACTS/studio-remove-cgroups.log"
+    worker_cgroup=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
+    [[ $worker_cgroup == /user.slice/*/studio-remove-*.scope ]] ||
+      fail "the remover $mode worker is inside a Studio removal scope"
+    if [[ -z $expected_cgroup ]]; then
+      expected_cgroup=$worker_cgroup
+    else
+      [[ $worker_cgroup == "$expected_cgroup" ]] ||
+        fail "the remover $mode descendants share one verified scope"
+    fi
+  done
+  pass "the remover $mode descendants share one verified scope"
+
+  if [[ $mode == "term" ]]; then
+    kill -TERM "$controller_pid"
+  else
+    kill -KILL "$controller_pid"
+  fi
+  if wait "$controller_pid" 2>/dev/null; then
+    controller_status=0
+  else
+    controller_status=$?
+  fi
+  if [[ $mode == "term" ]]; then
+    (( controller_status == 130 )) || fail 'the TERM-cancelled remover returns its cancellation status'
+  else
+    (( controller_status == 137 )) || fail 'the SIGKILLed remover records its controller death'
+  fi
+  wait_until "the remover $mode cgroup contains no runnable test descendants" 15 \
+    pids_nonrunnable "$node_pid" "$nested_pid" "$detached_pid"
+  [[ ! -e $run_root/package.log ]] || fail "the remover $mode containment path never reaches package removal"
+  pass "the remover $mode containment path never reaches package removal"
 }
 
 verified_package_handoff_present() {
@@ -468,6 +899,15 @@ studio_updater_process_absent() {
   return 0
 }
 
+installed_package_matches_plugin_version() {
+  local installed_name installed_version extra
+
+  read -r installed_name installed_version extra < <(pacman -Q "$PACKAGE_NAME") || return 1
+  [[ $installed_name == "$PACKAGE_NAME" &&
+    $installed_version == "$PLUGIN_VERSION-"* &&
+    -z $extra ]]
+}
+
 finish_package_install_or_update() {
   local operation=$1 shot=$2
 
@@ -477,15 +917,14 @@ finish_package_install_or_update() {
   wait_until "the $operation password prompt owns the active terminal" 10 active_window_matches "$TERMINAL_CLASS"
   wtype 'omarchy'
   wtype -k Return
-  wait_until "$operation installs the expected native package" 300 pacman -Q "$PACKAGE_NAME"
+  wait_until "$operation installs the exact Studio package version" 300 \
+    installed_package_matches_plugin_version
   wait_until "$operation updater process completes" 120 studio_updater_process_absent
-  wait_until "$operation reports the exact installed Studio version" 30 \
-    screen_contains "WordPress Studio $PLUGIN_VERSION is installed"
   wait_until "$operation presents its exact successful completion screen" 30 screen_contains 'Done! Press any key'
   screenshot "$shot"
   wtype -k space
   wait_until "$operation terminal closes" 30 window_absent "$TERMINAL_CLASS"
-  pacman -Q "$PACKAGE_NAME" | awk -v version="$PLUGIN_VERSION" '$2 ~ "^" version "([.-]|$)" { found=1 } END { exit found ? 0 : 1 }' ||
+  installed_package_matches_plugin_version ||
     fail "$operation leaves the package at the plugin version"
   pass "$operation leaves the package at the plugin version"
 }
@@ -532,6 +971,26 @@ site_files_ready() {
   [[ -f $path/wp-load.php && -f $path/wp-config.php && -s $path/wp-content/database/.ht.sqlite ]]
 }
 
+removal_fixture_invariants() {
+  jq -cer --arg name "$SITE_REMOVAL_NAME" --arg path "$SITE_REMOVAL_PATH" '
+    [.sites[]? | select(.name == $name and .path == $path)]
+    | if length == 1 then .[0] else error("expected exactly one removal fixture") end
+    | {id, name, path, port, phpVersion}
+  ' "$STUDIO_CONFIG"
+}
+
+removal_fixture_is_preserved_exactly() {
+  [[ $(removal_fixture_invariants) == "$SITE_REMOVAL_RECORD_INVARIANTS" ]] &&
+    [[ $(sha256sum "$SITE_REMOVAL_PATH/.omarchy-removal-preservation") == "$SITE_REMOVAL_SENTINEL_HASH" ]] &&
+    [[ $(sha256sum "$SITE_REMOVAL_PATH/wp-load.php") == "$SITE_REMOVAL_WP_LOAD_HASH" ]] &&
+    [[ $(sha256sum "$SITE_REMOVAL_PATH/wp-config.php") == "$SITE_REMOVAL_WP_CONFIG_HASH" ]] &&
+    [[ $(sha256sum "$SITE_REMOVAL_PATH/wp-content/database/.ht.sqlite") == "$SITE_REMOVAL_DATABASE_HASH" ]]
+}
+
+plugin_status_is_missing() {
+  [[ $("$PLUGIN_DIR/scripts/status.sh") == "missing" ]]
+}
+
 site_cli_state() {
   local path=$1 expected=$2 status
 
@@ -567,11 +1026,17 @@ site_http_offline() {
 }
 
 site_record_absent() {
-  local name=$1 expected_path=$2
+  local name=$1 expected_path=$2 expected_id=${3:-}
 
   [[ ! -e $STUDIO_CONFIG ]] ||
-    jq -e --arg name "$name" --arg path "$expected_path" \
-      'all(.sites[]?; .name != $name and .path != $path)' "$STUDIO_CONFIG" >/dev/null
+    jq -e --arg name "$name" --arg path "$expected_path" --arg id "$expected_id" \
+      'all(.sites[]?; .name != $name and .path != $path and ($id == "" or .id != $id))' \
+      "$STUDIO_CONFIG" >/dev/null
+}
+
+studio_config_has_no_sites() {
+  [[ ! -e $STUDIO_CONFIG ]] ||
+    jq -e '(.sites // []) | length == 0' "$STUDIO_CONFIG" >/dev/null
 }
 
 same_version_update_log_is_idempotent() {
@@ -672,11 +1137,13 @@ cleanup() {
   if (( exit_status != 0 )); then
     collect_diagnostics
   fi
-  close_windows "$BROWSER_CLASS" || true
+  close_browser_windows || true
   close_windows "$STUDIO_CLASS" || true
   close_windows "$TERMINAL_CLASS" || true
-  for path in "$SITE_ONE_PATH" "$SITE_TWO_PATH"; do
-    if [[ $path == "$HOME/Studio/omarchy-acceptance-one" || $path == "$HOME/Studio/omarchy-acceptance-two" ]]; then
+  for path in "$SITE_ONE_PATH" "$SITE_TWO_PATH" "$SITE_REMOVAL_PATH"; do
+    if [[ $path == "$HOME/Studio/omarchy-acceptance-one" ||
+      $path == "$HOME/Studio/omarchy-acceptance-two" ||
+      $path == "$HOME/Studio/omarchy-removal-preserve" ]]; then
       if [[ -x $BUNDLED_NODE && -f $BUNDLED_CLI ]]; then
         "$BUNDLED_NODE" --experimental-wasm-jspi "$BUNDLED_CLI" site delete --path "$path" --avoid-telemetry >/dev/null 2>&1 || true
       fi
@@ -728,6 +1195,10 @@ pass 'WordPress Studio passes the host validator'
 
 exercise_status_containment term
 exercise_status_containment sigkill
+exercise_status_pre_ready_containment
+exercise_remove_pre_ready_containment
+exercise_remove_containment term
+exercise_remove_containment sigkill
 
 mkdir -p "$(dirname "$PLUGIN_DIR")"
 cp -a "$FIXTURE" "$PLUGIN_DIR"
@@ -754,6 +1225,15 @@ wait_until 'the installed Studio panel opens' 20 layer_on_screen omarchy-keyboar
 wait_until 'the plugin reports its installed version' 30 screen_contains "Installed $PLUGIN_VERSION"
 wait_until 'the installed panel exposes Native Wayland' 20 screen_contains 'Native Wayland'
 screenshot 'success-studio-03-installed-panel'
+wtype -k Escape
+wait_until 'Escape closes the installed Studio panel' 20 layer_absent omarchy-keyboard-panel
+park_pointer
+wait_until 'the escaped Studio panel clears visually' 20 screen_absent 'Launch Studio'
+wait_until 'the escaped Studio bar tooltip clears visually' 20 screen_absent 'WordPress Studio'
+screenshot 'success-studio-03a-escape-closed'
+click_bar_widget
+wait_until 'the installed Studio panel reopens after Escape' 20 layer_on_screen omarchy-keyboard-panel
+wait_until 'the reopened Studio panel reports its version' 20 screen_contains "Installed $PLUGIN_VERSION"
 [[ -x /usr/bin/studio-omarchy-cleanup-user-trust &&
   ! -L /usr/bin/studio-omarchy-cleanup-user-trust &&
   $(stat -c %a /usr/bin/studio-omarchy-cleanup-user-trust) == "755" ]] ||
@@ -783,6 +1263,8 @@ omarchy-shell shell hide "$PLUGIN_ID" >/dev/null
 wait_until 'the Studio panel hides through shell IPC' 20 layer_absent omarchy-keyboard-panel
 omarchy plugin disable "$PLUGIN_ID" >/dev/null
 wait_until 'disabling Studio removes its bar widget' 20 bar_widget_absent
+park_pointer
+screenshot 'success-studio-04b-disabled-widget-absent'
 omarchy plugin enable "$PLUGIN_ID" >/dev/null
 wait_until 're-enabling Studio restores its bar widget' 20 bar_widget_present
 omarchy-restart-shell
@@ -848,39 +1330,49 @@ wait_until 'the first site exposes the WordPress REST API' 120 site_rest_ready "
 wait_until 'the first site serves visible HTML' 120 site_frontend_ready "$SITE_ONE_PORT"
 screenshot 'success-studio-07-first-site-running'
 
-click_active_phrase 'Settings' '20 0 100 35' 'the site Settings tab is clicked'
+click_active_relative_control 35 14 'the site Settings tab is clicked'
 wait_until 'the Settings tab renders PHP version controls' 20 screen_contains 'PHP version'
 screenshot 'success-studio-08-settings-tab'
-click_active_phrase 'Debugging' '20 0 100 35' 'the site Debugging tab is clicked'
+click_active_relative_control 41 14 'the site Debugging tab is clicked'
 wait_until 'the Debugging tab renders Xdebug controls' 20 screen_contains 'Xdebug'
 screenshot 'success-studio-09-debugging-tab'
-click_active_phrase 'Overview' '20 0 100 35' 'the site Overview tab is clicked'
-wait_until 'the Overview tab renders About' 20 screen_contains 'About'
+click_active_relative_control 29 14 'the site Overview tab is clicked'
+wait_until 'the Overview tab renders Customize controls' 20 screen_contains 'Customize'
 
-click_active_tooltip 'Show preview' 96 98 45 'the in-app Show preview control is clicked with the pointer'
+click_active_relative_control 55 95 'the initially visible in-app preview is hidden with the pointer'
+wait_until 'the initial in-app preview pane is hidden' 20 \
+  active_region_absent 'Hello world' '55 12 100 90'
+pass 'the in-app preview begins its explicit toggle sequence hidden'
+click_active_relative_control 97 95 'the in-app Show preview control is clicked with the pointer'
 wait_until 'the in-app preview renders the site in its right pane' 60 active_region_contains "$SITE_ONE_NAME" '55 12 100 95'
 screenshot 'success-studio-10-preview-shown'
-click_active_tooltip 'Refresh' 7 45 95 'the in-app preview Refresh control is clicked with the pointer'
+click_active_relative_control 60 7 'the in-app preview Refresh control is clicked with the pointer'
 wait_until 'the refreshed preview keeps the site serving' 30 site_frontend_ready "$SITE_ONE_PORT"
-click_active_tooltip 'Hide preview' 96 80 25 'the in-app Hide preview control is clicked with the pointer'
-read -r _ _ < <(hover_active_tooltip 'Show preview' 96 98 45 'the preview toggle returns to Show preview after hiding')
-pass 'the in-app preview returns to its hidden state'
+click_active_relative_control 55 95 'the in-app Hide preview control is clicked with the pointer'
+wait_until 'the in-app preview returns to its hidden state' 20 \
+  active_region_absent 'Hello world' '55 12 100 90'
 screenshot 'success-studio-11-preview-hidden'
 
-hover_theme_thumbnail_and_open
-wait_until 'Open site launches the external browser' 60 window_present "$BROWSER_CLASS"
+click_active_phrase 'Open site' '25 10 60 75' 'the external Open site control is clicked with the pointer'
+wait_until 'Open site launches the external browser' 60 browser_window_present
+dismiss_chromium_terms_if_needed "$SITE_ONE_NAME"
 wait_until 'the native Wayland browser is active with the first site in its title' 60 active_native_browser_for_site "$SITE_ONE_NAME"
 site_frontend_ready "$SITE_ONE_PORT" || fail 'the externally opened site remains reachable'
 pass 'the externally opened site remains reachable'
 screenshot 'success-studio-12-external-site'
-close_windows "$BROWSER_CLASS"
-wait_until 'the external browser closes' 30 window_absent "$BROWSER_CLASS"
-hyprctl dispatch focuswindow "class:$STUDIO_CLASS" >/dev/null
+close_browser_windows
+wait_until 'the external browser closes' 30 browser_window_absent
 wait_until 'focus returns to Studio' 20 active_window_matches "$STUDIO_CLASS"
 
-click_active_tooltip 'Add site' 3 27 15 'the sidebar Add site icon button is clicked through its visible tooltip'
+click_active_relative_control 17 3 'the sidebar Add site icon button is clicked with the pointer'
 wait_until 'the second Add a site screen appears' 20 screen_contains 'Create a new site'
 create_site_with_pointer "$SITE_TWO_NAME" 'second' "$HOME/Studio/omarchy-acceptance-two"
+wait_until 'the second site creation leaves its progress form' 120 screen_absent 'Creating site'
+wait_until 'the second site workbench renders' 60 screen_contains 'Overview'
+wait_until 'the first site name renders in the sidebar' 30 \
+  active_region_contains "$SITE_ONE_NAME" '0 0 28 100'
+wait_until 'the second site name renders in the sidebar' 30 \
+  active_region_contains "$SITE_TWO_NAME" '0 0 28 100'
 load_site_record "$SITE_TWO_NAME" "$HOME/Studio/omarchy-acceptance-two" SITE_TWO
 [[ $SITE_TWO_PATH == "$HOME/Studio/omarchy-acceptance-two" ]] || fail 'the second site uses its isolated default path'
 [[ $SITE_ONE_ID != "$SITE_TWO_ID" && $SITE_ONE_PATH != "$SITE_TWO_PATH" && $SITE_ONE_PORT != "$SITE_TWO_PORT" ]] ||
@@ -893,76 +1385,157 @@ wait_until 'both sites serve concurrently on distinct ports' 60 bash -c \
   "curl --noproxy '*' -fsSL --max-time 8 'http://localhost:$SITE_ONE_PORT/wp-json/' | jq -e '(.namespaces | index(\"wp/v2\")) != null' >/dev/null && curl --noproxy '*' -fsSL --max-time 8 'http://localhost:$SITE_TWO_PORT/wp-json/' | jq -e '(.namespaces | index(\"wp/v2\")) != null' >/dev/null"
 screenshot 'success-studio-13-two-sites-running'
 
-click_active_phrase "$SITE_ONE_NAME" '0 0 28 100' 'the first sidebar site is selected with the pointer'
+click_active_site_row 0 'the first sidebar site is selected with the pointer'
 wait_until 'the first sidebar selection binds the main workbench to site one' 20 active_region_contains "$SITE_ONE_NAME" '28 0 100 35'
 wait_until 'the first sidebar selection remains online' 20 site_cli_state "$SITE_ONE_PATH" true
 screenshot 'success-studio-13a-first-site-selected'
-click_active_phrase "$SITE_TWO_NAME" '0 0 28 100' 'the second sidebar site is selected with the pointer'
+click_active_site_row 1 'the second sidebar site is selected with the pointer'
 wait_until 'the second sidebar selection binds the main workbench to site two' 20 active_region_contains "$SITE_TWO_NAME" '28 0 100 35'
 wait_until 'the second sidebar selection remains online' 20 site_cli_state "$SITE_TWO_PATH" true
 screenshot 'success-studio-13b-second-site-selected'
 
-right_click_active_phrase "$SITE_TWO_NAME" '0 0 28 100' 'the second site context menu is opened with the pointer'
-wait_until 'the running site menu exposes Stop site' 15 screen_contains 'Stop site'
+click_active_site_row 1 'the second site context menu is opened with the pointer' right
+wait_until 'the running site menu exposes Stop site' 15 \
+  active_region_contains 'Stop site' '0 0 35 100'
 click_active_phrase 'Stop site' '0 0 35 100' 'Stop site is clicked with the pointer'
 wait_until 'the bundled CLI reports the second site stopped' 120 site_cli_state "$SITE_TWO_PATH" false
 wait_until 'the stopped second site refuses HTTP' 30 site_http_offline "$SITE_TWO_PORT"
 wait_until 'stopping site two leaves site one online in the bundled CLI' 30 site_cli_state "$SITE_ONE_PATH" true
 wait_until 'stopping site two leaves site one REST available' 30 site_rest_ready "$SITE_ONE_PORT"
 wait_until 'stopping site two leaves site one frontend available' 30 site_frontend_ready "$SITE_ONE_PORT"
-screenshot 'success-studio-14-site-stopped'
-right_click_active_phrase "$SITE_TWO_NAME" '0 0 28 100' 'the stopped site context menu is opened with the pointer'
-wait_until 'the stopped site menu exposes Start site' 15 screen_contains 'Start site'
+click_active_site_row 1 'the stopped site context menu is opened with the pointer' right
+wait_until 'the stopped site menu exposes Start site' 15 \
+  active_region_contains 'Start site' '0 0 35 100'
+screenshot 'success-studio-14-site-stopped-menu'
 click_active_phrase 'Start site' '0 0 35 100' 'Start site is clicked with the pointer'
 wait_until 'the bundled CLI reports the second site restarted' 120 site_cli_state "$SITE_TWO_PATH" true
 wait_until 'the restarted second site restores REST' 120 site_rest_ready "$SITE_TWO_PORT"
 wait_until 'both sites serve concurrently after restarting site two' 60 bash -c \
   "curl --noproxy '*' -fsSL --max-time 8 'http://localhost:$SITE_ONE_PORT/wp-json/' | jq -e '(.namespaces | index(\"wp/v2\")) != null' >/dev/null && curl --noproxy '*' -fsSL --max-time 8 'http://localhost:$SITE_TWO_PORT/wp-json/' | jq -e '(.namespaces | index(\"wp/v2\")) != null' >/dev/null"
-screenshot 'success-studio-15-site-restarted'
-
-right_click_active_phrase "$SITE_TWO_NAME" '0 0 28 100' 'the second site menu opens for WP admin'
-wait_until 'the site menu exposes Open WP admin' 15 screen_contains 'Open WP admin'
+wait_until 'the restarted site leaves its stopped UI state' 60 \
+  active_region_absent 'Start site' '28 0 100 100'
+wait_until 'the restarted site restores its live preview' 60 \
+  active_region_contains 'Hello world!' '28 0 100 100'
+screenshot 'success-studio-14a-site-restarted-workbench'
+click_active_site_row 1 'the second site menu opens for WP admin' right
+wait_until 'the restarted site menu returns to Stop site' 15 \
+  active_region_contains 'Stop site' '0 0 35 100'
+wait_until 'the site menu exposes Open WP admin' 15 \
+  active_region_contains 'Open WP admin' '0 0 35 100'
+screenshot 'success-studio-15-site-restarted-menu'
 click_active_phrase 'Open WP admin' '0 0 35 100' 'Open WP admin is clicked with the pointer'
-wait_until 'WP admin opens in the external browser' 60 window_present "$BROWSER_CLASS"
+wait_until 'WP admin opens in the external browser' 60 browser_window_present
+dismiss_chromium_terms_if_needed "$SITE_TWO_NAME"
 wait_until 'the native Wayland browser is active with site two in its admin title' 60 active_native_browser_for_site "$SITE_TWO_NAME"
 wait_until 'the external WP admin renders Dashboard' 90 screen_contains 'Dashboard'
 screenshot 'success-studio-16-wp-admin'
-close_windows "$BROWSER_CLASS"
-wait_until 'the WP admin browser closes' 30 window_absent "$BROWSER_CLASS"
-hyprctl dispatch focuswindow "class:$STUDIO_CLASS" >/dev/null
+close_browser_windows
+wait_until 'the WP admin browser closes' 30 browser_window_absent
 wait_until 'focus returns to Studio after WP admin' 20 active_window_matches "$STUDIO_CLASS"
 
 for site_name in "$SITE_TWO_NAME" "$SITE_ONE_NAME"; do
   if [[ $site_name == "$SITE_TWO_NAME" ]]; then
+    site_id=$SITE_TWO_ID
     site_path=$SITE_TWO_PATH
+    site_port=$SITE_TWO_PORT
+    site_row=1
   else
+    site_id=$SITE_ONE_ID
     site_path=$SITE_ONE_PATH
-    click_active_phrase "$SITE_ONE_NAME" '0 0 28 100' 'the first site is selected for deletion'
+    site_port=$SITE_ONE_PORT
+    site_row=0
+    click_active_site_row "$site_row" 'the first site is selected for deletion'
   fi
-  right_click_active_phrase "$site_name" '0 0 28 100' "the $site_name menu is opened for deletion"
-  wait_until "the $site_name menu exposes Delete site" 15 screen_contains 'Delete site'
-  click_active_phrase 'Delete site' '0 0 35 100' "the $site_name Delete site menu action is clicked"
+  click_active_site_row "$site_row" "the $site_name menu is opened for deletion" right false
+  click_active_site_delete_action "$site_row" "the $site_name Delete site menu action is clicked"
   wait_until "the Delete $site_name confirmation appears" 20 screen_contains "Delete $site_name"
-  wait_until "the $site_name file-deletion checkbox label is visible and left at its default" 10 screen_contains 'Delete site files from my computer'
   screenshot "ready-delete-${site_name// /-}"
-  click_active_phrase 'Delete site' '60 45 100 75' "the $site_name deletion is confirmed with the pointer"
-  wait_until "$site_name leaves Studio config" 30 site_record_absent "$site_name" "$site_path"
+  # The fixed 560px confirmation dialog centers its destructive button 212px
+  # right and 56px below the active window center. Its red label is otherwise
+  # a recurring Tesseract false negative despite being plainly rendered.
+  click_active_centered_control 212 56 "the $site_name deletion is confirmed with the pointer"
+  wait_until "$site_name leaves Studio config" 30 site_record_absent "$site_name" "$site_path" "$site_id"
   wait_until "$site_name files are deleted" 30 test ! -e "$site_path"
+  wait_until "$site_name stops serving after deletion" 30 site_http_offline "$site_port"
+  wait_until "the Delete $site_name confirmation closes" 30 screen_absent "Delete $site_name"
 done
+wait_until 'Studio config contains no sites after both deletions' 30 studio_config_has_no_sites
+wait_until 'the first deleted site leaves the visible sidebar' 30 \
+  active_region_absent "$SITE_ONE_NAME" '0 0 28 100'
+wait_until 'the second deleted site leaves the visible sidebar' 30 \
+  active_region_absent "$SITE_TWO_NAME" '0 0 28 100'
 screenshot 'success-studio-17-sites-deleted'
 
-close_windows "$STUDIO_CLASS"
-wait_until 'WordPress Studio closes cleanly' 30 window_absent "$STUDIO_CLASS"
-"$BUNDLED_NODE" --experimental-wasm-jspi "$BUNDLED_CLI" site stop --all --avoid-telemetry >/dev/null
-wait_until 'all bundled Studio daemon and server processes stop before removal' 60 studio_processes_absent
-click_bar_widget
+# Create one final disposable site to prove package removal stops background
+# serving while preserving the site's registry record and files.
+create_site_with_pointer "$SITE_REMOVAL_NAME" 'removal-fixture' "$HOME/Studio/omarchy-removal-preserve"
+wait_until 'the removal-fixture site creation leaves its progress form' 120 screen_absent 'Creating site'
+wait_until 'the removal-fixture site workbench renders' 60 screen_contains 'Overview'
+load_site_record "$SITE_REMOVAL_NAME" "$HOME/Studio/omarchy-removal-preserve" SITE_REMOVAL
+wait_until 'the removal-fixture site writes WordPress and SQLite files' 120 site_files_ready "$SITE_REMOVAL_PATH"
+wait_until 'the removal-fixture site reports online through the bundled CLI' 120 \
+  site_cli_state "$SITE_REMOVAL_PATH" true
+wait_until 'the removal-fixture site exposes the WordPress REST API' 120 site_rest_ready "$SITE_REMOVAL_PORT"
+screenshot 'success-studio-18-removal-site-running'
+
+# Removal must fail closed while Studio is open so the app retains control of
+# active Sync confirmation/cancellation. Exercise the actual Quattro action,
+# dismiss its bounded failure presentation, then quit Studio normally.
+guarded_package=$(pacman -Q "$PACKAGE_NAME")
+guarded_studio_hash=$(sha256sum /usr/lib/studio/studio)
+click_bar_widget false
+wait_until 'the guarded Studio removal panel opens' 20 layer_on_screen omarchy-keyboard-panel
+click_quattro_remove_control 'the guarded Remove Studio action is clicked with the pointer'
+wait_until 'the guarded removal terminal opens' 30 window_present "$TERMINAL_CLASS"
+wait_until 'the guarded removal terminal owns focus' 30 active_window_matches "$TERMINAL_CLASS"
+wait_until 'the guarded remover exits after refusing an open Studio app' 30 studio_remover_process_absent
+[[ $(pacman -Q "$PACKAGE_NAME") == "$guarded_package" &&
+  $(sha256sum /usr/lib/studio/studio) == "$guarded_studio_hash" ]] ||
+  fail 'guarded removal preserves the exact installed Studio package'
+pass 'guarded removal preserves the installed Studio package'
+pgrep -u "$(id -u)" -f '^/usr/lib/studio/studio( |$)' >/dev/null ||
+  fail 'guarded removal leaves Studio running for its normal quit flow'
+pass 'guarded removal leaves Studio running for its normal quit flow'
+site_rest_ready "$SITE_REMOVAL_PORT" || fail 'guarded removal leaves the preservation site online'
+pass 'guarded removal leaves the preservation site online'
+screenshot 'success-studio-19-open-app-removal-guard'
+wtype -k space
+wait_until 'the guarded removal terminal closes' 30 window_absent "$TERMINAL_CLASS"
+wait_until 'focus returns to Studio after guarded removal' 20 active_window_matches "$STUDIO_CLASS"
+click_active_relative_control 2 2 'the Studio application menu is opened with the pointer'
+wait_until 'the Studio application submenu is visible' 20 screen_contains 'Studio'
+click_screen_phrase 'Studio' '0 0 20 20' 'the Studio application submenu is opened with the pointer'
+wait_until 'the Studio application submenu exposes Quit' 20 screen_contains 'Quit'
+click_screen_phrase 'Quit' '0 0 55 100' 'the Studio Quit action is clicked with the pointer'
+# Electron keeps this native modal inside the existing Studio window, so its
+# compositor identity does not change. Give it one render tick, capture it for
+# mandatory visual review, and let the close-plus-site-serving invariants below
+# prove that the intended native action was reached and accepted.
+sleep 1
+screenshot 'success-studio-20-native-quit-dialog'
+click_active_centered_control 0 68 \
+  'the running removal fixture is kept online through the native quit dialog'
+wait_until 'the WordPress Studio window closes normally' 30 window_absent "$STUDIO_CLASS"
+pgrep -u "$(id -u)" -f '^/usr/lib/studio/studio( |$)' >/dev/null ||
+  fail 'keeping the removal fixture online retains Studio background supervision'
+pass 'keeping the removal fixture online retains Studio background supervision'
+wait_until 'the preserved removal-fixture site remains online after Studio quits' 30 \
+  site_rest_ready "$SITE_REMOVAL_PORT"
+
+printf '%s\n' 'Omarchy removal preservation sentinel v1' >"$SITE_REMOVAL_PATH/.omarchy-removal-preservation"
+SITE_REMOVAL_RECORD_INVARIANTS=$(removal_fixture_invariants)
+SITE_REMOVAL_SENTINEL_HASH=$(sha256sum "$SITE_REMOVAL_PATH/.omarchy-removal-preservation")
+SITE_REMOVAL_WP_LOAD_HASH=$(sha256sum "$SITE_REMOVAL_PATH/wp-load.php")
+SITE_REMOVAL_WP_CONFIG_HASH=$(sha256sum "$SITE_REMOVAL_PATH/wp-config.php")
+SITE_REMOVAL_DATABASE_HASH=$(sha256sum "$SITE_REMOVAL_PATH/wp-content/database/.ht.sqlite")
+
+click_bar_widget false
 wait_until 'the Studio removal panel opens' 20 layer_on_screen omarchy-keyboard-panel
-wait_until 'the Studio removal action is visible' 20 screen_contains 'Remove Studio'
-click_screen_phrase 'Remove Studio' '70 0 100 40' 'the Remove Studio button is clicked with the pointer'
+click_quattro_remove_control 'the Remove Studio button is clicked with the pointer'
 wait_until 'the visible Studio removal terminal opens' 30 window_present "$TERMINAL_CLASS"
-wait_until 'the removal password prompt owns the active terminal' 30 active_window_matches "$TERMINAL_CLASS"
-wait_until 'the remover completes current-user browser trust cleanup before package removal' 60 \
-  browser_cleanup_success_visible
+wait_until 'the removal terminal owns focus' 30 active_window_matches "$TERMINAL_CLASS"
+wait_until 'the remover completes browser trust cleanup and reaches the package transaction' 60 \
+  pgrep -f '[s]udo pacman -Rns --noconfirm wordpress-studio-omarchy'
 remove_deadline=$((SECONDS + 180))
 remove_password_sent=false
 until ! pacman -Q "$PACKAGE_NAME" >/dev/null 2>&1; do
@@ -975,19 +1548,23 @@ until ! pacman -Q "$PACKAGE_NAME" >/dev/null 2>&1; do
   sleep 1
 done
 pass 'the native Studio package removes cleanly'
+wait_until 'package removal stops the preserved background site' 30 site_http_offline "$SITE_REMOVAL_PORT"
+removal_fixture_is_preserved_exactly || fail 'package removal preserves the exact removal-fixture record and files'
+pass 'package removal preserves the exact removal-fixture record and files'
 wait_until 'the remover presents its completion screen' 60 screen_contains 'Done! Press any key'
-screenshot 'success-studio-18-removed-terminal'
+screenshot 'success-studio-20-removed-terminal'
 wtype -k space
 wait_until 'the removal terminal closes' 30 window_absent "$TERMINAL_CLASS"
+wait_until 'the remover terminates every Studio process' 30 studio_processes_absent
 wait_until 'the Studio executable is removed' 30 test ! -e /usr/bin/studio
 [[ ! -e /usr/bin/studio-omarchy-cleanup-user-trust ]] ||
   fail 'the standalone browser trust cleanup helper is removed with the package'
 [[ ! -e /etc/ca-certificates/trust-source/anchors/studio-ca.crt ]] || fail 'the Studio trust anchor is removed with the package'
 pass 'the Studio trust anchor is removed with the package'
 
-click_bar_widget
-wait_until 'the plugin returns to Not installed' 30 screen_contains 'Not installed'
-screenshot 'success-studio-19-removed-panel'
+click_bar_widget false
+wait_until 'the Studio panel reports the package missing' 30 plugin_status_is_missing
+screenshot 'success-studio-21-package-not-installed-panel'
 omarchy-shell shell hide "$PLUGIN_ID" >/dev/null
 wait_until 'the final Studio panel hides' 20 layer_absent omarchy-keyboard-panel
 omarchy plugin disable "$PLUGIN_ID" >/dev/null
@@ -995,5 +1572,9 @@ wait_until 'WordPress Studio is disabled after cleanup' 15 bar_widget_absent
 omarchy plugin remove "$PLUGIN_ID" --yes >/dev/null
 wait_until 'WordPress Studio plugin is removed from disk' 15 test ! -e "$PLUGIN_DIR"
 wait_until 'WordPress Studio plugin leaves the registry' 15 plugin_absent
+removal_fixture_is_preserved_exactly || fail 'plugin removal preserves the exact removal-fixture record and files'
+pass 'plugin removal preserves the exact removal-fixture record and files'
+park_pointer
+screenshot 'success-studio-22-plugin-removed-widget-absent'
 
 pass 'WordPress Studio pointer-driven guest acceptance passed'
