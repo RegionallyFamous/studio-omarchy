@@ -1,8 +1,8 @@
 diff --git a/apps/cli/lib/certificate-manager.ts b/apps/cli/lib/certificate-manager.ts
-index 3f351ce9..bde93dc8 100644
+index 3f351ce9f..d50f1b600 100644
 --- a/apps/cli/lib/certificate-manager.ts
 +++ b/apps/cli/lib/certificate-manager.ts
-@@ -7,9 +7,11 @@ import { promisify } from 'node:util';
+@@ -7,9 +7,12 @@ import { promisify } from 'node:util';
  import { CERT_UNTRUSTED_ROOT, SERVER_AUTH_OID } from '@studio/common/constants';
  import {
  	buildLinuxTrustInstallCommand,
@@ -10,17 +10,39 @@ index 3f351ce9..bde93dc8 100644
  	importCAIntoUserNssDbsLinux,
  	isCAImportedInUserNssDbsLinux,
  	isCATrustedOnLinux,
++	isLinuxTrustAnchorCurrent,
 +	readLinuxTrustCertificate,
  } from '@studio/common/lib/linux-trust-store';
  import { getCertificatesPath } from '@studio/common/lib/well-known-paths';
  import sudo from '@vscode/sudo-prompt';
-@@ -230,10 +232,12 @@ export async function trustRootCA(): Promise< void > {
+@@ -184,11 +187,15 @@ export async function isRootCATrusted(): Promise< boolean > {
+ 			return false;
+ 		}
+ 	} else if ( process.platform === 'linux' ) {
++		const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
++		const { trustStorePath } = getLinuxTrustStoreConfig();
+ 		// The CA is fully trusted on Linux only when it lives in both the system
+ 		// bundle (covers curl/openssl/Node) AND every NSS DB candidate (covers
+ 		// Chromium-family browsers, including Snap-Chromium's sandboxed DB).
+ 		return (
+-			( await isCATrustedOnLinux( CA_CERT_PATH ) ) && ( await isCAImportedInUserNssDbsLinux() )
++			isLinuxTrustAnchorCurrent( certificate, trustStorePath ) &&
++			( await isCATrustedOnLinux( trustStorePath ) ) &&
++			( await isCAImportedInUserNssDbsLinux() )
+ 		);
+ 	}
+ 
+@@ -230,10 +237,15 @@ export async function trustRootCA(): Promise< void > {
  			// otherwise we'd reprompt for the polkit password just to re-sync NSS
  			// (the common case when a Chromium-family browser is installed after
  			// the initial trust flow).
+-			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
 +			const { trustStorePath } = getLinuxTrustStoreConfig();
- 			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
-+				const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
++			const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
++			if (
++				! isLinuxTrustAnchorCurrent( certificate, trustStorePath ) ||
++				! ( await isCATrustedOnLinux( trustStorePath ) )
++			) {
  				await new Promise< void >( ( resolve, reject ) => {
  					sudo.exec(
 -						buildLinuxTrustInstallCommand( CA_CERT_PATH ),
@@ -28,8 +50,13 @@ index 3f351ce9..bde93dc8 100644
  						{ name: 'WordPress Studio' },
  						( error ) => {
  							if ( error ) {
-@@ -249,7 +253,7 @@ export async function trustRootCA(): Promise< void > {
+@@ -247,9 +259,12 @@ export async function trustRootCA(): Promise< void > {
+ 					);
+ 				} );
  			}
++			if ( ! isLinuxTrustAnchorCurrent( certificate, trustStorePath ) ) {
++				throw new Error( 'The installed Linux trust anchor does not match the current Studio CA' );
++			}
  			// Always run NSS imports — they're idempotent (-D before -A) and don't
  			// need sudo, so re-running covers the install-browser-after-trust case.
 -			await importCAIntoUserNssDbsLinux( CA_CERT_PATH );
@@ -38,7 +65,7 @@ index 3f351ce9..bde93dc8 100644
  			console.error( 'Unsupported platform for automatic certificate trust:', platform );
  		}
 diff --git a/apps/cli/lib/hosts-file.ts b/apps/cli/lib/hosts-file.ts
-index a12908c6..4b2f1da1 100644
+index a12908c67..081729826 100644
 --- a/apps/cli/lib/hosts-file.ts
 +++ b/apps/cli/lib/hosts-file.ts
 @@ -1,13 +1,16 @@
@@ -60,7 +87,7 @@ index a12908c6..4b2f1da1 100644
  
  // Host file paths for different operating systems
  const HOST_FILES: Record< string, string > = {
-@@ -45,15 +48,45 @@ export const readHostsFile = async (): Promise< string > => {
+@@ -45,15 +48,52 @@ export const readHostsFile = async (): Promise< string > => {
  /**
   * Writes content to the hosts file (requires elevated permissions)
   */
@@ -97,7 +124,14 @@ index a12908c6..4b2f1da1 100644
 +			const currentHash = createHash( 'sha256' ).update( currentContent, 'utf8' ).digest( 'hex' );
 +
 +			if ( currentPlatform === 'linux' ) {
-+				command = createLinuxWriteCommand( encodedContent, payloadHash, currentHash, hostsPath );
++				const metadata = await getLinuxHostsMetadata( hostsPath );
++				command = createLinuxWriteCommand(
++					encodedContent,
++					payloadHash,
++					currentHash,
++					metadata,
++					hostsPath
++				);
 +			} else {
 +				const script = createDarwinWriteScript(
 +					encodedContent,
@@ -113,36 +147,86 @@ index a12908c6..4b2f1da1 100644
  		await sudoExec( command, {
  			name: 'WordPress Studio',
  		} );
-@@ -63,6 +96,71 @@ export const writeHostsFile = async ( content: string ): Promise< void > => {
+@@ -63,6 +103,121 @@ export const writeHostsFile = async ( content: string ): Promise< void > => {
  	}
  };
  
++interface LinuxHostsMetadata {
++	fullHash: string;
++	identityHash: string;
++}
++
++async function getLinuxHostsMetadata( hostsPath: string ): Promise< LinuxHostsMetadata > {
++	const hostsStat = await fs.promises.lstat( hostsPath, { bigint: true } );
++	if (
++		! hostsStat.isFile() ||
++		hostsStat.isSymbolicLink() ||
++		hostsStat.uid !== BigInt( 0 ) ||
++		hostsStat.nlink !== BigInt( 1 )
++	) {
++		throw new Error( 'The Linux hosts target must be a root-owned, single-link regular file' );
++	}
++	const mtimeSeconds = hostsStat.mtimeNs / BigInt( 1_000_000_000 );
++	const ctimeSeconds = hostsStat.ctimeNs / BigInt( 1_000_000_000 );
++	const mode = hostsStat.mode.toString( 16 );
++	const identity = `${ hostsStat.dev }:${ hostsStat.ino }:${ hostsStat.uid }:${ hostsStat.gid }:${ mode }:${ hostsStat.size }:${ mtimeSeconds }\n`;
++	const full = `${ hostsStat.dev }:${ hostsStat.ino }:${ hostsStat.uid }:${ hostsStat.gid }:${ mode }:${ hostsStat.nlink }:${ hostsStat.size }:${ mtimeSeconds }:${ ctimeSeconds }\n`;
++	return {
++		fullHash: createHash( 'sha256' ).update( full ).digest( 'hex' ),
++		identityHash: createHash( 'sha256' ).update( identity ).digest( 'hex' ),
++	};
++}
++
 +function createLinuxWriteCommand(
 +	encodedContent: string,
 +	payloadHash: string,
 +	currentHash: string,
++	metadata: LinuxHostsMetadata,
 +	hostsPath: string
 +): string {
-+	const stagingPath = path.join(
++	const nonce = randomBytes( 16 ).toString( 'hex' );
++	const stagingPath = path.join( path.dirname( hostsPath ), `.wp-studio-hosts-${ nonce }` );
++	const identityPath = path.join(
 +		path.dirname( hostsPath ),
-+		`.wp-studio-hosts-${ randomBytes( 16 ).toString( 'hex' ) }`
++		`.wp-studio-hosts-${ nonce }.identity`
 +	);
++	const metadataPath = path.join(
++		path.dirname( hostsPath ),
++		`.wp-studio-hosts-${ nonce }.metadata`
++	);
++	const verifyMetadata = ( format: string, expectedHash: string ) =>
++		`/usr/bin/stat --format='${ format }' -- '${ hostsPath }' > '${ metadataPath }' && ` +
++		`/usr/bin/printf '%s  %s\\n' '${ expectedHash }' '${ metadataPath }' | /usr/bin/sha256sum --check --strict --status -`;
 +	return [
 +		'set -euo pipefail',
 +		'umask 077',
 +		'set -C',
 +		`: > '${ stagingPath }'`,
++		`: > '${ metadataPath }'`,
 +		'set +C',
-+		`trap '/bin/rm -f -- ${ stagingPath }' EXIT`,
++		`trap '/bin/rm -f -- ${ stagingPath } ${ identityPath } ${ metadataPath }' EXIT`,
 +		`exec 9>'${ LINUX_HOSTS_WRITE_LOCK }'`,
 +		'/usr/bin/flock -x 9',
++		`[ -f '${ hostsPath }' ] && [ ! -L '${ hostsPath }' ]`,
++		verifyMetadata( '%d:%i:%u:%g:%f:%h:%s:%Y:%Z', metadata.fullHash ),
 +		`/usr/bin/printf '%s  %s\\n' '${ currentHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/ln -- '${ hostsPath }' '${ identityPath }'`,
++		`/usr/bin/test '${ hostsPath }' -ef '${ identityPath }'`,
++		verifyMetadata( '%d:%i:%u:%g:%f:%s:%Y', metadata.identityHash ),
++		`/usr/bin/stat --format='%h' -- '${ hostsPath }' | /usr/bin/grep --quiet --fixed-strings --line-regexp '2'`,
 +		`/usr/bin/printf '%s' '${ encodedContent }' | /usr/bin/base64 --decode > '${ stagingPath }'`,
 +		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ stagingPath }' | /usr/bin/sha256sum --check --status -`,
 +		`/usr/bin/cp --attributes-only --preserve=all -- '${ hostsPath }' '${ stagingPath }'`,
 +		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ stagingPath }' | /usr/bin/sha256sum --check --status -`,
++		`[ -f '${ stagingPath }' ] && [ ! -L '${ stagingPath }' ]`,
++		`/usr/bin/stat --format='%u:%h:%F' -- '${ stagingPath }' | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1:regular file'`,
++		`/usr/bin/test '${ hostsPath }' -ef '${ identityPath }'`,
++		verifyMetadata( '%d:%i:%u:%g:%f:%s:%Y', metadata.identityHash ),
++		`/usr/bin/stat --format='%h' -- '${ hostsPath }' | /usr/bin/grep --quiet --fixed-strings --line-regexp '2'`,
 +		`/usr/bin/printf '%s  %s\\n' '${ currentHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
 +		`/usr/bin/mv -fT -- '${ stagingPath }' '${ hostsPath }'`,
++		`[ -f '${ hostsPath }' ] && [ ! -L '${ hostsPath }' ]`,
++		`/usr/bin/stat --format='%u:%h:%F' -- '${ hostsPath }' | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1:regular file'`,
 +		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
 +		`/usr/bin/sync -f '${ path.dirname( hostsPath ) }'`,
 +	].join( '; ' );
@@ -185,7 +269,7 @@ index a12908c6..4b2f1da1 100644
  /**
   * Create a regular expression matching the hosts entries for a given domain,
   * covering both the IPv4 and IPv6 loopback addresses:
-@@ -121,7 +219,7 @@ export const addDomainToHosts = async ( domain: string, port: number ): Promise<
+@@ -121,7 +276,7 @@ export const addDomainToHosts = async ( domain: string, port: number ): Promise<
  		} );
  
  		if ( newContent !== hostsContent ) {
@@ -194,7 +278,7 @@ index a12908c6..4b2f1da1 100644
  		}
  	} catch ( error ) {
  		console.error( `Error adding domain ${ domain } to hosts file:`, error );
-@@ -144,7 +242,7 @@ export const removeDomainFromHosts = async ( domain: string ): Promise< void > =
+@@ -144,7 +299,7 @@ export const removeDomainFromHosts = async ( domain: string ): Promise< void > =
  
  		// Only write if content changed
  		if ( newContent !== hostsContent ) {
@@ -203,7 +287,7 @@ index a12908c6..4b2f1da1 100644
  		}
  	} catch ( error ) {
  		console.error( `Error removing domain ${ domain } from hosts file:`, error );
-@@ -186,7 +284,7 @@ export const updateDomainInHosts = async (
+@@ -186,7 +341,7 @@ export const updateDomainInHosts = async (
  		} );
  
  		if ( newContent !== hostsContent ) {
@@ -213,7 +297,7 @@ index a12908c6..4b2f1da1 100644
  	} catch ( error ) {
  		console.error(
 diff --git a/apps/cli/lib/proxy-server.ts b/apps/cli/lib/proxy-server.ts
-index 133bdc20..9cc5aae1 100644
+index 133bdc20b..9cc5aae1d 100644
 --- a/apps/cli/lib/proxy-server.ts
 +++ b/apps/cli/lib/proxy-server.ts
 @@ -6,8 +6,10 @@ import httpProxy from 'http-proxy';
@@ -434,10 +518,10 @@ index 133bdc20..9cc5aae1 100644
  		throw error;
  	}
 diff --git a/apps/cli/lib/tests/certificate-manager.test.ts b/apps/cli/lib/tests/certificate-manager.test.ts
-index 8d8d2632..b127154e 100644
+index 8d8d26321..ab0fe120f 100644
 --- a/apps/cli/lib/tests/certificate-manager.test.ts
 +++ b/apps/cli/lib/tests/certificate-manager.test.ts
-@@ -1,9 +1,11 @@
+@@ -1,9 +1,12 @@
  import fs from 'node:fs';
  import {
  	buildLinuxTrustInstallCommand,
@@ -445,12 +529,16 @@ index 8d8d2632..b127154e 100644
  	importCAIntoUserNssDbsLinux,
  	isCAImportedInUserNssDbsLinux,
  	isCATrustedOnLinux,
++	isLinuxTrustAnchorCurrent,
 +	readLinuxTrustCertificate,
  } from '@studio/common/lib/linux-trust-store';
  import sudo from '@vscode/sudo-prompt';
  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-@@ -15,7 +17,12 @@ vi.mock( '@studio/common/lib/linux-trust-store', () => ( {
+@@ -13,9 +16,15 @@ vi.mock( '@studio/common/lib/linux-trust-store', () => ( {
+ 	LINUX_TRUST_STORE_PATH: '/usr/local/share/ca-certificates/studio-ca.crt',
+ 	LINUX_NSS_NICKNAME: 'WordPress Studio CA',
  	isCATrustedOnLinux: vi.fn(),
++	isLinuxTrustAnchorCurrent: vi.fn(),
  	isCAImportedInUserNssDbsLinux: vi.fn(),
  	buildLinuxTrustInstallCommand: vi.fn(),
 +	getLinuxTrustStoreConfig: vi.fn( () => ( {
@@ -462,8 +550,11 @@ index 8d8d2632..b127154e 100644
  } ) );
  
  vi.mock( '@vscode/sudo-prompt', () => ( {
-@@ -27,7 +34,9 @@ vi.mock( '@vscode/sudo-prompt', () => ( {
+@@ -25,9 +34,12 @@ vi.mock( '@vscode/sudo-prompt', () => ( {
+ } ) );
+ 
  const mockedIsCATrustedOnLinux = vi.mocked( isCATrustedOnLinux );
++const mockedIsLinuxTrustAnchorCurrent = vi.mocked( isLinuxTrustAnchorCurrent );
  const mockedIsCAImportedInUserNssDbsLinux = vi.mocked( isCAImportedInUserNssDbsLinux );
  const mockedBuildLinuxTrustInstallCommand = vi.mocked( buildLinuxTrustInstallCommand );
 +const mockedGetLinuxTrustStoreConfig = vi.mocked( getLinuxTrustStoreConfig );
@@ -472,8 +563,11 @@ index 8d8d2632..b127154e 100644
  const mockedSudoExec = vi.mocked( sudo.exec );
  
  type SudoExecCallback = ( error?: Error, stdout?: string, stderr?: string ) => void;
-@@ -50,10 +59,13 @@ describe( 'certificate-manager (Linux)', () => {
+@@ -48,12 +60,16 @@ describe( 'certificate-manager (Linux)', () => {
+ 	let existsSpy: ReturnType< typeof vi.spyOn >;
+ 	beforeEach( () => {
  		mockedIsCATrustedOnLinux.mockReset();
++		mockedIsLinuxTrustAnchorCurrent.mockReset().mockReturnValue( true );
  		mockedIsCAImportedInUserNssDbsLinux.mockReset();
  		mockedBuildLinuxTrustInstallCommand.mockReset();
 +		mockedGetLinuxTrustStoreConfig.mockClear();
@@ -487,7 +581,16 @@ index 8d8d2632..b127154e 100644
  		);
  		mockedImportCAIntoUserNssDbsLinux.mockResolvedValue( undefined );
  		// Default: NSS DBs are populated. Override per-test for the
-@@ -121,16 +133,34 @@ describe( 'certificate-manager (Linux)', () => {
+@@ -76,7 +92,7 @@ describe( 'certificate-manager (Linux)', () => {
+ 			await expect( isRootCATrusted() ).resolves.toBe( true );
+ 
+ 			expect( mockedIsCATrustedOnLinux ).toHaveBeenCalledWith(
+-				expect.stringContaining( 'studio-ca.crt' )
++				'/usr/local/share/ca-certificates/studio-ca.crt'
+ 			);
+ 			expect( mockedIsCAImportedInUserNssDbsLinux ).toHaveBeenCalled();
+ 		} );
+@@ -121,16 +137,54 @@ describe( 'certificate-manager (Linux)', () => {
  
  			await expect( trustRootCA() ).resolves.toBeUndefined();
  
@@ -506,6 +609,26 @@ index 8d8d2632..b127154e 100644
  			expect( options ).toEqual( { name: 'WordPress Studio' } );
  		} );
  
++		it( 'reinstalls a trusted but stale root anchor and verifies it before NSS import', async () => {
++			mockedIsCATrustedOnLinux.mockResolvedValue( true );
++			mockedIsLinuxTrustAnchorCurrent
++				.mockReturnValueOnce( false )
++				.mockReturnValueOnce( false )
++				.mockReturnValueOnce( true );
++			stubSudoExec();
++
++			await trustRootCA();
++
++			expect( mockedSudoExec ).toHaveBeenCalledOnce();
++			expect( mockedIsLinuxTrustAnchorCurrent ).toHaveBeenLastCalledWith(
++				Buffer.from( 'authorized CA bytes' ),
++				'/usr/local/share/ca-certificates/studio-ca.crt'
++			);
++			expect( mockedImportCAIntoUserNssDbsLinux ).toHaveBeenCalledAfter(
++				mockedIsLinuxTrustAnchorCurrent
++			);
++		} );
++
 +		it( 'snapshots the CA before opening the authorization prompt', async () => {
 +			mockedIsCATrustedOnLinux.mockResolvedValue( false );
 +			mockedIsCAImportedInUserNssDbsLinux.mockResolvedValue( false );
@@ -524,7 +647,7 @@ index 8d8d2632..b127154e 100644
  		it( 'imports the CA into per-user NSS DBs after the system install succeeds', async () => {
  			mockedIsCATrustedOnLinux.mockResolvedValue( false );
  			mockedIsCAImportedInUserNssDbsLinux.mockResolvedValue( false );
-@@ -139,7 +169,7 @@ describe( 'certificate-manager (Linux)', () => {
+@@ -139,7 +193,7 @@ describe( 'certificate-manager (Linux)', () => {
  			await trustRootCA();
  
  			expect( mockedImportCAIntoUserNssDbsLinux ).toHaveBeenCalledWith(
@@ -534,7 +657,7 @@ index 8d8d2632..b127154e 100644
  			// NSS import must run *after* the sudo install.
  			const sudoOrder = mockedSudoExec.mock.invocationCallOrder[ 0 ];
 diff --git a/apps/cli/lib/tests/hosts-file.test.ts b/apps/cli/lib/tests/hosts-file.test.ts
-index e67d43c2..8904f49b 100644
+index e67d43c29..8904f49b8 100644
 --- a/apps/cli/lib/tests/hosts-file.test.ts
 +++ b/apps/cli/lib/tests/hosts-file.test.ts
 @@ -1,18 +1,20 @@
@@ -969,1166 +1092,9 @@ index e67d43c2..8904f49b 100644
 +		expect( getWrittenContent() ).not.toContain( '# BEGIN WordPress Studio' );
  	} );
  } );
-diff --git a/apps/cli/php-server-child.ts b/apps/cli/php-server-child.ts
-index 41258378..6d647063 100644
---- a/apps/cli/php-server-child.ts
-+++ b/apps/cli/php-server-child.ts
-@@ -450,7 +450,7 @@ function proxyRequestToPhpWorker(
- 	req.pipe( proxyReq );
- }
- 
--async function startPhpProxyServer(
-+export async function startPhpProxyServer(
- 	config: ServerConfig,
- 	stopSignal?: AbortSignal
- ): Promise< http.Server > {
-@@ -464,7 +464,7 @@ async function startPhpProxyServer(
- 			proxyServer.close();
- 			reject( new DOMException( 'Aborted', 'AbortError' ) );
- 		} );
--		proxyServer.listen( config.port, 'localhost', () => {
-+		proxyServer.listen( config.port, '127.0.0.1', () => {
- 			resolve();
- 		} );
- 	} );
-diff --git a/apps/cli/playground-server-child.ts b/apps/cli/playground-server-child.ts
-index dc14d0f2..6192dcc2 100644
---- a/apps/cli/playground-server-child.ts
-+++ b/apps/cli/playground-server-child.ts
-@@ -10,6 +10,7 @@
-  * - Sends response back when ready
-  * - Sends activity heartbeats to prevent timeout during long operations
-  */
-+import net from 'node:net';
- import { rootCertificates } from 'node:tls';
- import path, { dirname } from 'path';
- import { setPhpIniEntries } from '@php-wasm/universal';
-@@ -58,6 +59,65 @@ import {
- let server: RunCLIServer | null = null;
- let lastCliArgs: Record< string, unknown > | null = null;
- 
-+const PLAYGROUND_LOOPBACK_HOST = '127.0.0.1';
-+type MutableServerPrototype = {
-+	listen: ( this: net.Server, ...args: unknown[] ) => net.Server;
-+};
-+let activeLoopbackBindings = 0;
-+let originalServerListen: MutableServerPrototype[ 'listen' ] | null = null;
-+let loopbackServerListen: MutableServerPrototype[ 'listen' ] | null = null;
-+
-+/**
-+ * Playground CLI 3.1.45 does not expose a host option and otherwise calls
-+ * server.listen(port), which binds to every interface. This child owns a single
-+ * Playground operation, so confine every TCP listener created while runCLI is
-+ * starting and restore Node's prototype as soon as the operation settles.
-+ */
-+export async function withPlaygroundCliLoopbackBinding< T >(
-+	callback: () => Promise< T >
-+): Promise< T > {
-+	const serverPrototype = net.Server.prototype as unknown as MutableServerPrototype;
-+	if ( activeLoopbackBindings === 0 ) {
-+		const originalListen = serverPrototype.listen;
-+		originalServerListen = originalListen;
-+		loopbackServerListen = function ( ...args: unknown[] ) {
-+			let loopbackArgs = args;
-+			const firstArg = args[ 0 ];
-+
-+			if ( typeof firstArg === 'number' ) {
-+				loopbackArgs =
-+					typeof args[ 1 ] === 'string'
-+						? [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 2 ) ]
-+						: [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 1 ) ];
-+			} else if (
-+				typeof firstArg === 'object' &&
-+				firstArg !== null &&
-+				'port' in firstArg &&
-+				typeof firstArg.port === 'number'
-+			) {
-+				loopbackArgs = [ { ...firstArg, host: PLAYGROUND_LOOPBACK_HOST }, ...args.slice( 1 ) ];
-+			}
-+
-+			return originalListen.apply( this, loopbackArgs );
-+		};
-+		serverPrototype.listen = loopbackServerListen;
-+	}
-+
-+	activeLoopbackBindings++;
-+	try {
-+		return await callback();
-+	} finally {
-+		activeLoopbackBindings--;
-+		if ( activeLoopbackBindings === 0 ) {
-+			if ( serverPrototype.listen === loopbackServerListen && originalServerListen ) {
-+				serverPrototype.listen = originalServerListen;
-+			}
-+			originalServerListen = null;
-+			loopbackServerListen = null;
-+		}
-+	}
-+}
-+
- // Intercept and prefix all console output from playground-cli
- const originalConsoleLog = console.log;
- const originalConsoleError = console.error;
-@@ -429,7 +489,7 @@ const startServer = wrapWithStartingPromise(
- 
- 			const args = await getBaseRunCLIArgs( 'server', config );
- 
--			server = await runCLI( args );
-+			server = await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
- 
- 			stopSignal.throwIfAborted();
- 
-@@ -516,7 +576,7 @@ async function runBlueprint( config: ServerConfig, signal: AbortSignal ): Promis
- 		signal.throwIfAborted();
- 
- 		const args = await getBaseRunCLIArgs( 'run-blueprint', config );
--		await runCLI( args );
-+		await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
- 
- 		signal.throwIfAborted();
- 
-diff --git a/apps/studio/forge.config.ts b/apps/studio/forge.config.ts
-index 3742fc52..260fc774 100644
---- a/apps/studio/forge.config.ts
-+++ b/apps/studio/forge.config.ts
-@@ -105,7 +105,13 @@ const config: ForgeConfig = {
- 				// dependency resolvable on both.
- 				// ca-certificates: ships `update-ca-certificates` and the system trust bundle.
- 				// libnss3-tools: ships `certutil`, used to import the CA into per-user NSS DBs.
--				depends: [ 'libcap2-bin', 'pkexec | policykit-1', 'ca-certificates', 'libnss3-tools' ],
-+				depends: [
-+					'libcap2-bin',
-+					'pkexec | policykit-1',
-+					'ca-certificates',
-+					'libnss3-tools',
-+					'util-linux',
-+				],
- 				scripts: {
- 					postinst: path.join( __dirname, 'installers', 'linux', 'postinst.sh' ),
- 					postrm: path.join( __dirname, 'installers', 'linux', 'postrm.sh' ),
-diff --git a/apps/studio/installers/linux/postrm.sh b/apps/studio/installers/linux/postrm.sh
-index fc71ddad..b4c95133 100755
---- a/apps/studio/installers/linux/postrm.sh
-+++ b/apps/studio/installers/linux/postrm.sh
-@@ -6,12 +6,16 @@ set -e
- case "$1" in
- 	purge)
- 		STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"
--		if [ -f "$STUDIO_CA_PATH" ]; then
--			rm -f "$STUDIO_CA_PATH"
--			if command -v update-ca-certificates >/dev/null 2>&1; then
--				update-ca-certificates --fresh >/dev/null || true
-+		STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"
-+		(
-+			umask 077
-+			exec 9>"$STUDIO_CA_LOCK"
-+			/usr/bin/flock -x 9
-+			if [ -f "$STUDIO_CA_PATH" ]; then
-+				rm -f "$STUDIO_CA_PATH"
- 			fi
--		fi
-+			/usr/sbin/update-ca-certificates --fresh >/dev/null
-+		)
- 		;;
- esac
- 
-diff --git a/apps/studio/src/lib/certificate-manager.ts b/apps/studio/src/lib/certificate-manager.ts
-index 304ee753..c81d0a58 100644
---- a/apps/studio/src/lib/certificate-manager.ts
-+++ b/apps/studio/src/lib/certificate-manager.ts
-@@ -8,10 +8,12 @@ import { CERT_UNTRUSTED_ROOT, SERVER_AUTH_OID } from '@studio/common/constants';
- import {
- 	areAllFirefoxProfilesTrustedLinux,
- 	buildLinuxTrustInstallCommand,
-+	getLinuxTrustStoreConfig,
- 	importCAIntoFirefoxProfilesLinux,
- 	importCAIntoUserNssDbsLinux,
- 	isCAImportedInUserNssDbsLinux,
- 	isCATrustedOnLinux,
-+	readLinuxTrustCertificate,
- } from '@studio/common/lib/linux-trust-store';
- import { getCertificatesPath } from '@studio/common/lib/well-known-paths';
- import sudo from '@vscode/sudo-prompt';
-@@ -103,10 +105,12 @@ export async function trustRootCA(): Promise< void > {
- 			// otherwise we'd reprompt for the polkit password just to re-sync NSS
- 			// (the common case when a Chromium-family browser is installed after
- 			// the initial trust flow).
-+			const { trustStorePath } = getLinuxTrustStoreConfig();
- 			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
-+				const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
- 				await new Promise< void >( ( resolve, reject ) => {
- 					sudo.exec(
--						buildLinuxTrustInstallCommand( CA_CERT_PATH ),
-+						buildLinuxTrustInstallCommand( certificate ),
- 						{ name: 'WordPress Studio' },
- 						( error ) => {
- 							if ( error ) {
-@@ -122,13 +126,13 @@ export async function trustRootCA(): Promise< void > {
- 			}
- 			// Always run NSS imports — they're idempotent (-D before -A) and don't
- 			// need sudo, so re-running covers the install-browser-after-trust case.
--			await importCAIntoUserNssDbsLinux( CA_CERT_PATH );
-+			await importCAIntoUserNssDbsLinux( trustStorePath );
- 			// Firefox keeps a per-profile NSS DB; the system + Chromium imports
- 			// above don't reach it. Profiles that don't exist yet are skipped —
- 			// when the user later opens Firefox for the first time, the trust
- 			// check flips back to untrusted on refetch and the user clicks Trust
- 			// again to import into the newly created profile.
--			await importCAIntoFirefoxProfilesLinux( CA_CERT_PATH );
-+			await importCAIntoFirefoxProfilesLinux( trustStorePath );
- 		} else {
- 			console.error( 'Unsupported platform for automatic certificate trust:', platform );
- 		}
-diff --git a/apps/studio/src/lib/php-error-recovery.ts b/apps/studio/src/lib/php-error-recovery.ts
-index d65123e7..0ee0d72e 100644
---- a/apps/studio/src/lib/php-error-recovery.ts
-+++ b/apps/studio/src/lib/php-error-recovery.ts
-@@ -105,7 +105,7 @@ export async function startErrorRecovery(
- 
- 	await new Promise< void >( ( resolve, reject ) => {
- 		errorServer.on( 'error', reject );
--		errorServer.listen( port, () => resolve() );
-+		errorServer.listen( port, '127.0.0.1', () => resolve() );
- 	} );
- 
- 	let retrying = false;
-diff --git a/apps/studio/src/lib/tests/php-error-recovery.test.ts b/apps/studio/src/lib/tests/php-error-recovery.test.ts
-index 51e8b9d5..cf17e5ff 100644
---- a/apps/studio/src/lib/tests/php-error-recovery.test.ts
-+++ b/apps/studio/src/lib/tests/php-error-recovery.test.ts
-@@ -15,7 +15,7 @@ function getFreePort(): Promise< number > {
- 	return new Promise( ( resolve, reject ) => {
- 		const srv = http.createServer();
- 		srv.once( 'error', reject );
--		srv.listen( 0, () => {
-+		srv.listen( 0, '127.0.0.1', () => {
- 			const address = srv.address();
- 			const port = typeof address === 'object' && address ? address.port : 0;
- 			srv.close( () => resolve( port ) );
-@@ -27,7 +27,7 @@ function canBind( port: number ): Promise< boolean > {
- 	return new Promise( ( resolve ) => {
- 		const srv = http.createServer();
- 		srv.once( 'error', () => resolve( false ) );
--		srv.listen( port, () => srv.close( () => resolve( true ) ) );
-+		srv.listen( port, '127.0.0.1', () => srv.close( () => resolve( true ) ) );
- 	} );
- }
- 
-@@ -109,6 +109,7 @@ describe( 'error recovery port lifecycle', () => {
- 	test( 'holds the port and marks the site running, then releases both on stop', async () => {
- 		const port = await getFreePort();
- 		const dir = fs.mkdtempSync( nodePath.join( os.tmpdir(), 'php-recovery-test-' ) );
-+		const listenSpy = vi.spyOn( http.Server.prototype, 'listen' );
- 		const siteServer = {
- 			details: { id: 'test-site', port, path: dir } as {
- 				id: string;
-@@ -124,6 +125,7 @@ describe( 'error recovery port lifecycle', () => {
- 
- 		try {
- 			await startErrorRecovery( siteServer as never, 'Fatal error: boom', () => ( {} ) );
-+			expect( listenSpy ).toHaveBeenCalledWith( port, '127.0.0.1', expect.any( Function ) );
- 			expect( isInErrorRecovery( 'test-site' ) ).toBe( true );
- 			// The recovery error server holds the port; the site shows as running and in recovery.
- 			expect( await canBind( port ) ).toBe( false );
-@@ -149,6 +151,7 @@ describe( 'error recovery port lifecycle', () => {
- 			expect( siteServer.inErrorRecovery ).toBe( false );
- 		} finally {
- 			await stopErrorRecovery( 'test-site' );
-+			listenSpy.mockRestore();
- 			fs.rmSync( dir, { recursive: true, force: true } );
- 		}
- 	} );
-diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
-index 4bb9bf6c..f54ecf4a 100644
---- a/apps/studio/src/site-server.ts
-+++ b/apps/studio/src/site-server.ts
-@@ -265,6 +265,7 @@ export class SiteServer {
- 
- 		console.log( `Starting server for '${ this.details.name }'` );
- 		await this.server.start();
-+		this.adoptRunningState( true );
- 	}
- 
- 	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
-diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
-index bbc02940..3f9a444e 100644
---- a/apps/studio/src/tests/site-server.test.ts
-+++ b/apps/studio/src/tests/site-server.test.ts
-@@ -195,5 +195,31 @@ describe( 'SiteServer', () => {
- 				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
- 			);
- 		} );
-+
-+		it( 'marks a successful CLI start as running before it resolves', async () => {
-+			mockStartServer.mockResolvedValueOnce( {
-+				url: 'http://localhost:1234',
-+				options: { port: 1234, phpVersion: '8.0' },
-+				_internal: { mode: 'wordpress', port: 1234 },
-+			} );
-+
-+			const server = SiteServer.register( {
-+				id: 'successful-start',
-+				name: 'successful-start',
-+				path: '/tmp/successful-start',
-+				port: 1234,
-+				adminPassword: 'test-password',
-+				phpVersion: '8.4',
-+				running: false,
-+				themeDetails: undefined,
-+			} );
-+
-+			await server.start();
-+
-+			expect( server.details.running ).toBe( true );
-+			if ( server.details.running ) {
-+				expect( server.details.url ).toBe( 'http://localhost:1234' );
-+			}
-+		} );
- 	} );
- } );
-diff --git a/apps/studio/src/tests/updates.test.ts b/apps/studio/src/tests/updates.test.ts
-index b90c9371..1241f667 100644
---- a/apps/studio/src/tests/updates.test.ts
-+++ b/apps/studio/src/tests/updates.test.ts
-@@ -25,10 +25,14 @@ vi.mock( 'src/main-window', () => ( {
- const originalFetch = global.fetch;
- const originalPlatform = process.platform;
- const originalArch = process.arch;
-+const originalOmarchyPath = process.env.OMARCHY_PATH;
-+const originalStudioOmarchyPackage = process.env.STUDIO_OMARCHY_PACKAGE;
- 
- beforeEach( () => {
- 	Object.defineProperty( process, 'platform', { value: 'linux', configurable: true } );
- 	Object.defineProperty( process, 'arch', { value: 'arm64', configurable: true } );
-+	delete process.env.OMARCHY_PATH;
-+	delete process.env.STUDIO_OMARCHY_PACKAGE;
- 	vi.mocked( app.getVersion ).mockReturnValue( '1.8.2' );
- 	// shell.openExternal isn't part of the global electron mock in vitest.setup.ts.
- 	( shell as unknown as { openExternal: ReturnType< typeof vi.fn > } ).openExternal = vi
-@@ -40,6 +44,16 @@ afterEach( () => {
- 	global.fetch = originalFetch;
- 	Object.defineProperty( process, 'platform', { value: originalPlatform, configurable: true } );
- 	Object.defineProperty( process, 'arch', { value: originalArch, configurable: true } );
-+	if ( originalOmarchyPath === undefined ) {
-+		delete process.env.OMARCHY_PATH;
-+	} else {
-+		process.env.OMARCHY_PATH = originalOmarchyPath;
-+	}
-+	if ( originalStudioOmarchyPackage === undefined ) {
-+		delete process.env.STUDIO_OMARCHY_PACKAGE;
-+	} else {
-+		process.env.STUDIO_OMARCHY_PACKAGE = originalStudioOmarchyPackage;
-+	}
- } );
- 
- describe( 'Linux updater', () => {
-@@ -97,6 +111,34 @@ describe( 'Linux updater', () => {
- 		);
- 	} );
- 
-+	it( 'routes updates through Omarchy without downloading the DEB', async () => {
-+		process.env.OMARCHY_PATH = '/usr/share/omarchy';
-+		process.env.STUDIO_OMARCHY_PACKAGE = '1';
-+		global.fetch = vi.fn().mockResolvedValue( {
-+			status: 200,
-+			ok: true,
-+			json: async () => ( {
-+				version: '1.9.0',
-+				downloadUrl: 'https://appscdn.example.com/path/studio_1.9.0_arm64.deb',
-+			} ),
-+		} as Response );
-+		vi.mocked( dialog.showMessageBox ).mockResolvedValue( {
-+			response: 0,
-+			checkboxChecked: false,
-+		} );
-+
-+		await manualCheckForUpdates();
-+
-+		await vi.waitFor( () => {
-+			expect( clipboard.writeText ).toHaveBeenCalledWith( 'studio-omarchy-update' );
-+		} );
-+
-+		const args = getLastDialogOptions();
-+		expect( args.buttons?.[ 0 ] ).toBe( 'Copy update command' );
-+		expect( args.detail ).toContain( 'studio-omarchy-update' );
-+		expect( shell.openExternal ).not.toHaveBeenCalled();
-+	} );
-+
- 	it( 'does not copy to the clipboard or open the browser when the user dismisses the dialog', async () => {
- 		global.fetch = vi.fn().mockResolvedValue( {
- 			status: 200,
-diff --git a/apps/studio/src/updates.ts b/apps/studio/src/updates.ts
-index 142b6b7a..bb075f16 100644
---- a/apps/studio/src/updates.ts
-+++ b/apps/studio/src/updates.ts
-@@ -3,6 +3,7 @@ import * as Sentry from '@sentry/electron/main';
- import { sprintf, __ } from '@wordpress/i18n';
- import { AUTO_UPDATE_INTERVAL_MS, NIGHTLY_UPDATE_TTL_MS } from 'src/constants';
- import { sendIpcEventToRenderer, type AppUpdateStatus } from 'src/ipc-utils';
-+import { getLinuxUpdateAction, isStudioOmarchyPackage } from 'src/lib/linux-update';
- import { shellOpenExternalWrapper } from 'src/lib/shell-open-external-wrapper';
- import { getPreferredStudioUiMode } from 'src/lib/studio-ui-mode';
- import { isDevRelease } from 'src/lib/version-utils';
-@@ -361,21 +362,29 @@ function rescheduleLinuxOrFinish() {
- async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: string ) {
- 	const mainWindow = await getMainWindow();
- 
--	const command = `sudo apt install ~/Downloads/${ debFilenameFromUrl( downloadUrl ) }`;
--	const actionDescription = __(
--		'Clicking the button below will download the new package and copy the install command to your clipboard.'
--	);
--	const followUpInstruction = __(
--		'Once the download finishes, quit Studio, open a terminal, and paste the command to install:'
--	);
-+	const updateAction = getLinuxUpdateAction( debFilenameFromUrl( downloadUrl ) );
-+	const isOmarchy = isStudioOmarchyPackage();
-+	const actionDescription = isOmarchy
-+		? __( 'This Studio package is updated from its native Omarchy release channel.' )
-+		: __(
-+				'Clicking the button below will download the new package and copy the install command to your clipboard.'
-+		  );
-+	const followUpInstruction = isOmarchy
-+		? __( 'Quit Studio, open a terminal, and paste:' )
-+		: __(
-+				'Once the download finishes, quit Studio, open a terminal, and paste the command to install:'
-+		  );
- 
- 	const { response } = await dialog.showMessageBox( mainWindow, {
- 		type: 'info',
--		buttons: [ __( 'Download & copy command' ), __( 'Later' ) ],
-+		buttons: [
-+			isOmarchy ? __( 'Copy update command' ) : __( 'Download & copy command' ),
-+			__( 'Later' ),
-+		],
- 		title: __( 'New Version Available' ),
- 		// translators: %s is the version number, e.g. "1.9.0".
- 		message: sprintf( __( 'Studio %s is available' ), version ),
--		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ command }`,
-+		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ updateAction.command }`,
- 		defaultId: 0,
- 		cancelId: 1,
- 	} );
-@@ -384,6 +393,11 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
- 		return;
- 	}
- 
-+	if ( ! updateAction.shouldDownload ) {
-+		clipboard.writeText( updateAction.command );
-+		return;
-+	}
-+
- 	try {
- 		const parsedUrl = new URL( downloadUrl );
- 		if ( ! [ 'http:', 'https:' ].includes( parsedUrl.protocol ) ) {
-@@ -392,7 +406,7 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
- 			);
- 			return;
- 		}
--		clipboard.writeText( command );
-+		clipboard.writeText( updateAction.command );
- 		void shellOpenExternalWrapper( parsedUrl.toString() );
- 	} catch {
- 		Sentry.captureException( new Error( `Malformed downloadUrl: ${ downloadUrl }` ) );
-diff --git a/packages/common/lib/linux-trust-store.ts b/packages/common/lib/linux-trust-store.ts
-index 485387ab..56045ba8 100644
---- a/packages/common/lib/linux-trust-store.ts
-+++ b/packages/common/lib/linux-trust-store.ts
-@@ -1,15 +1,105 @@
- import { execFile } from 'node:child_process';
--import { existsSync, mkdirSync, readdirSync } from 'node:fs';
-+import { createHash, randomBytes, X509Certificate } from 'node:crypto';
-+import {
-+	closeSync,
-+	constants as fsConstants,
-+	existsSync,
-+	fstatSync,
-+	mkdirSync,
-+	openSync,
-+	readSync,
-+	readdirSync,
-+} from 'node:fs';
- import os from 'node:os';
- import path from 'node:path';
- import { promisify } from 'node:util';
-+import {
-+	getLinuxDistribution,
-+	isArchBasedLinux,
-+	type LinuxDistribution,
-+} from '@studio/common/lib/linux-distribution';
- 
- const execFilePromise = promisify( execFile );
- 
- export const LINUX_SYSTEM_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt';
- export const LINUX_TRUST_STORE_PATH = '/usr/local/share/ca-certificates/studio-ca.crt';
-+export const ARCH_LINUX_TRUST_STORE_PATH =
-+	'/etc/ca-certificates/trust-source/anchors/studio-ca.crt';
- export const LINUX_NSS_NICKNAME = 'WordPress Studio CA';
- 
-+export interface LinuxTrustStoreConfig {
-+	trustStorePath: string;
-+	updateCommand: string;
-+}
-+
-+const MAX_LINUX_CA_SIZE = 64 * 1024;
-+const STUDIO_CA_COMMON_NAME = 'CN=WordPress Studio CA';
-+const STUDIO_CA_ORGANIZATION = 'O=WordPress Studio';
-+const STUDIO_CA_INSTALL_LOCK = '/run/lock/wordpress-studio-ca.lock';
-+
-+interface LinuxTrustCertificateFingerprints {
-+	file: string;
-+	der: string;
-+}
-+
-+function validateLinuxTrustCertificate(
-+	certificateBytes: Buffer
-+): LinuxTrustCertificateFingerprints {
-+	if ( certificateBytes.byteLength <= 0 || certificateBytes.byteLength > MAX_LINUX_CA_SIZE ) {
-+		throw new Error( 'The Studio CA has an invalid size' );
-+	}
-+
-+	const pem = certificateBytes.toString( 'utf8' );
-+	const pemCertificates = pem.match(
-+		/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
-+	);
-+	if ( pemCertificates?.length !== 1 || pem.trim() !== pemCertificates[ 0 ] ) {
-+		throw new Error( 'The Studio CA must contain exactly one PEM certificate' );
-+	}
-+
-+	let certificate: X509Certificate;
-+	try {
-+		certificate = new X509Certificate( certificateBytes );
-+	} catch {
-+		throw new Error( 'The Studio CA is not a valid X.509 certificate' );
-+	}
-+
-+	if (
-+		! certificate.ca ||
-+		certificate.subject !== certificate.issuer ||
-+		! certificate.checkIssued( certificate ) ||
-+		! certificate.verify( certificate.publicKey )
-+	) {
-+		throw new Error( 'The Studio CA must be a self-signed certificate authority' );
-+	}
-+	if (
-+		! certificate.subject.split( '\n' ).includes( STUDIO_CA_COMMON_NAME ) ||
-+		! certificate.subject.split( '\n' ).includes( STUDIO_CA_ORGANIZATION )
-+	) {
-+		throw new Error( 'The Studio CA has an unexpected identity' );
-+	}
-+	return {
-+		file: createHash( 'sha256' ).update( certificateBytes ).digest( 'hex' ),
-+		der: certificate.fingerprint256.replace( /:/g, '' ).toLowerCase(),
-+	};
-+}
-+
-+export function getLinuxTrustStoreConfig(
-+	distribution: LinuxDistribution = getLinuxDistribution()
-+): LinuxTrustStoreConfig {
-+	if ( isArchBasedLinux( distribution ) ) {
-+		return {
-+			trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
-+			updateCommand: '/usr/bin/update-ca-trust extract',
-+		};
-+	}
-+
-+	return {
-+		trustStorePath: LINUX_TRUST_STORE_PATH,
-+		updateCommand: '/usr/sbin/update-ca-certificates',
-+	};
-+}
-+
- export async function isCATrustedOnLinux( caPath: string ): Promise< boolean > {
- 	try {
- 		await execFilePromise( 'openssl', [ 'verify', '-CAfile', LINUX_SYSTEM_CA_BUNDLE, caPath ] );
-@@ -37,8 +127,121 @@ export async function isCAImportedInUserNssDbsLinux(
- 	return true;
- }
- 
--export function buildLinuxTrustInstallCommand( caPath: string ): string {
--	return `install -m 0644 "${ caPath }" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`;
-+export function readLinuxTrustCertificate( caPath: string ): Buffer {
-+	const fd = openSync(
-+		caPath,
-+		fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
-+	);
-+	try {
-+		const initialStat = fstatSync( fd, { bigint: true } );
-+		if ( ! initialStat.isFile() ) {
-+			throw new Error( 'The Studio CA must be a regular file' );
-+		}
-+		if ( initialStat.size <= BigInt( 0 ) || initialStat.size > BigInt( MAX_LINUX_CA_SIZE ) ) {
-+			throw new Error( 'The Studio CA has an invalid size' );
-+		}
-+
-+		const certificate = Buffer.allocUnsafe( Number( initialStat.size ) );
-+		let offset = 0;
-+		while ( offset < certificate.byteLength ) {
-+			const bytesRead = readSync( fd, certificate, offset, certificate.byteLength - offset, null );
-+			if ( bytesRead === 0 ) {
-+				throw new Error( 'The Studio CA changed while it was being read' );
-+			}
-+			offset += bytesRead;
-+		}
-+
-+		const extraByte = Buffer.allocUnsafe( 1 );
-+		const grewDuringRead = readSync( fd, extraByte, 0, 1, null ) !== 0;
-+		const finalStat = fstatSync( fd, { bigint: true } );
-+		if (
-+			grewDuringRead ||
-+			finalStat.size !== initialStat.size ||
-+			finalStat.dev !== initialStat.dev ||
-+			finalStat.ino !== initialStat.ino ||
-+			finalStat.ctimeNs !== initialStat.ctimeNs ||
-+			finalStat.mtimeNs !== initialStat.mtimeNs
-+		) {
-+			throw new Error( 'The Studio CA changed while it was being read' );
-+		}
-+		validateLinuxTrustCertificate( certificate );
-+		return certificate;
-+	} finally {
-+		closeSync( fd );
-+	}
-+}
-+
-+export function buildLinuxTrustInstallCommand(
-+	certificate: Buffer,
-+	distribution: LinuxDistribution = getLinuxDistribution()
-+): string {
-+	const { trustStorePath, updateCommand } = getLinuxTrustStoreConfig( distribution );
-+	const fingerprints = validateLinuxTrustCertificate( certificate );
-+	const encodedCertificate = certificate.toString( 'base64' );
-+	const nonce = randomBytes( 16 ).toString( 'hex' );
-+	const trustStoreDirectory = path.posix.dirname( trustStorePath );
-+	const stagingPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.tmp` );
-+	const derPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.der` );
-+	const backupCopyPath = path.posix.join(
-+		trustStoreDirectory,
-+		`.studio-ca-${ nonce }.backup-copy`
-+	);
-+	const backupPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.backup` );
-+	const noPreviousAnchorPath = path.posix.join(
-+		trustStoreDirectory,
-+		`.studio-ca-${ nonce }.no-previous-anchor`
-+	);
-+	const cleanupPaths = [ stagingPath, derPath, backupCopyPath, backupPath, noPreviousAnchorPath ]
-+		.map( ( filePath ) => `'${ filePath }'` )
-+		.join( ' ' );
-+	const rollbackFailureCleanupPaths = [ stagingPath, derPath, backupCopyPath, noPreviousAnchorPath ]
-+		.map( ( filePath ) => `'${ filePath }'` )
-+		.join( ' ' );
-+	const verifyFile = ( filePath: string ) =>
-+		`/usr/bin/printf '%s  %s\\n' '${ fingerprints.file }' '${ filePath }' | /usr/bin/sha256sum --check --strict --status`;
-+	const verifyDer = ( filePath: string ) =>
-+		`/usr/bin/openssl x509 -in '${ filePath }' -outform DER -out '${ derPath }' && /usr/bin/printf '%s  %s\\n' '${ fingerprints.der }' '${ derPath }' | /usr/bin/sha256sum --check --strict --status && /usr/bin/rm -f -- '${ derPath }'`;
-+	const verifyInstalledAnchor = `${ verifyFile( trustStorePath ) } && ${ verifyDer(
-+		trustStorePath
-+	) }`;
-+	const preservePreviousAnchor =
-+		`if [ -e '${ trustStorePath }' ] || [ -L '${ trustStorePath }' ]; then ` +
-+		`/usr/bin/cp -a -- '${ trustStorePath }' '${ backupCopyPath }' && ` +
-+		`/usr/bin/mv -fT -- '${ backupCopyPath }' '${ backupPath }'; else ` +
-+		`/usr/bin/touch '${ noPreviousAnchorPath }'; fi`;
-+	const rollback =
-+		`if { ${ verifyInstalledAnchor }; }; then ` +
-+		`if [ -e '${ backupPath }' ] || [ -L '${ backupPath }' ]; then ` +
-+		`/usr/bin/mv -fT -- '${ backupPath }' '${ trustStorePath }' || { ` +
-+		`${ updateCommand } >/dev/null 2>&1 || true; ` +
-+		`/usr/bin/rm -f -- ${ rollbackFailureCleanupPaths }; exit 1; }; ` +
-+		`elif [ -e '${ noPreviousAnchorPath }' ]; then ` +
-+		`/usr/bin/rm -f -- '${ trustStorePath }' || { ` +
-+		`${ updateCommand } >/dev/null 2>&1 || true; ` +
-+		`/usr/bin/rm -f -- ${ rollbackFailureCleanupPaths }; exit 1; }; fi; fi; ` +
-+		`${ updateCommand } >/dev/null 2>&1 || true; ` +
-+		`/usr/bin/rm -f -- ${ cleanupPaths }; exit 1`;
-+
-+	return (
-+		[
-+			'umask 077',
-+			`exec 9>'${ STUDIO_CA_INSTALL_LOCK }'`,
-+			'/usr/bin/flock -x 9',
-+			`/usr/bin/rm -f -- ${ cleanupPaths }`,
-+			`/usr/bin/printf '%s' '${ encodedCertificate }' | /usr/bin/base64 --decode > '${ stagingPath }'`,
-+			verifyFile( stagingPath ),
-+			verifyDer( stagingPath ),
-+			`/usr/bin/chmod 0644 '${ stagingPath }'`,
-+			preservePreviousAnchor,
-+			`/usr/bin/mv -fT -- '${ stagingPath }' '${ trustStorePath }'`,
-+			verifyInstalledAnchor,
-+			updateCommand,
-+			verifyInstalledAnchor,
-+			`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ trustStorePath }'`,
-+			verifyInstalledAnchor,
-+			`/usr/bin/rm -f -- '${ backupPath }' '${ noPreviousAnchorPath }'`,
-+		].join( ' && ' ) + ` || { ${ rollback }; }`
-+	);
- }
- 
- // Snap-Chromium uses a sandboxed NSS DB under ~/snap/chromium/, separate
-diff --git a/packages/common/lib/port-finder.ts b/packages/common/lib/port-finder.ts
-index 9da2e3b8..6d9d1cc7 100644
---- a/packages/common/lib/port-finder.ts
-+++ b/packages/common/lib/port-finder.ts
-@@ -8,16 +8,14 @@ let searchPort = DEFAULT_PORT;
- let openPort: number | null = null;
- const unavailablePorts: Array< number > = [];
- 
--// Bind the same host the site server uses (localhost, see php-server-child.ts)
--// so a successful probe means the server can bind the port too; probing a fixed
--// 127.0.0.1 could disagree with the server when localhost resolves to ::1. A
--// single bind also avoids the connect/destroy socket churn that crashed Node on
--// Windows.
-+// Bind the same literal loopback address as the site server so a successful
-+// probe means the server can bind the port too. A single bind also avoids the
-+// connect/destroy socket churn that crashed Node on Windows.
- function isPortFree( portToCheck: number ): Promise< boolean > {
- 	return new Promise( ( resolve ) => {
- 		const server = net.createServer();
- 		server.once( 'error', () => resolve( false ) );
--		server.listen( portToCheck, 'localhost', () => server.close( () => resolve( true ) ) );
-+		server.listen( portToCheck, '127.0.0.1', () => server.close( () => resolve( true ) ) );
- 	} );
- }
- 
-diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/common/lib/tests/linux-trust-store.test.ts
-index c69b9ebd..48a039bc 100644
---- a/packages/common/lib/tests/linux-trust-store.test.ts
-+++ b/packages/common/lib/tests/linux-trust-store.test.ts
-@@ -1,17 +1,31 @@
-+import { execFileSync, spawnSync } from 'node:child_process';
-+import { createHash, X509Certificate } from 'node:crypto';
- import fs from 'node:fs';
- import os from 'node:os';
- import path from 'node:path';
- import { afterEach, beforeEach, describe, expect, it } from 'vitest';
- import {
-+	ARCH_LINUX_TRUST_STORE_PATH,
- 	buildLinuxTrustInstallCommand,
- 	getLinuxFirefoxProfileDbDirs,
- 	getLinuxNssDbCandidates,
-+	getLinuxTrustStoreConfig,
- 	LINUX_NSS_NICKNAME,
- 	LINUX_SYSTEM_CA_BUNDLE,
- 	LINUX_TRUST_STORE_PATH,
-+	readLinuxTrustCertificate,
- } from '@studio/common/lib/linux-trust-store';
- 
- describe( 'linux-trust-store', () => {
-+	const studioCAFixturePath = path.join(
-+		process.cwd(),
-+		'packages/common/lib/tests/fixtures/studio-ca.crt'
-+	);
-+	const studioCAFixture = fs.readFileSync( studioCAFixturePath );
-+	const notACAFixture = fs.readFileSync(
-+		path.join( process.cwd(), 'packages/common/lib/tests/fixtures/not-a-ca.crt' )
-+	);
-+
- 	describe( 'constants', () => {
- 		it( 'targets the Debian/Ubuntu system trust bundle', () => {
- 			expect( LINUX_SYSTEM_CA_BUNDLE ).toBe( '/etc/ssl/certs/ca-certificates.crt' );
-@@ -26,21 +40,357 @@ describe( 'linux-trust-store', () => {
- 		} );
- 	} );
- 
-+	it.skipIf( process.platform === 'win32' )(
-+		'uses the generated critical .local name constraint in the Studio CA fixture',
-+		() => {
-+			const certificateText = execFileSync(
-+				'openssl',
-+				[ 'x509', '-in', studioCAFixturePath, '-noout', '-text' ],
-+				{ encoding: 'utf8' }
-+			);
-+
-+			expect( certificateText ).toMatch( /X509v3 Name Constraints: critical/ );
-+			expect( certificateText ).toMatch( /Permitted:\s+DNS:\.local/ );
-+		}
-+	);
-+
- 	describe( 'buildLinuxTrustInstallCommand', () => {
--		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
--			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt' );
-+		const certificate = studioCAFixture;
-+
-+		it( 'binds the exact certificate bytes and fingerprint to a fixed Debian trust destination', () => {
-+			const command = buildLinuxTrustInstallCommand( certificate, {
-+				id: 'ubuntu',
-+				idLike: [ 'debian' ],
-+			} );
-+			const fingerprint = createHash( 'sha256' ).update( certificate ).digest( 'hex' );
-+			const derFingerprint = new X509Certificate( certificate ).fingerprint256
-+				.replace( /:/g, '' )
-+				.toLowerCase();
-+
-+			expect( command ).toContain( certificate.toString( 'base64' ) );
-+			expect( command ).toContain( fingerprint );
-+			expect( command.match( new RegExp( fingerprint, 'g' ) ) ).toHaveLength( 5 );
-+			expect( command.match( new RegExp( derFingerprint, 'g' ) ) ).toHaveLength( 5 );
-+			expect( command ).toContain( `'${ LINUX_TRUST_STORE_PATH }'` );
-+			expect( command ).toContain( '/usr/sbin/update-ca-certificates' );
-+			expect( command ).toMatch(
-+				/\/usr\/local\/share\/ca-certificates\/\.studio-ca-[a-f0-9]{32}\.tmp/
-+			);
-+		} );
-+
-+		it( 'does not give the privileged shell a mutable source path or expansion syntax', () => {
-+			const command = buildLinuxTrustInstallCommand( certificate, {
-+				id: 'ubuntu',
-+				idLike: [ 'debian' ],
-+			} );
- 
--			expect( command ).toBe(
--				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
-+			expect( command ).not.toContain( '/home/' );
-+			expect( command ).not.toMatch( /[\r\n`$"]/ );
-+		} );
-+
-+		it( 'restores the previous anchor and re-extracts trust after a failed replacement', () => {
-+			const command = buildLinuxTrustInstallCommand( certificate, {
-+				id: 'ubuntu',
-+				idLike: [ 'debian' ],
-+			} );
-+
-+			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.backup/ );
-+			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.no-previous-anchor/ );
-+			expect( command ).toContain(
-+				`/usr/bin/mv -fT -- '/usr/local/share/ca-certificates/.studio-ca-`
-+			);
-+			expect( command ).toMatch(
-+				/\.backup' '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{/
-+			);
-+			expect( command ).toMatch(
-+				/\/usr\/bin\/rm -f -- '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{/
-+			);
-+			expect( command.match( /\/usr\/sbin\/update-ca-certificates/g ) ).toHaveLength( 4 );
-+			expect( command ).toContain( "exec 9>'/run/lock/wordpress-studio-ca.lock'" );
-+			expect( command ).toContain( '/usr/bin/flock -x 9' );
-+			expect( command ).toMatch(
-+				/\|\| \{ if \{ \/usr\/bin\/printf[^}]+studio-ca\.crt[^}]+\/usr\/bin\/openssl x509[^}]+studio-ca\.crt[^}]+\}; then if /
-+			);
-+			expect( command ).toContain(
-+				`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ LINUX_TRUST_STORE_PATH }'`
-+			);
-+			expect( command ).toMatch(
-+				/\/usr\/sbin\/update-ca-certificates && \/usr\/bin\/printf[^&]+studio-ca\.crt/
-+			);
-+			expect( command ).toMatch(
-+				/openssl verify -CAfile [^&]+studio-ca\.crt' && \/usr\/bin\/printf[^&]+studio-ca\.crt/
-+			);
-+			expect( command ).toMatch(
-+				/\.backup' '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{[\s\S]+update-ca-certificates[^}]+\/usr\/bin\/rm -f --[^}]+exit 1/
- 			);
- 		} );
- 
--		it( 'quotes the source path so home directories with spaces are handled', () => {
--			const command = buildLinuxTrustInstallCommand(
--				'/home/Some User/.studio/certificates/studio-ca.crt'
-+		it( 'shares the certificate transaction lock with Debian package removal', () => {
-+			const debianRemovalScript = fs.readFileSync(
-+				path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
-+				'utf8'
-+			);
-+
-+			expect( debianRemovalScript ).toContain( '/run/lock/wordpress-studio-ca.lock' );
-+			expect( debianRemovalScript ).toContain( '/usr/bin/flock -x 9' );
-+			expect( debianRemovalScript ).toContain(
-+				'/usr/sbin/update-ca-certificates --fresh >/dev/null'
- 			);
-+			expect( debianRemovalScript ).not.toContain( 'update-ca-certificates --fresh >/dev/null ||' );
-+		} );
-+
-+		it.skipIf( process.platform !== 'linux' )(
-+			'retries Debian trust extraction after an earlier refresh failure',
-+			() => {
-+				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-deb-trust-retry-' ) );
-+				try {
-+					const caPath = path.join( tmpDir, 'studio-ca.crt' );
-+					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
-+					const counterPath = path.join( tmpDir, 'update-count' );
-+					const updateScript = path.join( tmpDir, 'update-trust' );
-+					const removalScriptPath = path.join( tmpDir, 'postrm.sh' );
-+					fs.writeFileSync( caPath, studioCAFixture );
-+					fs.writeFileSync(
-+						updateScript,
-+						`#!/bin/sh\ncount=0\n[ ! -e '${ counterPath }' ] || read -r count <'${ counterPath }'\ncount=$((count + 1))\nprintf '%s\\n' "$count" >'${ counterPath }'\n[ "$count" -gt 1 ]\n`,
-+						{ mode: 0o755 }
-+					);
-+					const removalScript = fs
-+						.readFileSync(
-+							path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
-+							'utf8'
-+						)
-+						.replace(
-+							'STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"',
-+							`STUDIO_CA_PATH="${ caPath }"`
-+						)
-+						.replace(
-+							'STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"',
-+							`STUDIO_CA_LOCK="${ lockPath }"`
-+						)
-+						.replace( '/usr/sbin/update-ca-certificates --fresh >/dev/null', updateScript );
-+					fs.writeFileSync( removalScriptPath, removalScript, { mode: 0o755 } );
-+
-+					const first = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
-+					expect( first.status ).not.toBe( 0 );
-+					expect( fs.existsSync( caPath ) ).toBe( false );
-+					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '1' );
-+
-+					const second = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
-+					expect( second.status ).toBe( 0 );
-+					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '2' );
-+				} finally {
-+					fs.rmSync( tmpDir, { recursive: true, force: true } );
-+				}
-+			}
-+		);
-+
-+		it.skipIf( process.platform !== 'linux' )(
-+			'does not roll back over an anchor replaced by another authorized operation',
-+			() => {
-+				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-cas-test-' ) );
-+				try {
-+					const trustDirectory = path.join( tmpDir, 'trust' );
-+					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
-+					const replacementPath = path.join( tmpDir, 'replacement.crt' );
-+					const updateScript = path.join( tmpDir, 'update-trust' );
-+					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
-+					const replacement = Buffer.from( 'concurrent authorized replacement' );
-+					fs.mkdirSync( trustDirectory );
-+					fs.writeFileSync( trustStorePath, notACAFixture );
-+					fs.writeFileSync( replacementPath, replacement );
-+					fs.writeFileSync(
-+						updateScript,
-+						`#!/bin/sh\n/usr/bin/cp -- '${ replacementPath }' '${ trustStorePath }'\nexit 0\n`,
-+						{ mode: 0o755 }
-+					);
-+
-+					const command = buildLinuxTrustInstallCommand( certificate, {
-+						id: 'ubuntu',
-+						idLike: [ 'debian' ],
-+					} )
-+						.split( '/usr/local/share/ca-certificates/' )
-+						.join( `${ trustDirectory }/` )
-+						.split( '/usr/sbin/update-ca-certificates' )
-+						.join( updateScript )
-+						.split( '/run/lock/wordpress-studio-ca.lock' )
-+						.join( lockPath );
-+					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
-+
-+					expect( result.status ).toBe( 1 );
-+					expect( fs.readFileSync( trustStorePath ) ).toEqual( replacement );
-+					expect( fs.readdirSync( trustDirectory ) ).toEqual( [ 'studio-ca.crt' ] );
-+				} finally {
-+					fs.rmSync( tmpDir, { recursive: true, force: true } );
-+				}
-+			}
-+		);
-+
-+		it.skipIf( process.platform !== 'linux' )(
-+			'preserves the previous anchor backup when rollback restoration fails',
-+			() => {
-+				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-restore-test-' ) );
-+				try {
-+					const trustDirectory = path.join( tmpDir, 'trust' );
-+					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
-+					const updateScript = path.join( tmpDir, 'update-trust' );
-+					const moveScript = path.join( tmpDir, 'move' );
-+					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
-+					fs.mkdirSync( trustDirectory );
-+					fs.writeFileSync( trustStorePath, notACAFixture );
-+					fs.writeFileSync( updateScript, '#!/bin/sh\nexit 1\n', { mode: 0o755 } );
-+
-+					let command = buildLinuxTrustInstallCommand( certificate, {
-+						id: 'ubuntu',
-+						idLike: [ 'debian' ],
-+					} )
-+						.split( '/usr/local/share/ca-certificates/' )
-+						.join( `${ trustDirectory }/` )
-+						.split( '/usr/sbin/update-ca-certificates' )
-+						.join( updateScript )
-+						.split( '/run/lock/wordpress-studio-ca.lock' )
-+						.join( lockPath );
-+					const backupPath = command.match( /'([^']+\.backup)'/ )?.[ 1 ];
-+					expect( backupPath ).toBeTypeOf( 'string' );
-+					fs.writeFileSync(
-+						moveScript,
-+						`#!/bin/sh\nif [ "$3" = '${ backupPath }' ]; then exit 1; fi\nexec /usr/bin/mv "$@"\n`,
-+						{ mode: 0o755 }
-+					);
-+					command = command.split( '/usr/bin/mv' ).join( moveScript );
-+
-+					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
-+
-+					expect( result.status ).toBe( 1 );
-+					expect( fs.readFileSync( trustStorePath ) ).toEqual( certificate );
-+					expect( fs.readFileSync( backupPath! ) ).toEqual( notACAFixture );
-+					expect( fs.readdirSync( trustDirectory ).sort() ).toEqual(
-+						[ path.basename( backupPath! ), 'studio-ca.crt' ].sort()
-+					);
-+				} finally {
-+					fs.rmSync( tmpDir, { recursive: true, force: true } );
-+				}
-+			}
-+		);
-+
-+		it( 'rejects malformed and non-CA inputs before constructing a root command', () => {
-+			expect( () =>
-+				buildLinuxTrustInstallCommand( Buffer.from( 'not a certificate' ), {
-+					id: 'ubuntu',
-+					idLike: [ 'debian' ],
-+				} )
-+			).toThrow( 'exactly one PEM certificate' );
-+			expect( () =>
-+				buildLinuxTrustInstallCommand( notACAFixture, {
-+					id: 'ubuntu',
-+					idLike: [ 'debian' ],
-+				} )
-+			).toThrow( 'self-signed certificate authority' );
-+		} );
-+
-+		it( 'uses the Arch trust anchor directory and update command', () => {
-+			const command = buildLinuxTrustInstallCommand( certificate, {
-+				id: 'arch',
-+				idLike: [],
-+			} );
-+
-+			expect( command ).toContain( `'${ ARCH_LINUX_TRUST_STORE_PATH }'` );
-+			expect( command ).toContain( '/usr/bin/update-ca-trust extract' );
-+		} );
-+	} );
-+
-+	describe( 'readLinuxTrustCertificate', () => {
-+		let tmpDir: string;
-+
-+		beforeEach( () => {
-+			tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-source-test-' ) );
-+		} );
-+
-+		afterEach( () => {
-+			fs.rmSync( tmpDir, { recursive: true, force: true } );
-+		} );
-+
-+		it( 'keeps the authorized bytes when the source path is replaced afterwards', () => {
-+			const caPath = path.join( tmpDir, 'studio-ca.crt' );
-+			const replacementPath = path.join( tmpDir, 'replacement.crt' );
-+			const authorized = studioCAFixture;
-+			const replacement = Buffer.from( 'substituted certificate bytes' );
-+			fs.writeFileSync( caPath, authorized );
-+			fs.writeFileSync( replacementPath, replacement );
-+
-+			const snapshot = readLinuxTrustCertificate( caPath );
-+			fs.unlinkSync( caPath );
-+			fs.symlinkSync( replacementPath, caPath );
-+			const command = buildLinuxTrustInstallCommand( snapshot, {
-+				id: 'ubuntu',
-+				idLike: [ 'debian' ],
-+			} );
-+
-+			expect( command ).toContain( authorized.toString( 'base64' ) );
-+			expect( command ).not.toContain( replacement.toString( 'base64' ) );
-+		} );
-+
-+		it( 'rejects a symlink instead of following it', () => {
-+			const realPath = path.join( tmpDir, 'real.crt' );
-+			const symlinkPath = path.join( tmpDir, 'studio-ca.crt' );
-+			fs.writeFileSync( realPath, 'certificate bytes' );
-+			fs.symlinkSync( realPath, symlinkPath );
-+
-+			expect( () => readLinuxTrustCertificate( symlinkPath ) ).toThrow();
-+		} );
-+
-+		it( 'rejects non-regular sources', () => {
-+			expect( () => readLinuxTrustCertificate( tmpDir ) ).toThrow(
-+				'The Studio CA must be a regular file'
-+			);
-+		} );
-+
-+		it.skipIf( process.platform === 'win32' )(
-+			'rejects a FIFO without blocking on a writer',
-+			() => {
-+				const fifoPath = path.join( tmpDir, 'studio-ca.crt' );
-+				execFileSync( 'mkfifo', [ fifoPath ] );
-+
-+				expect( () => readLinuxTrustCertificate( fifoPath ) ).toThrow(
-+					'The Studio CA must be a regular file'
-+				);
-+			}
-+		);
-+
-+		it( 'accepts a certificate exactly at the bounded-read limit', () => {
-+			const caPath = path.join( tmpDir, 'studio-ca.crt' );
-+			const certificate = Buffer.concat( [
-+				studioCAFixture,
-+				Buffer.alloc( 64 * 1024 - studioCAFixture.byteLength, 0x0a ),
-+			] );
-+			fs.writeFileSync( caPath, certificate );
-+
-+			expect( readLinuxTrustCertificate( caPath ) ).toEqual( certificate );
-+		} );
-+
-+		it( 'rejects a certificate one byte over the bounded-read limit', () => {
-+			const caPath = path.join( tmpDir, 'studio-ca.crt' );
-+			fs.writeFileSync( caPath, Buffer.alloc( 64 * 1024 + 1, 0x41 ) );
-+
-+			expect( () => readLinuxTrustCertificate( caPath ) ).toThrow(
-+				'The Studio CA has an invalid size'
-+			);
-+		} );
-+	} );
-+
-+	describe( 'getLinuxTrustStoreConfig', () => {
-+		it( 'uses Debian defaults for Ubuntu', () => {
-+			expect( getLinuxTrustStoreConfig( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toEqual( {
-+				trustStorePath: LINUX_TRUST_STORE_PATH,
-+				updateCommand: '/usr/sbin/update-ca-certificates',
-+			} );
-+		} );
- 
--			expect( command ).toContain( '"/home/Some User/.studio/certificates/studio-ca.crt"' );
-+		it( 'uses p11-kit anchors for Arch derivatives', () => {
-+			expect( getLinuxTrustStoreConfig( { id: 'omarchy', idLike: [ 'arch' ] } ) ).toEqual( {
-+				trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
-+				updateCommand: '/usr/bin/update-ca-trust extract',
-+			} );
- 		} );
- 	} );
- 
-diff --git a/packages/common/lib/tests/port-finder.test.ts b/packages/common/lib/tests/port-finder.test.ts
-index b8e224bb..f50f5519 100644
---- a/packages/common/lib/tests/port-finder.test.ts
-+++ b/packages/common/lib/tests/port-finder.test.ts
-@@ -34,11 +34,11 @@ describe( 'portFinder STUDIO_BASE_PORT', () => {
- 	} );
- } );
- 
--function listenOnLocalhost( port: number ): Promise< net.Server > {
-+function listenOnIpv4Loopback( port: number ): Promise< net.Server > {
- 	return new Promise( ( resolve, reject ) => {
- 		const server = net.createServer();
- 		server.once( 'error', reject );
--		server.listen( port, 'localhost', () => resolve( server ) );
-+		server.listen( port, '127.0.0.1', () => resolve( server ) );
- 	} );
- }
- 
-@@ -58,7 +58,7 @@ describe( 'portFinder availability detection', () => {
- 	it( 'skips an occupied port and returns one that is actually bindable', async () => {
- 		// Occupy an OS-assigned free port so the test never collides with a port
- 		// already in use on the machine.
--		const occupiedServer = await listenOnLocalhost( 0 );
-+		const occupiedServer = await listenOnIpv4Loopback( 0 );
- 		openServers.push( occupiedServer );
- 		const occupied = ( occupiedServer.address() as net.AddressInfo ).port;
- 
-@@ -69,6 +69,6 @@ describe( 'portFinder availability detection', () => {
- 		const port = await portFinder.getOpenPort();
- 		expect( port ).toBeGreaterThan( occupied );
- 		// Binding throws if getOpenPort handed back an occupied port.
--		openServers.push( await listenOnLocalhost( port ) );
-+		openServers.push( await listenOnIpv4Loopback( port ) );
- 	} );
- } );
 diff --git a/apps/cli/lib/tests/proxy-server.test.ts b/apps/cli/lib/tests/proxy-server.test.ts
 new file mode 100644
-index 00000000..530f6394
+index 000000000..530f6394d
 --- /dev/null
 +++ b/apps/cli/lib/tests/proxy-server.test.ts
 @@ -0,0 +1,211 @@
@@ -2343,9 +1309,127 @@ index 00000000..530f6394
 +		);
 +	} );
 +} );
+diff --git a/apps/cli/php-server-child.ts b/apps/cli/php-server-child.ts
+index 7e01abec9..97b94e5f4 100644
+--- a/apps/cli/php-server-child.ts
++++ b/apps/cli/php-server-child.ts
+@@ -458,7 +458,7 @@ function proxyRequestToPhpWorker(
+ 	req.pipe( proxyReq );
+ }
+ 
+-async function startPhpProxyServer(
++export async function startPhpProxyServer(
+ 	config: ServerConfig,
+ 	stopSignal?: AbortSignal
+ ): Promise< http.Server > {
+@@ -472,7 +472,7 @@ async function startPhpProxyServer(
+ 			proxyServer.close();
+ 			reject( new DOMException( 'Aborted', 'AbortError' ) );
+ 		} );
+-		proxyServer.listen( config.port, 'localhost', () => {
++		proxyServer.listen( config.port, '127.0.0.1', () => {
+ 			resolve();
+ 		} );
+ 	} );
+diff --git a/apps/cli/playground-server-child.ts b/apps/cli/playground-server-child.ts
+index dc14d0f22..6192dcc2d 100644
+--- a/apps/cli/playground-server-child.ts
++++ b/apps/cli/playground-server-child.ts
+@@ -10,6 +10,7 @@
+  * - Sends response back when ready
+  * - Sends activity heartbeats to prevent timeout during long operations
+  */
++import net from 'node:net';
+ import { rootCertificates } from 'node:tls';
+ import path, { dirname } from 'path';
+ import { setPhpIniEntries } from '@php-wasm/universal';
+@@ -58,6 +59,65 @@ import {
+ let server: RunCLIServer | null = null;
+ let lastCliArgs: Record< string, unknown > | null = null;
+ 
++const PLAYGROUND_LOOPBACK_HOST = '127.0.0.1';
++type MutableServerPrototype = {
++	listen: ( this: net.Server, ...args: unknown[] ) => net.Server;
++};
++let activeLoopbackBindings = 0;
++let originalServerListen: MutableServerPrototype[ 'listen' ] | null = null;
++let loopbackServerListen: MutableServerPrototype[ 'listen' ] | null = null;
++
++/**
++ * Playground CLI 3.1.45 does not expose a host option and otherwise calls
++ * server.listen(port), which binds to every interface. This child owns a single
++ * Playground operation, so confine every TCP listener created while runCLI is
++ * starting and restore Node's prototype as soon as the operation settles.
++ */
++export async function withPlaygroundCliLoopbackBinding< T >(
++	callback: () => Promise< T >
++): Promise< T > {
++	const serverPrototype = net.Server.prototype as unknown as MutableServerPrototype;
++	if ( activeLoopbackBindings === 0 ) {
++		const originalListen = serverPrototype.listen;
++		originalServerListen = originalListen;
++		loopbackServerListen = function ( ...args: unknown[] ) {
++			let loopbackArgs = args;
++			const firstArg = args[ 0 ];
++
++			if ( typeof firstArg === 'number' ) {
++				loopbackArgs =
++					typeof args[ 1 ] === 'string'
++						? [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 2 ) ]
++						: [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 1 ) ];
++			} else if (
++				typeof firstArg === 'object' &&
++				firstArg !== null &&
++				'port' in firstArg &&
++				typeof firstArg.port === 'number'
++			) {
++				loopbackArgs = [ { ...firstArg, host: PLAYGROUND_LOOPBACK_HOST }, ...args.slice( 1 ) ];
++			}
++
++			return originalListen.apply( this, loopbackArgs );
++		};
++		serverPrototype.listen = loopbackServerListen;
++	}
++
++	activeLoopbackBindings++;
++	try {
++		return await callback();
++	} finally {
++		activeLoopbackBindings--;
++		if ( activeLoopbackBindings === 0 ) {
++			if ( serverPrototype.listen === loopbackServerListen && originalServerListen ) {
++				serverPrototype.listen = originalServerListen;
++			}
++			originalServerListen = null;
++			loopbackServerListen = null;
++		}
++	}
++}
++
+ // Intercept and prefix all console output from playground-cli
+ const originalConsoleLog = console.log;
+ const originalConsoleError = console.error;
+@@ -429,7 +489,7 @@ const startServer = wrapWithStartingPromise(
+ 
+ 			const args = await getBaseRunCLIArgs( 'server', config );
+ 
+-			server = await runCLI( args );
++			server = await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
+ 
+ 			stopSignal.throwIfAborted();
+ 
+@@ -516,7 +576,7 @@ async function runBlueprint( config: ServerConfig, signal: AbortSignal ): Promis
+ 		signal.throwIfAborted();
+ 
+ 		const args = await getBaseRunCLIArgs( 'run-blueprint', config );
+-		await runCLI( args );
++		await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
+ 
+ 		signal.throwIfAborted();
+ 
 diff --git a/apps/cli/tests/php-server-child.test.ts b/apps/cli/tests/php-server-child.test.ts
 new file mode 100644
-index 00000000..c3d69f2f
+index 000000000..c3d69f2ff
 --- /dev/null
 +++ b/apps/cli/tests/php-server-child.test.ts
 @@ -0,0 +1,65 @@
@@ -2416,7 +1500,7 @@ index 00000000..c3d69f2f
 +} );
 diff --git a/apps/cli/tests/playground-server-child.test.ts b/apps/cli/tests/playground-server-child.test.ts
 new file mode 100644
-index 00000000..fdd4b95c
+index 000000000..fdd4b95c6
 --- /dev/null
 +++ b/apps/cli/tests/playground-server-child.test.ts
 @@ -0,0 +1,155 @@
@@ -2575,43 +1659,179 @@ index 00000000..fdd4b95c
 +		expect( net.Server.prototype.listen ).toBe( originalListen );
 +	} );
 +} );
+diff --git a/apps/studio/forge.config.ts b/apps/studio/forge.config.ts
+index 3742fc52b..260fc7749 100644
+--- a/apps/studio/forge.config.ts
++++ b/apps/studio/forge.config.ts
+@@ -105,7 +105,13 @@ const config: ForgeConfig = {
+ 				// dependency resolvable on both.
+ 				// ca-certificates: ships `update-ca-certificates` and the system trust bundle.
+ 				// libnss3-tools: ships `certutil`, used to import the CA into per-user NSS DBs.
+-				depends: [ 'libcap2-bin', 'pkexec | policykit-1', 'ca-certificates', 'libnss3-tools' ],
++				depends: [
++					'libcap2-bin',
++					'pkexec | policykit-1',
++					'ca-certificates',
++					'libnss3-tools',
++					'util-linux',
++				],
+ 				scripts: {
+ 					postinst: path.join( __dirname, 'installers', 'linux', 'postinst.sh' ),
+ 					postrm: path.join( __dirname, 'installers', 'linux', 'postrm.sh' ),
+diff --git a/apps/studio/installers/linux/postrm.sh b/apps/studio/installers/linux/postrm.sh
+index fc71ddad3..221b2fc67 100755
+--- a/apps/studio/installers/linux/postrm.sh
++++ b/apps/studio/installers/linux/postrm.sh
+@@ -6,12 +6,31 @@ set -e
+ case "$1" in
+ 	purge)
+ 		STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"
+-		if [ -f "$STUDIO_CA_PATH" ]; then
+-			rm -f "$STUDIO_CA_PATH"
+-			if command -v update-ca-certificates >/dev/null 2>&1; then
+-				update-ca-certificates --fresh >/dev/null || true
++		STUDIO_CA_FINGERPRINT_PATH="/usr/local/share/ca-certificates/studio-ca.crt.sha256"
++		STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"
++		(
++			umask 077
++			exec 9>"$STUDIO_CA_LOCK"
++			/usr/bin/flock -x 9
++			if [ -e "$STUDIO_CA_PATH" ] || [ -L "$STUDIO_CA_PATH" ]; then
++				[ -f "$STUDIO_CA_PATH" ] && [ ! -L "$STUDIO_CA_PATH" ]
++				[ -f "$STUDIO_CA_FINGERPRINT_PATH" ] && [ ! -L "$STUDIO_CA_FINGERPRINT_PATH" ]
++				/usr/bin/stat --format='%u:%h:%F' -- "$STUDIO_CA_PATH" | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1:regular file'
++				/usr/bin/stat --format='%u:%h:%F' -- "$STUDIO_CA_FINGERPRINT_PATH" | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1:regular file'
++				IFS= read -r STUDIO_CA_FINGERPRINT < "$STUDIO_CA_FINGERPRINT_PATH"
++				[ "${#STUDIO_CA_FINGERPRINT}" -eq 64 ]
++				case "$STUDIO_CA_FINGERPRINT" in
++					*[!0-9a-f]*) exit 1 ;;
++				esac
++				/usr/bin/printf '%s  %s\n' "$STUDIO_CA_FINGERPRINT" "$STUDIO_CA_PATH" | /usr/bin/sha256sum --check --strict --status -
++				/bin/rm -f -- "$STUDIO_CA_PATH" "$STUDIO_CA_FINGERPRINT_PATH"
++			elif [ -e "$STUDIO_CA_FINGERPRINT_PATH" ] || [ -L "$STUDIO_CA_FINGERPRINT_PATH" ]; then
++				[ -f "$STUDIO_CA_FINGERPRINT_PATH" ] && [ ! -L "$STUDIO_CA_FINGERPRINT_PATH" ]
++				/usr/bin/stat --format='%u:%h:%F' -- "$STUDIO_CA_FINGERPRINT_PATH" | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1:regular file'
++				/bin/rm -f -- "$STUDIO_CA_FINGERPRINT_PATH"
+ 			fi
+-		fi
++			/usr/sbin/update-ca-certificates --fresh >/dev/null
++		)
+ 		;;
+ esac
+ 
+diff --git a/apps/studio/src/lib/certificate-manager.ts b/apps/studio/src/lib/certificate-manager.ts
+index 304ee7532..765ba52c0 100644
+--- a/apps/studio/src/lib/certificate-manager.ts
++++ b/apps/studio/src/lib/certificate-manager.ts
+@@ -8,10 +8,13 @@ import { CERT_UNTRUSTED_ROOT, SERVER_AUTH_OID } from '@studio/common/constants';
+ import {
+ 	areAllFirefoxProfilesTrustedLinux,
+ 	buildLinuxTrustInstallCommand,
++	getLinuxTrustStoreConfig,
+ 	importCAIntoFirefoxProfilesLinux,
+ 	importCAIntoUserNssDbsLinux,
+ 	isCAImportedInUserNssDbsLinux,
+ 	isCATrustedOnLinux,
++	isLinuxTrustAnchorCurrent,
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
+ import { getCertificatesPath } from '@studio/common/lib/well-known-paths';
+ import sudo from '@vscode/sudo-prompt';
+@@ -54,12 +57,15 @@ export async function isRootCATrusted(): Promise< boolean > {
+ 			return false;
+ 		}
+ 	} else if ( process.platform === 'linux' ) {
++		const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
++		const { trustStorePath } = getLinuxTrustStoreConfig();
+ 		// The CA is fully trusted on Linux only when it lives in the system
+ 		// bundle (curl/openssl/Node), every Chromium-family NSS DB (including
+ 		// Snap-Chromium's sandboxed DB), and every existing Firefox profile
+ 		// NSS DB. Firefox profiles that don't exist yet are vacuously trusted.
+ 		return (
+-			( await isCATrustedOnLinux( CA_CERT_PATH ) ) &&
++			isLinuxTrustAnchorCurrent( certificate, trustStorePath ) &&
++			( await isCATrustedOnLinux( trustStorePath ) ) &&
+ 			( await isCAImportedInUserNssDbsLinux() ) &&
+ 			( await areAllFirefoxProfilesTrustedLinux() )
+ 		);
+@@ -103,10 +109,15 @@ export async function trustRootCA(): Promise< void > {
+ 			// otherwise we'd reprompt for the polkit password just to re-sync NSS
+ 			// (the common case when a Chromium-family browser is installed after
+ 			// the initial trust flow).
+-			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
++			const { trustStorePath } = getLinuxTrustStoreConfig();
++			const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
++			if (
++				! isLinuxTrustAnchorCurrent( certificate, trustStorePath ) ||
++				! ( await isCATrustedOnLinux( trustStorePath ) )
++			) {
+ 				await new Promise< void >( ( resolve, reject ) => {
+ 					sudo.exec(
+-						buildLinuxTrustInstallCommand( CA_CERT_PATH ),
++						buildLinuxTrustInstallCommand( certificate ),
+ 						{ name: 'WordPress Studio' },
+ 						( error ) => {
+ 							if ( error ) {
+@@ -120,15 +131,18 @@ export async function trustRootCA(): Promise< void > {
+ 					);
+ 				} );
+ 			}
++			if ( ! isLinuxTrustAnchorCurrent( certificate, trustStorePath ) ) {
++				throw new Error( 'The installed Linux trust anchor does not match the current Studio CA' );
++			}
+ 			// Always run NSS imports — they're idempotent (-D before -A) and don't
+ 			// need sudo, so re-running covers the install-browser-after-trust case.
+-			await importCAIntoUserNssDbsLinux( CA_CERT_PATH );
++			await importCAIntoUserNssDbsLinux( trustStorePath );
+ 			// Firefox keeps a per-profile NSS DB; the system + Chromium imports
+ 			// above don't reach it. Profiles that don't exist yet are skipped —
+ 			// when the user later opens Firefox for the first time, the trust
+ 			// check flips back to untrusted on refetch and the user clicks Trust
+ 			// again to import into the newly created profile.
+-			await importCAIntoFirefoxProfilesLinux( CA_CERT_PATH );
++			await importCAIntoFirefoxProfilesLinux( trustStorePath );
+ 		} else {
+ 			console.error( 'Unsupported platform for automatic certificate trust:', platform );
+ 		}
 diff --git a/apps/studio/src/lib/linux-update.ts b/apps/studio/src/lib/linux-update.ts
 new file mode 100644
-index 00000000..f4d96a90
+index 000000000..c7ee680c7
 --- /dev/null
 +++ b/apps/studio/src/lib/linux-update.ts
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,14 @@
 +export interface LinuxUpdateAction {
 +	command: string;
 +	shouldDownload: boolean;
 +}
 +
-+export function isStudioOmarchyPackage( env: NodeJS.ProcessEnv = process.env ): boolean {
-+	return Boolean( env.OMARCHY_PATH ) && env.STUDIO_OMARCHY_PACKAGE === '1';
-+}
-+
-+export function getLinuxUpdateAction(
-+	debFilename: string,
-+	env: NodeJS.ProcessEnv = process.env
-+): LinuxUpdateAction {
-+	if ( isStudioOmarchyPackage( env ) ) {
-+		return {
-+			command: 'studio-omarchy-update',
-+			shouldDownload: false,
-+		};
-+	}
-+
++// This module exists only in the Omarchy source patch. Keeping the package
++// identity in the compiled source makes update routing independent of mutable
++// launcher/session environment variables.
++export function getLinuxUpdateAction(): LinuxUpdateAction {
 +	return {
-+		command: `sudo apt install ~/Downloads/${ debFilename }`,
-+		shouldDownload: true,
++		command: '/usr/bin/studio-omarchy-update',
++		shouldDownload: false,
 +	};
 +}
+diff --git a/apps/studio/src/lib/php-error-recovery.ts b/apps/studio/src/lib/php-error-recovery.ts
+index d65123e77..0ee0d72ee 100644
+--- a/apps/studio/src/lib/php-error-recovery.ts
++++ b/apps/studio/src/lib/php-error-recovery.ts
+@@ -105,7 +105,7 @@ export async function startErrorRecovery(
+ 
+ 	await new Promise< void >( ( resolve, reject ) => {
+ 		errorServer.on( 'error', reject );
+-		errorServer.listen( port, () => resolve() );
++		errorServer.listen( port, '127.0.0.1', () => resolve() );
+ 	} );
+ 
+ 	let retrying = false;
 diff --git a/apps/studio/src/lib/tests/certificate-manager.test.ts b/apps/studio/src/lib/tests/certificate-manager.test.ts
 new file mode 100644
-index 00000000..f17b2bfc
+index 000000000..3cea4dee8
 --- /dev/null
 +++ b/apps/studio/src/lib/tests/certificate-manager.test.ts
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,153 @@
 +/**
 + * @vitest-environment node
 + */
@@ -2624,6 +1844,7 @@ index 00000000..f17b2bfc
 +	importCAIntoUserNssDbsLinux,
 +	isCAImportedInUserNssDbsLinux,
 +	isCATrustedOnLinux,
++	isLinuxTrustAnchorCurrent,
 +	readLinuxTrustCertificate,
 +} from '@studio/common/lib/linux-trust-store';
 +import sudo from '@vscode/sudo-prompt';
@@ -2653,6 +1874,7 @@ index 00000000..f17b2bfc
 +	importCAIntoUserNssDbsLinux: vi.fn(),
 +	isCAImportedInUserNssDbsLinux: vi.fn(),
 +	isCATrustedOnLinux: vi.fn(),
++	isLinuxTrustAnchorCurrent: vi.fn(),
 +	readLinuxTrustCertificate: vi.fn(),
 +} ) );
 +
@@ -2667,6 +1889,7 @@ index 00000000..f17b2bfc
 +const mockedImportCAIntoUserNssDbsLinux = vi.mocked( importCAIntoUserNssDbsLinux );
 +const mockedIsCAImportedInUserNssDbsLinux = vi.mocked( isCAImportedInUserNssDbsLinux );
 +const mockedIsCATrustedOnLinux = vi.mocked( isCATrustedOnLinux );
++const mockedIsLinuxTrustAnchorCurrent = vi.mocked( isLinuxTrustAnchorCurrent );
 +const mockedReadLinuxTrustCertificate = vi.mocked( readLinuxTrustCertificate );
 +const mockedSudoExec = vi.mocked( sudo.exec );
 +
@@ -2692,6 +1915,7 @@ index 00000000..f17b2bfc
 +		mockedImportCAIntoUserNssDbsLinux.mockReset().mockResolvedValue( undefined );
 +		mockedIsCAImportedInUserNssDbsLinux.mockReset().mockResolvedValue( false );
 +		mockedIsCATrustedOnLinux.mockReset().mockResolvedValue( false );
++		mockedIsLinuxTrustAnchorCurrent.mockReset().mockReturnValue( true );
 +		mockedReadLinuxTrustCertificate
 +			.mockReset()
 +			.mockReturnValue( Buffer.from( 'authorized CA bytes' ) );
@@ -2741,61 +1965,264 @@ index 00000000..f17b2bfc
 +		expect( mockedImportCAIntoUserNssDbsLinux ).not.toHaveBeenCalled();
 +		expect( mockedImportCAIntoFirefoxProfilesLinux ).not.toHaveBeenCalled();
 +	} );
++
++	it( 'reinstalls a trusted but stale root anchor and verifies it before browser import', async () => {
++		mockedIsCATrustedOnLinux.mockResolvedValue( true );
++		mockedIsLinuxTrustAnchorCurrent
++			.mockReturnValueOnce( false )
++			.mockReturnValueOnce( false )
++			.mockReturnValueOnce( true );
++
++		await trustRootCA();
++
++		expect( mockedSudoExec ).toHaveBeenCalledOnce();
++		expect( mockedIsLinuxTrustAnchorCurrent ).toHaveBeenLastCalledWith(
++			Buffer.from( 'authorized CA bytes' ),
++			'/usr/local/share/ca-certificates/studio-ca.crt'
++		);
++		expect( mockedImportCAIntoUserNssDbsLinux ).toHaveBeenCalledAfter(
++			mockedIsLinuxTrustAnchorCurrent
++		);
++	} );
 +} );
 diff --git a/apps/studio/src/lib/tests/linux-update.test.ts b/apps/studio/src/lib/tests/linux-update.test.ts
 new file mode 100644
-index 00000000..2d4c95c9
+index 000000000..2f6599998
 --- /dev/null
 +++ b/apps/studio/src/lib/tests/linux-update.test.ts
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,11 @@
 +import { describe, expect, it } from 'vitest';
-+import { getLinuxUpdateAction, isStudioOmarchyPackage } from 'src/lib/linux-update';
++import { getLinuxUpdateAction } from 'src/lib/linux-update';
 +
 +describe( 'linux-update', () => {
-+	it( 'detects Omarchy from its session environment', () => {
-+		expect(
-+			isStudioOmarchyPackage( {
-+				OMARCHY_PATH: '/usr/share/omarchy',
-+				STUDIO_OMARCHY_PACKAGE: '1',
-+			} )
-+		).toBe( true );
-+		expect( isStudioOmarchyPackage( { OMARCHY_PATH: '/usr/share/omarchy' } ) ).toBe( false );
-+		expect( isStudioOmarchyPackage( { STUDIO_OMARCHY_PACKAGE: '1' } ) ).toBe( false );
-+	} );
-+
-+	it( 'routes Omarchy updates through the system update command', () => {
-+		expect(
-+			getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {
-+				OMARCHY_PATH: '/usr/share/omarchy',
-+				STUDIO_OMARCHY_PACKAGE: '1',
-+			} )
-+		).toEqual( {
-+			command: 'studio-omarchy-update',
++	it( 'always routes this build through the absolute Omarchy update command', () => {
++		expect( getLinuxUpdateAction() ).toEqual( {
++			command: '/usr/bin/studio-omarchy-update',
 +			shouldDownload: false,
 +		} );
 +	} );
-+
-+	it( 'keeps the DEB installation flow on other Linux systems', () => {
-+		expect( getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {} ) ).toEqual( {
-+			command: 'sudo apt install ~/Downloads/studio-x64-v1.18.0.deb',
-+			shouldDownload: true,
-+		} );
-+	} );
-+
-+	it( 'does not change the updater for other Studio packages running on Omarchy', () => {
-+		expect(
-+			getLinuxUpdateAction( 'studio-x64-v1.18.0.deb', {
-+				OMARCHY_PATH: '/usr/share/omarchy',
-+			} )
-+		).toEqual( {
-+			command: 'sudo apt install ~/Downloads/studio-x64-v1.18.0.deb',
-+			shouldDownload: true,
-+		} );
-+	} );
 +} );
+diff --git a/apps/studio/src/lib/tests/php-error-recovery.test.ts b/apps/studio/src/lib/tests/php-error-recovery.test.ts
+index 51e8b9d55..cf17e5ff4 100644
+--- a/apps/studio/src/lib/tests/php-error-recovery.test.ts
++++ b/apps/studio/src/lib/tests/php-error-recovery.test.ts
+@@ -15,7 +15,7 @@ function getFreePort(): Promise< number > {
+ 	return new Promise( ( resolve, reject ) => {
+ 		const srv = http.createServer();
+ 		srv.once( 'error', reject );
+-		srv.listen( 0, () => {
++		srv.listen( 0, '127.0.0.1', () => {
+ 			const address = srv.address();
+ 			const port = typeof address === 'object' && address ? address.port : 0;
+ 			srv.close( () => resolve( port ) );
+@@ -27,7 +27,7 @@ function canBind( port: number ): Promise< boolean > {
+ 	return new Promise( ( resolve ) => {
+ 		const srv = http.createServer();
+ 		srv.once( 'error', () => resolve( false ) );
+-		srv.listen( port, () => srv.close( () => resolve( true ) ) );
++		srv.listen( port, '127.0.0.1', () => srv.close( () => resolve( true ) ) );
+ 	} );
+ }
+ 
+@@ -109,6 +109,7 @@ describe( 'error recovery port lifecycle', () => {
+ 	test( 'holds the port and marks the site running, then releases both on stop', async () => {
+ 		const port = await getFreePort();
+ 		const dir = fs.mkdtempSync( nodePath.join( os.tmpdir(), 'php-recovery-test-' ) );
++		const listenSpy = vi.spyOn( http.Server.prototype, 'listen' );
+ 		const siteServer = {
+ 			details: { id: 'test-site', port, path: dir } as {
+ 				id: string;
+@@ -124,6 +125,7 @@ describe( 'error recovery port lifecycle', () => {
+ 
+ 		try {
+ 			await startErrorRecovery( siteServer as never, 'Fatal error: boom', () => ( {} ) );
++			expect( listenSpy ).toHaveBeenCalledWith( port, '127.0.0.1', expect.any( Function ) );
+ 			expect( isInErrorRecovery( 'test-site' ) ).toBe( true );
+ 			// The recovery error server holds the port; the site shows as running and in recovery.
+ 			expect( await canBind( port ) ).toBe( false );
+@@ -149,6 +151,7 @@ describe( 'error recovery port lifecycle', () => {
+ 			expect( siteServer.inErrorRecovery ).toBe( false );
+ 		} finally {
+ 			await stopErrorRecovery( 'test-site' );
++			listenSpy.mockRestore();
+ 			fs.rmSync( dir, { recursive: true, force: true } );
+ 		}
+ 	} );
+diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
+index 4bb9bf6cc..f54ecf4a5 100644
+--- a/apps/studio/src/site-server.ts
++++ b/apps/studio/src/site-server.ts
+@@ -265,6 +265,7 @@ export class SiteServer {
+ 
+ 		console.log( `Starting server for '${ this.details.name }'` );
+ 		await this.server.start();
++		this.adoptRunningState( true );
+ 	}
+ 
+ 	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
+diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
+index bbc029409..3f9a444e1 100644
+--- a/apps/studio/src/tests/site-server.test.ts
++++ b/apps/studio/src/tests/site-server.test.ts
+@@ -195,5 +195,31 @@ describe( 'SiteServer', () => {
+ 				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
+ 			);
+ 		} );
++
++		it( 'marks a successful CLI start as running before it resolves', async () => {
++			mockStartServer.mockResolvedValueOnce( {
++				url: 'http://localhost:1234',
++				options: { port: 1234, phpVersion: '8.0' },
++				_internal: { mode: 'wordpress', port: 1234 },
++			} );
++
++			const server = SiteServer.register( {
++				id: 'successful-start',
++				name: 'successful-start',
++				path: '/tmp/successful-start',
++				port: 1234,
++				adminPassword: 'test-password',
++				phpVersion: '8.4',
++				running: false,
++				themeDetails: undefined,
++			} );
++
++			await server.start();
++
++			expect( server.details.running ).toBe( true );
++			if ( server.details.running ) {
++				expect( server.details.url ).toBe( 'http://localhost:1234' );
++			}
++		} );
+ 	} );
+ } );
+diff --git a/apps/studio/src/tests/updates.test.ts b/apps/studio/src/tests/updates.test.ts
+index b90c9371d..8fc417f5e 100644
+--- a/apps/studio/src/tests/updates.test.ts
++++ b/apps/studio/src/tests/updates.test.ts
+@@ -43,7 +43,7 @@ afterEach( () => {
+ } );
+ 
+ describe( 'Linux updater', () => {
+-	it( 'shows the download dialog with the install command and opens the browser on Download', async () => {
++	it( 'shows the immutable Omarchy update command without opening the DEB', async () => {
+ 		global.fetch = vi.fn().mockResolvedValue( {
+ 			status: 200,
+ 			ok: true,
+@@ -65,14 +65,12 @@ describe( 'Linux updater', () => {
+ 
+ 		const args = getLastDialogOptions();
+ 		expect( args.message ).toContain( '1.9.0' );
+-		expect( args.detail ).toContain( 'sudo apt install ~/Downloads/studio_1.9.0_arm64.deb' );
+-
+-		expect( shell.openExternal ).toHaveBeenCalledWith(
+-			'https://appscdn.example.com/path/studio_1.9.0_arm64.deb'
+-		);
++		expect( args.detail ).toContain( '/usr/bin/studio-omarchy-update' );
++		expect( args.buttons?.[ 0 ] ).toBe( 'Copy update command' );
++		expect( shell.openExternal ).not.toHaveBeenCalled();
+ 	} );
+ 
+-	it( 'copies the install command to the clipboard when the user clicks the primary button', async () => {
++	it( 'copies the absolute Omarchy update command with no package environment', async () => {
+ 		global.fetch = vi.fn().mockResolvedValue( {
+ 			status: 200,
+ 			ok: true,
+@@ -89,12 +87,9 @@ describe( 'Linux updater', () => {
+ 		await manualCheckForUpdates();
+ 
+ 		await vi.waitFor( () => {
+-			expect( shell.openExternal ).toHaveBeenCalled();
++			expect( clipboard.writeText ).toHaveBeenCalledWith( '/usr/bin/studio-omarchy-update' );
+ 		} );
+-
+-		expect( clipboard.writeText ).toHaveBeenCalledWith(
+-			'sudo apt install ~/Downloads/studio_1.9.0_arm64.deb'
+-		);
++		expect( shell.openExternal ).not.toHaveBeenCalled();
+ 	} );
+ 
+ 	it( 'does not copy to the clipboard or open the browser when the user dismisses the dialog', async () => {
+diff --git a/apps/studio/src/updates.ts b/apps/studio/src/updates.ts
+index 142b6b7a1..7f5245bfc 100644
+--- a/apps/studio/src/updates.ts
++++ b/apps/studio/src/updates.ts
+@@ -3,7 +3,7 @@ import * as Sentry from '@sentry/electron/main';
+ import { sprintf, __ } from '@wordpress/i18n';
+ import { AUTO_UPDATE_INTERVAL_MS, NIGHTLY_UPDATE_TTL_MS } from 'src/constants';
+ import { sendIpcEventToRenderer, type AppUpdateStatus } from 'src/ipc-utils';
+-import { shellOpenExternalWrapper } from 'src/lib/shell-open-external-wrapper';
++import { getLinuxUpdateAction } from 'src/lib/linux-update';
+ import { getPreferredStudioUiMode } from 'src/lib/studio-ui-mode';
+ import { isDevRelease } from 'src/lib/version-utils';
+ import { getMainWindow } from 'src/main-window';
+@@ -358,24 +358,22 @@ function rescheduleLinuxOrFinish() {
+ 	}, AUTO_UPDATE_INTERVAL_MS );
+ }
+ 
+-async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: string ) {
++async function showLinuxUpdateAvailableNotice( version: string, _downloadUrl: string ) {
+ 	const mainWindow = await getMainWindow();
+ 
+-	const command = `sudo apt install ~/Downloads/${ debFilenameFromUrl( downloadUrl ) }`;
++	const updateAction = getLinuxUpdateAction();
+ 	const actionDescription = __(
+-		'Clicking the button below will download the new package and copy the install command to your clipboard.'
+-	);
+-	const followUpInstruction = __(
+-		'Once the download finishes, quit Studio, open a terminal, and paste the command to install:'
++		'This Studio package is updated from its native Omarchy release channel.'
+ 	);
++	const followUpInstruction = __( 'Quit Studio, open a terminal, and paste:' );
+ 
+ 	const { response } = await dialog.showMessageBox( mainWindow, {
+ 		type: 'info',
+-		buttons: [ __( 'Download & copy command' ), __( 'Later' ) ],
++		buttons: [ __( 'Copy update command' ), __( 'Later' ) ],
+ 		title: __( 'New Version Available' ),
+ 		// translators: %s is the version number, e.g. "1.9.0".
+ 		message: sprintf( __( 'Studio %s is available' ), version ),
+-		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ command }`,
++		detail: `${ actionDescription }\n\n${ followUpInstruction }\n\n${ updateAction.command }`,
+ 		defaultId: 0,
+ 		cancelId: 1,
+ 	} );
+@@ -384,31 +382,7 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
+ 		return;
+ 	}
+ 
+-	try {
+-		const parsedUrl = new URL( downloadUrl );
+-		if ( ! [ 'http:', 'https:' ].includes( parsedUrl.protocol ) ) {
+-			Sentry.captureException(
+-				new Error( `Unexpected protocol in downloadUrl: ${ parsedUrl.protocol }` )
+-			);
+-			return;
+-		}
+-		clipboard.writeText( command );
+-		void shellOpenExternalWrapper( parsedUrl.toString() );
+-	} catch {
+-		Sentry.captureException( new Error( `Malformed downloadUrl: ${ downloadUrl }` ) );
+-	}
+-}
+-
+-function debFilenameFromUrl( downloadUrl: string ): string {
+-	try {
+-		const filename = new URL( downloadUrl ).pathname.split( '/' ).pop() ?? '';
+-		if ( /^[A-Za-z0-9._~+-]+\.deb$/.test( filename ) ) {
+-			return filename;
+-		}
+-	} catch {
+-		// ignore
+-	}
+-	return 'studio.deb';
++	clipboard.writeText( updateAction.command );
+ }
+ 
+ function isAppRunningFromDMG(): boolean {
 diff --git a/packages/common/lib/linux-distribution.ts b/packages/common/lib/linux-distribution.ts
 new file mode 100644
-index 00000000..7ca83c00
+index 000000000..7ca83c00d
 --- /dev/null
 +++ b/packages/common/lib/linux-distribution.ts
 @@ -0,0 +1,46 @@
@@ -2845,9 +2272,442 @@ index 00000000..7ca83c00
 +export function isArchBasedLinux( distribution: LinuxDistribution = getLinuxDistribution() ) {
 +	return [ distribution.id, ...distribution.idLike ].includes( 'arch' );
 +}
+diff --git a/packages/common/lib/linux-trust-store.ts b/packages/common/lib/linux-trust-store.ts
+index 485387ab8..c47234d05 100644
+--- a/packages/common/lib/linux-trust-store.ts
++++ b/packages/common/lib/linux-trust-store.ts
+@@ -1,15 +1,105 @@
+ import { execFile } from 'node:child_process';
+-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
++import { createHash, randomBytes, X509Certificate } from 'node:crypto';
++import {
++	closeSync,
++	constants as fsConstants,
++	existsSync,
++	fstatSync,
++	mkdirSync,
++	openSync,
++	readSync,
++	readdirSync,
++} from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+ import { promisify } from 'node:util';
++import {
++	getLinuxDistribution,
++	isArchBasedLinux,
++	type LinuxDistribution,
++} from '@studio/common/lib/linux-distribution';
+ 
+ const execFilePromise = promisify( execFile );
+ 
+ export const LINUX_SYSTEM_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt';
+ export const LINUX_TRUST_STORE_PATH = '/usr/local/share/ca-certificates/studio-ca.crt';
++export const ARCH_LINUX_TRUST_STORE_PATH =
++	'/etc/ca-certificates/trust-source/anchors/studio-ca.crt';
+ export const LINUX_NSS_NICKNAME = 'WordPress Studio CA';
+ 
++export interface LinuxTrustStoreConfig {
++	trustStorePath: string;
++	updateCommand: string;
++}
++
++const MAX_LINUX_CA_SIZE = 64 * 1024;
++const STUDIO_CA_COMMON_NAME = 'CN=WordPress Studio CA';
++const STUDIO_CA_ORGANIZATION = 'O=WordPress Studio';
++const STUDIO_CA_INSTALL_LOCK = '/run/lock/wordpress-studio-ca.lock';
++
++interface LinuxTrustCertificateFingerprints {
++	file: string;
++	der: string;
++}
++
++function validateLinuxTrustCertificate(
++	certificateBytes: Buffer
++): LinuxTrustCertificateFingerprints {
++	if ( certificateBytes.byteLength <= 0 || certificateBytes.byteLength > MAX_LINUX_CA_SIZE ) {
++		throw new Error( 'The Studio CA has an invalid size' );
++	}
++
++	const pem = certificateBytes.toString( 'utf8' );
++	const pemCertificates = pem.match(
++		/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
++	);
++	if ( pemCertificates?.length !== 1 || pem.trim() !== pemCertificates[ 0 ] ) {
++		throw new Error( 'The Studio CA must contain exactly one PEM certificate' );
++	}
++
++	let certificate: X509Certificate;
++	try {
++		certificate = new X509Certificate( certificateBytes );
++	} catch {
++		throw new Error( 'The Studio CA is not a valid X.509 certificate' );
++	}
++
++	if (
++		! certificate.ca ||
++		certificate.subject !== certificate.issuer ||
++		! certificate.checkIssued( certificate ) ||
++		! certificate.verify( certificate.publicKey )
++	) {
++		throw new Error( 'The Studio CA must be a self-signed certificate authority' );
++	}
++	if (
++		! certificate.subject.split( '\n' ).includes( STUDIO_CA_COMMON_NAME ) ||
++		! certificate.subject.split( '\n' ).includes( STUDIO_CA_ORGANIZATION )
++	) {
++		throw new Error( 'The Studio CA has an unexpected identity' );
++	}
++	return {
++		file: createHash( 'sha256' ).update( certificateBytes ).digest( 'hex' ),
++		der: certificate.fingerprint256.replace( /:/g, '' ).toLowerCase(),
++	};
++}
++
++export function getLinuxTrustStoreConfig(
++	distribution: LinuxDistribution = getLinuxDistribution()
++): LinuxTrustStoreConfig {
++	if ( isArchBasedLinux( distribution ) ) {
++		return {
++			trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
++			updateCommand: '/usr/bin/update-ca-trust extract',
++		};
++	}
++
++	return {
++		trustStorePath: LINUX_TRUST_STORE_PATH,
++		updateCommand: '/usr/sbin/update-ca-certificates',
++	};
++}
++
+ export async function isCATrustedOnLinux( caPath: string ): Promise< boolean > {
+ 	try {
+ 		await execFilePromise( 'openssl', [ 'verify', '-CAfile', LINUX_SYSTEM_CA_BUNDLE, caPath ] );
+@@ -37,8 +127,294 @@ export async function isCAImportedInUserNssDbsLinux(
+ 	return true;
+ }
+ 
+-export function buildLinuxTrustInstallCommand( caPath: string ): string {
+-	return `install -m 0644 "${ caPath }" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`;
++export function readLinuxTrustCertificate( caPath: string ): Buffer {
++	const fd = openSync(
++		caPath,
++		fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
++	);
++	try {
++		const initialStat = fstatSync( fd, { bigint: true } );
++		if ( ! initialStat.isFile() ) {
++			throw new Error( 'The Studio CA must be a regular file' );
++		}
++		if ( initialStat.size <= BigInt( 0 ) || initialStat.size > BigInt( MAX_LINUX_CA_SIZE ) ) {
++			throw new Error( 'The Studio CA has an invalid size' );
++		}
++
++		const certificate = Buffer.allocUnsafe( Number( initialStat.size ) );
++		let offset = 0;
++		while ( offset < certificate.byteLength ) {
++			const bytesRead = readSync( fd, certificate, offset, certificate.byteLength - offset, null );
++			if ( bytesRead === 0 ) {
++				throw new Error( 'The Studio CA changed while it was being read' );
++			}
++			offset += bytesRead;
++		}
++
++		const extraByte = Buffer.allocUnsafe( 1 );
++		const grewDuringRead = readSync( fd, extraByte, 0, 1, null ) !== 0;
++		const finalStat = fstatSync( fd, { bigint: true } );
++		if (
++			grewDuringRead ||
++			finalStat.size !== initialStat.size ||
++			finalStat.dev !== initialStat.dev ||
++			finalStat.ino !== initialStat.ino ||
++			finalStat.ctimeNs !== initialStat.ctimeNs ||
++			finalStat.mtimeNs !== initialStat.mtimeNs
++		) {
++			throw new Error( 'The Studio CA changed while it was being read' );
++		}
++		validateLinuxTrustCertificate( certificate );
++		return certificate;
++	} finally {
++		closeSync( fd );
++	}
++}
++
++export function isLinuxTrustAnchorCurrent( certificate: Buffer, trustStorePath: string ): boolean {
++	const fingerprints = validateLinuxTrustCertificate( certificate );
++	try {
++		if ( ! readLinuxTrustCertificate( trustStorePath ).equals( certificate ) ) {
++			return false;
++		}
++		if ( trustStorePath === ARCH_LINUX_TRUST_STORE_PATH ) {
++			return true;
++		}
++
++		const fingerprintPath = `${ trustStorePath }.sha256`;
++		const fd = openSync(
++			fingerprintPath,
++			fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
++		);
++		try {
++			const initialStat = fstatSync( fd, { bigint: true } );
++			const expected = Buffer.from( `${ fingerprints.file }\n` );
++			if ( ! initialStat.isFile() || initialStat.size !== BigInt( expected.byteLength ) ) {
++				return false;
++			}
++			const marker = Buffer.allocUnsafe( expected.byteLength );
++			let offset = 0;
++			while ( offset < marker.byteLength ) {
++				const bytesRead = readSync( fd, marker, offset, marker.byteLength - offset, null );
++				if ( bytesRead === 0 ) {
++					return false;
++				}
++				offset += bytesRead;
++			}
++			const extraByte = Buffer.allocUnsafe( 1 );
++			const grewDuringRead = readSync( fd, extraByte, 0, 1, null ) !== 0;
++			const finalStat = fstatSync( fd, { bigint: true } );
++			return (
++				! grewDuringRead &&
++				finalStat.size === initialStat.size &&
++				finalStat.dev === initialStat.dev &&
++				finalStat.ino === initialStat.ino &&
++				finalStat.ctimeNs === initialStat.ctimeNs &&
++				finalStat.mtimeNs === initialStat.mtimeNs &&
++				marker.equals( expected )
++			);
++		} finally {
++			closeSync( fd );
++		}
++	} catch {
++		return false;
++	}
++}
++
++export function buildLinuxTrustInstallCommand(
++	certificate: Buffer,
++	distribution: LinuxDistribution = getLinuxDistribution()
++): string {
++	const { trustStorePath, updateCommand } = getLinuxTrustStoreConfig( distribution );
++	const fingerprints = validateLinuxTrustCertificate( certificate );
++	const encodedCertificate = certificate.toString( 'base64' );
++	const nonce = randomBytes( 16 ).toString( 'hex' );
++	const trustStoreDirectory = path.posix.dirname( trustStorePath );
++	// Debian's package purge needs a root-owned record of the generated CA's
++	// exact bytes. Do not place a non-certificate sidecar in Arch's p11-kit
++	// anchors directory; Omarchy owns removal through its package lifecycle.
++	const fingerprintStorePath = isArchBasedLinux( distribution )
++		? undefined
++		: `${ trustStorePath }.sha256`;
++	const fingerprintDirectory = fingerprintStorePath
++		? path.posix.dirname( fingerprintStorePath )
++		: trustStoreDirectory;
++	const stagingPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.tmp` );
++	const derPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.der` );
++	const fingerprintStagingPath = path.posix.join(
++		fingerprintDirectory,
++		`.studio-ca-${ nonce }.sha256.tmp`
++	);
++	const backupCopyPath = path.posix.join(
++		trustStoreDirectory,
++		`.studio-ca-${ nonce }.backup-copy`
++	);
++	const backupPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.backup` );
++	const restorePath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.restore` );
++	const noPreviousAnchorPath = path.posix.join(
++		trustStoreDirectory,
++		`.studio-ca-${ nonce }.no-previous-anchor`
++	);
++	const fingerprintBackupCopyPath = path.posix.join(
++		fingerprintDirectory,
++		`.studio-ca-${ nonce }.sha256.backup-copy`
++	);
++	const fingerprintBackupPath = path.posix.join(
++		fingerprintDirectory,
++		`.studio-ca-${ nonce }.sha256.backup`
++	);
++	const fingerprintRestorePath = path.posix.join(
++		fingerprintDirectory,
++		`.studio-ca-${ nonce }.sha256.restore`
++	);
++	const noPreviousFingerprintPath = path.posix.join(
++		fingerprintDirectory,
++		`.studio-ca-${ nonce }.no-previous-fingerprint`
++	);
++	const fingerprintTransactionPaths = fingerprintStorePath
++		? [
++				fingerprintStagingPath,
++				fingerprintBackupCopyPath,
++				fingerprintBackupPath,
++				fingerprintRestorePath,
++				noPreviousFingerprintPath,
++		  ]
++		: [];
++	const cleanupPaths = [
++		stagingPath,
++		derPath,
++		backupCopyPath,
++		backupPath,
++		restorePath,
++		noPreviousAnchorPath,
++		...fingerprintTransactionPaths,
++	]
++		.map( ( filePath ) => `'${ filePath }'` )
++		.join( ' ' );
++	const rollbackFailureCleanupPaths = [
++		stagingPath,
++		derPath,
++		backupCopyPath,
++		restorePath,
++		...( fingerprintStorePath
++			? [ fingerprintStagingPath, fingerprintBackupCopyPath, fingerprintRestorePath ]
++			: [] ),
++	]
++		.map( ( filePath ) => `'${ filePath }'` )
++		.join( ' ' );
++	const verifyFile = ( filePath: string ) =>
++		`/usr/bin/printf '%s  %s\\n' '${ fingerprints.file }' '${ filePath }' | /usr/bin/sha256sum --check --strict --status`;
++	const verifyDer = ( filePath: string ) =>
++		`/usr/bin/openssl x509 -in '${ filePath }' -outform DER -out '${ derPath }' && /usr/bin/printf '%s  %s\\n' '${ fingerprints.der }' '${ derPath }' | /usr/bin/sha256sum --check --strict --status && /usr/bin/rm -f -- '${ derPath }'`;
++	const verifyInstalledAnchor = `${ verifyFile( trustStorePath ) } && ${ verifyDer(
++		trustStorePath
++	) }`;
++	const fingerprintMarkerHash = createHash( 'sha256' )
++		.update( `${ fingerprints.file }\n` )
++		.digest( 'hex' );
++	const verifyFingerprintMarker = ( filePath: string ) =>
++		`/usr/bin/printf '%s  %s\\n' '${ fingerprintMarkerHash }' '${ filePath }' | /usr/bin/sha256sum --check --strict --status`;
++	const preserveTarget = (
++		targetPath: string,
++		backupCopy: string,
++		backup: string,
++		noPrevious: string
++	) =>
++		`if [ -e '${ targetPath }' ] || [ -L '${ targetPath }' ]; then ` +
++		`[ -f '${ targetPath }' ] && [ ! -L '${ targetPath }' ] && ` +
++		`/usr/bin/stat --format='%u:%h' -- '${ targetPath }' | /usr/bin/grep --quiet --fixed-strings --line-regexp '0:1' && ` +
++		`/usr/bin/cp -a -- '${ targetPath }' '${ backupCopy }' && ` +
++		`/usr/bin/mv -fT -- '${ backupCopy }' '${ backup }'; else ` +
++		`/usr/bin/touch '${ noPrevious }'; fi`;
++	const restoreTarget = (
++		targetPath: string,
++		backup: string,
++		restore: string,
++		noPrevious: string
++	) =>
++		`if [ -f '${ backup }' ] && [ ! -L '${ backup }' ]; then ` +
++		`/usr/bin/cp -a -- '${ backup }' '${ restore }' && ` +
++		`/usr/bin/mv -fT -- '${ restore }' '${ targetPath }' && ` +
++		`/usr/bin/cmp --silent -- '${ backup }' '${ targetPath }'; ` +
++		`elif [ -f '${ noPrevious }' ] && [ ! -L '${ noPrevious }' ]; then ` +
++		`/usr/bin/rm -f -- '${ targetPath }' && [ ! -e '${ targetPath }' ] && ` +
++		`[ ! -L '${ targetPath }' ]; else /usr/bin/false; fi`;
++	const verifyRestoredTarget = ( targetPath: string, backup: string, noPrevious: string ) =>
++		`if [ -f '${ backup }' ] && [ ! -L '${ backup }' ]; then ` +
++		`/usr/bin/cmp --silent -- '${ backup }' '${ targetPath }'; ` +
++		`elif [ -f '${ noPrevious }' ] && [ ! -L '${ noPrevious }' ]; then ` +
++		`[ ! -e '${ targetPath }' ] && [ ! -L '${ targetPath }' ]; else /usr/bin/false; fi`;
++	const preservePreviousState =
++		preserveTarget( trustStorePath, backupCopyPath, backupPath, noPreviousAnchorPath ) +
++		( fingerprintStorePath
++			? ` && ${ preserveTarget(
++					fingerprintStorePath,
++					fingerprintBackupCopyPath,
++					fingerprintBackupPath,
++					noPreviousFingerprintPath
++			  ) }`
++			: '' );
++	const restoreFingerprint = fingerprintStorePath
++		? ` && { ${ restoreTarget(
++				fingerprintStorePath,
++				fingerprintBackupPath,
++				fingerprintRestorePath,
++				noPreviousFingerprintPath
++		  ) }; }`
++		: '';
++	const verifyRestoredFingerprint = fingerprintStorePath
++		? ` && { ${ verifyRestoredTarget(
++				fingerprintStorePath,
++				fingerprintBackupPath,
++				noPreviousFingerprintPath
++		  ) }; }`
++		: '';
++	const verifyRestoredDerivedTrust =
++		`if [ -f '${ backupPath }' ] && [ ! -L '${ backupPath }' ]; then ` +
++		`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ trustStorePath }'; ` +
++		`else /usr/bin/false; fi`;
++	const rollback =
++		`if { ${ verifyInstalledAnchor }; } && { ` +
++		restoreTarget( trustStorePath, backupPath, restorePath, noPreviousAnchorPath ) +
++		`; }${ restoreFingerprint } && ${ updateCommand } >/dev/null 2>&1 && { ` +
++		verifyRestoredTarget( trustStorePath, backupPath, noPreviousAnchorPath ) +
++		`; }${ verifyRestoredFingerprint } && { ${ verifyRestoredDerivedTrust }; }; then ` +
++		`/usr/bin/rm -f -- ${ cleanupPaths }; else ` +
++		`/usr/bin/rm -f -- ${ rollbackFailureCleanupPaths }; ` +
++		`/usr/bin/printf '%s\\n' 'Studio CA rollback needs recovery; retained transaction state beside the trust anchor.' >&2; fi; exit 1`;
++
++	return (
++		[
++			'umask 077',
++			`exec 9>'${ STUDIO_CA_INSTALL_LOCK }'`,
++			'/usr/bin/flock -x 9',
++			`/usr/bin/rm -f -- ${ cleanupPaths }`,
++			`/usr/bin/printf '%s' '${ encodedCertificate }' | /usr/bin/base64 --decode > '${ stagingPath }'`,
++			verifyFile( stagingPath ),
++			verifyDer( stagingPath ),
++			`/usr/bin/chmod 0644 '${ stagingPath }'`,
++			...( fingerprintStorePath
++				? [
++						`/usr/bin/printf '%s\\n' '${ fingerprints.file }' > '${ fingerprintStagingPath }'`,
++						verifyFingerprintMarker( fingerprintStagingPath ),
++						`/usr/bin/chmod 0644 '${ fingerprintStagingPath }'`,
++				  ]
++				: [] ),
++			preservePreviousState,
++			`/usr/bin/mv -fT -- '${ stagingPath }' '${ trustStorePath }'`,
++			...( fingerprintStorePath
++				? [ `/usr/bin/mv -fT -- '${ fingerprintStagingPath }' '${ fingerprintStorePath }'` ]
++				: [] ),
++			verifyInstalledAnchor,
++			...( fingerprintStorePath ? [ verifyFingerprintMarker( fingerprintStorePath ) ] : [] ),
++			updateCommand,
++			verifyInstalledAnchor,
++			...( fingerprintStorePath ? [ verifyFingerprintMarker( fingerprintStorePath ) ] : [] ),
++			`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ trustStorePath }'`,
++			verifyInstalledAnchor,
++			`/usr/bin/rm -f -- ${ cleanupPaths }`,
++		].join( ' && ' ) + ` || { ${ rollback }; }`
++	);
+ }
+ 
+ // Snap-Chromium uses a sandboxed NSS DB under ~/snap/chromium/, separate
+diff --git a/packages/common/lib/port-finder.ts b/packages/common/lib/port-finder.ts
+index 9da2e3b82..6d9d1cc7c 100644
+--- a/packages/common/lib/port-finder.ts
++++ b/packages/common/lib/port-finder.ts
+@@ -8,16 +8,14 @@ let searchPort = DEFAULT_PORT;
+ let openPort: number | null = null;
+ const unavailablePorts: Array< number > = [];
+ 
+-// Bind the same host the site server uses (localhost, see php-server-child.ts)
+-// so a successful probe means the server can bind the port too; probing a fixed
+-// 127.0.0.1 could disagree with the server when localhost resolves to ::1. A
+-// single bind also avoids the connect/destroy socket churn that crashed Node on
+-// Windows.
++// Bind the same literal loopback address as the site server so a successful
++// probe means the server can bind the port too. A single bind also avoids the
++// connect/destroy socket churn that crashed Node on Windows.
+ function isPortFree( portToCheck: number ): Promise< boolean > {
+ 	return new Promise( ( resolve ) => {
+ 		const server = net.createServer();
+ 		server.once( 'error', () => resolve( false ) );
+-		server.listen( portToCheck, 'localhost', () => server.close( () => resolve( true ) ) );
++		server.listen( portToCheck, '127.0.0.1', () => server.close( () => resolve( true ) ) );
+ 	} );
+ }
+ 
 diff --git a/packages/common/lib/tests/fixtures/not-a-ca.crt b/packages/common/lib/tests/fixtures/not-a-ca.crt
 new file mode 100644
-index 00000000..48f481e9
+index 000000000..48f481e91
 --- /dev/null
 +++ b/packages/common/lib/tests/fixtures/not-a-ca.crt
 @@ -0,0 +1,22 @@
@@ -2875,7 +2735,7 @@ index 00000000..48f481e9
 +-----END CERTIFICATE-----
 diff --git a/packages/common/lib/tests/fixtures/studio-ca.crt b/packages/common/lib/tests/fixtures/studio-ca.crt
 new file mode 100644
-index 00000000..16db6ca7
+index 000000000..16db6ca72
 --- /dev/null
 +++ b/packages/common/lib/tests/fixtures/studio-ca.crt
 @@ -0,0 +1,22 @@
@@ -2903,7 +2763,7 @@ index 00000000..16db6ca7
 +-----END CERTIFICATE-----
 diff --git a/packages/common/lib/tests/linux-distribution.test.ts b/packages/common/lib/tests/linux-distribution.test.ts
 new file mode 100644
-index 00000000..9d6e1768
+index 000000000..9d6e17684
 --- /dev/null
 +++ b/packages/common/lib/tests/linux-distribution.test.ts
 @@ -0,0 +1,24 @@
@@ -2931,3 +2791,535 @@ index 00000000..9d6e1768
 +		expect( isArchBasedLinux( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toBe( false );
 +	} );
 +} );
+diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/common/lib/tests/linux-trust-store.test.ts
+index c69b9ebd2..15735dbfe 100644
+--- a/packages/common/lib/tests/linux-trust-store.test.ts
++++ b/packages/common/lib/tests/linux-trust-store.test.ts
+@@ -1,17 +1,32 @@
++import { execFileSync, spawnSync } from 'node:child_process';
++import { createHash, X509Certificate } from 'node:crypto';
+ import fs from 'node:fs';
+ import os from 'node:os';
+ import path from 'node:path';
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import {
++	ARCH_LINUX_TRUST_STORE_PATH,
+ 	buildLinuxTrustInstallCommand,
+ 	getLinuxFirefoxProfileDbDirs,
+ 	getLinuxNssDbCandidates,
++	getLinuxTrustStoreConfig,
+ 	LINUX_NSS_NICKNAME,
+ 	LINUX_SYSTEM_CA_BUNDLE,
+ 	LINUX_TRUST_STORE_PATH,
++	isLinuxTrustAnchorCurrent,
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ 
+ describe( 'linux-trust-store', () => {
++	const studioCAFixturePath = path.join(
++		process.cwd(),
++		'packages/common/lib/tests/fixtures/studio-ca.crt'
++	);
++	const studioCAFixture = fs.readFileSync( studioCAFixturePath );
++	const notACAFixture = fs.readFileSync(
++		path.join( process.cwd(), 'packages/common/lib/tests/fixtures/not-a-ca.crt' )
++	);
++
+ 	describe( 'constants', () => {
+ 		it( 'targets the Debian/Ubuntu system trust bundle', () => {
+ 			expect( LINUX_SYSTEM_CA_BUNDLE ).toBe( '/etc/ssl/certs/ca-certificates.crt' );
+@@ -26,21 +41,450 @@ describe( 'linux-trust-store', () => {
+ 		} );
+ 	} );
+ 
++	it.skipIf( process.platform === 'win32' )(
++		'uses the generated critical .local name constraint in the Studio CA fixture',
++		() => {
++			const certificateText = execFileSync(
++				'openssl',
++				[ 'x509', '-in', studioCAFixturePath, '-noout', '-text' ],
++				{ encoding: 'utf8' }
++			);
++
++			expect( certificateText ).toMatch( /X509v3 Name Constraints: critical/ );
++			expect( certificateText ).toMatch( /Permitted:\s+DNS:\.local/ );
++		}
++	);
++
+ 	describe( 'buildLinuxTrustInstallCommand', () => {
+-		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
+-			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt' );
++		const certificate = studioCAFixture;
+ 
+-			expect( command ).toBe(
+-				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
++		it( 'binds the exact certificate bytes and fingerprint to a fixed Debian trust destination', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++			const fingerprint = createHash( 'sha256' ).update( certificate ).digest( 'hex' );
++			const derFingerprint = new X509Certificate( certificate ).fingerprint256
++				.replace( /:/g, '' )
++				.toLowerCase();
++
++			expect( command ).toContain( certificate.toString( 'base64' ) );
++			expect( command ).toContain( fingerprint );
++			expect( command.match( new RegExp( fingerprint, 'g' ) ) ).toHaveLength( 6 );
++			expect( command.match( new RegExp( derFingerprint, 'g' ) ) ).toHaveLength( 5 );
++			expect( command ).toContain( `'${ LINUX_TRUST_STORE_PATH }'` );
++			expect( command ).toContain( '/usr/sbin/update-ca-certificates' );
++			expect( command ).toMatch(
++				/\/usr\/local\/share\/ca-certificates\/\.studio-ca-[a-f0-9]{32}\.tmp/
+ 			);
+ 		} );
+ 
+-		it( 'quotes the source path so home directories with spaces are handled', () => {
+-			const command = buildLinuxTrustInstallCommand(
+-				'/home/Some User/.studio/certificates/studio-ca.crt'
++		it( 'does not give the privileged shell a mutable source path or expansion syntax', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).not.toContain( '/home/' );
++			expect( command ).not.toMatch( /[\r\n`$"]/ );
++		} );
++
++		it( 'restores the previous anchor and re-extracts trust after a failed replacement', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.backup/ );
++			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.no-previous-anchor/ );
++			expect( command ).toContain(
++				`/usr/bin/mv -fT -- '/usr/local/share/ca-certificates/.studio-ca-`
++			);
++			expect( command ).toMatch( /\.backup' '[^']+\.restore'/ );
++			expect( command ).toContain( '/usr/bin/cmp --silent' );
++			expect( command.match( /\/usr\/sbin\/update-ca-certificates/g ) ).toHaveLength( 2 );
++			expect( command ).toContain( "exec 9>'/run/lock/wordpress-studio-ca.lock'" );
++			expect( command ).toContain( '/usr/bin/flock -x 9' );
++			expect( command ).toMatch( /\|\| \{ if \{ \/usr\/bin\/printf/ );
++			expect( command ).toContain(
++				`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ LINUX_TRUST_STORE_PATH }'`
++			);
++			expect( command ).toMatch(
++				/\/usr\/sbin\/update-ca-certificates && \/usr\/bin\/printf[^&]+studio-ca\.crt/
++			);
++			expect( command ).toMatch(
++				/openssl verify -CAfile [^&]+studio-ca\.crt' && \/usr\/bin\/printf[^&]+studio-ca\.crt/
++			);
++			expect( command ).not.toContain( '|| true' );
++			expect( command ).toMatch(
++				/update-ca-certificates >\/dev\/null 2>&1[\s\S]+openssl verify -CAfile/
++			);
++			expect( command ).toContain(
++				'Studio CA rollback needs recovery; retained transaction state beside the trust anchor.'
++			);
++			expect( command ).toContain( 'studio-ca.crt.sha256' );
++		} );
++
++		it( 'shares the certificate transaction lock with Debian package removal', () => {
++			const debianRemovalScript = fs.readFileSync(
++				path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
++				'utf8'
++			);
++
++			expect( debianRemovalScript ).toContain( '/run/lock/wordpress-studio-ca.lock' );
++			expect( debianRemovalScript ).toContain( '/usr/bin/flock -x 9' );
++			expect( debianRemovalScript ).toContain( 'studio-ca.crt.sha256' );
++			expect( debianRemovalScript ).toContain( '/usr/bin/sha256sum --check --strict --status' );
++			expect( debianRemovalScript ).toContain( '/bin/rm -f --' );
++			expect( debianRemovalScript ).not.toMatch( /(^|\s)rm -f/ );
++			expect( debianRemovalScript ).toContain(
++				'/usr/sbin/update-ca-certificates --fresh >/dev/null'
+ 			);
++			expect( debianRemovalScript ).not.toContain( 'update-ca-certificates --fresh >/dev/null ||' );
++		} );
++
++		it.skipIf( process.platform !== 'linux' )(
++			'retries Debian trust extraction after an earlier refresh failure',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-deb-trust-retry-' ) );
++				try {
++					const caPath = path.join( tmpDir, 'studio-ca.crt' );
++					const fingerprintPath = path.join( tmpDir, 'studio-ca.crt.sha256' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					const counterPath = path.join( tmpDir, 'update-count' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const removalScriptPath = path.join( tmpDir, 'postrm.sh' );
++					fs.writeFileSync( caPath, studioCAFixture );
++					fs.writeFileSync(
++						fingerprintPath,
++						`${ createHash( 'sha256' ).update( studioCAFixture ).digest( 'hex' ) }\n`
++					);
++					fs.writeFileSync(
++						updateScript,
++						`#!/bin/sh\ncount=0\n[ ! -e '${ counterPath }' ] || read -r count <'${ counterPath }'\ncount=$((count + 1))\nprintf '%s\\n' "$count" >'${ counterPath }'\n[ "$count" -gt 1 ]\n`,
++						{ mode: 0o755 }
++					);
++					const removalScript = fs
++						.readFileSync(
++							path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
++							'utf8'
++						)
++						.replace(
++							'STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"',
++							`STUDIO_CA_PATH="${ caPath }"`
++						)
++						.replace(
++							'STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"',
++							`STUDIO_CA_LOCK="${ lockPath }"`
++						)
++						.replace(
++							'STUDIO_CA_FINGERPRINT_PATH="/usr/local/share/ca-certificates/studio-ca.crt.sha256"',
++							`STUDIO_CA_FINGERPRINT_PATH="${ fingerprintPath }"`
++						)
++						.replace( '/usr/sbin/update-ca-certificates --fresh >/dev/null', updateScript );
++					fs.writeFileSync( removalScriptPath, removalScript, { mode: 0o755 } );
++
++					const first = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
++					expect( first.status ).not.toBe( 0 );
++					expect( fs.existsSync( caPath ) ).toBe( false );
++					expect( fs.existsSync( fingerprintPath ) ).toBe( false );
++					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '1' );
++
++					const second = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
++					expect( second.status ).toBe( 0 );
++					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '2' );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it.skipIf( process.platform !== 'linux' )(
++			'does not roll back over an anchor replaced by another authorized operation and retains recovery',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-cas-test-' ) );
++				try {
++					const trustDirectory = path.join( tmpDir, 'trust' );
++					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
++					const replacementPath = path.join( tmpDir, 'replacement.crt' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					const replacement = Buffer.from( 'concurrent authorized replacement' );
++					fs.mkdirSync( trustDirectory );
++					fs.writeFileSync( trustStorePath, notACAFixture );
++					fs.writeFileSync( replacementPath, replacement );
++					fs.writeFileSync(
++						updateScript,
++						`#!/bin/sh\n/usr/bin/cp -- '${ replacementPath }' '${ trustStorePath }'\nexit 0\n`,
++						{ mode: 0o755 }
++					);
++
++					const command = buildLinuxTrustInstallCommand( certificate, {
++						id: 'ubuntu',
++						idLike: [ 'debian' ],
++					} )
++						.split( '/usr/local/share/ca-certificates/' )
++						.join( `${ trustDirectory }/` )
++						.split( '/usr/sbin/update-ca-certificates' )
++						.join( updateScript )
++						.split( '/run/lock/wordpress-studio-ca.lock' )
++						.join( lockPath );
++					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
++
++					expect( result.status ).toBe( 1 );
++					expect( fs.readFileSync( trustStorePath ) ).toEqual( replacement );
++					const recoveryFiles = fs.readdirSync( trustDirectory );
++					expect( recoveryFiles ).toContain( 'studio-ca.crt' );
++					expect( recoveryFiles.some( ( name ) => name.endsWith( '.backup' ) ) ).toBe( true );
++					expect(
++						recoveryFiles.some( ( name ) => name.endsWith( '.no-previous-fingerprint' ) )
++					).toBe( true );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it.skipIf( process.platform !== 'linux' )(
++			'preserves the previous anchor backup when rollback restoration fails',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-restore-test-' ) );
++				try {
++					const trustDirectory = path.join( tmpDir, 'trust' );
++					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const moveScript = path.join( tmpDir, 'move' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					fs.mkdirSync( trustDirectory );
++					fs.writeFileSync( trustStorePath, notACAFixture );
++					fs.writeFileSync( updateScript, '#!/bin/sh\nexit 1\n', { mode: 0o755 } );
++
++					let command = buildLinuxTrustInstallCommand( certificate, {
++						id: 'ubuntu',
++						idLike: [ 'debian' ],
++					} )
++						.split( '/usr/local/share/ca-certificates/' )
++						.join( `${ trustDirectory }/` )
++						.split( '/usr/sbin/update-ca-certificates' )
++						.join( updateScript )
++						.split( '/run/lock/wordpress-studio-ca.lock' )
++						.join( lockPath );
++					const backupPath = command.match( /'([^']+\.backup)'/ )?.[ 1 ];
++					const restorePath = command.match( /'([^']+\.restore)'/ )?.[ 1 ];
++					expect( backupPath ).toBeTypeOf( 'string' );
++					expect( restorePath ).toBeTypeOf( 'string' );
++					fs.writeFileSync(
++						moveScript,
++						`#!/bin/sh\nif [ "$3" = '${ restorePath }' ]; then exit 1; fi\nexec /usr/bin/mv "$@"\n`,
++						{ mode: 0o755 }
++					);
++					command = command.split( '/usr/bin/mv' ).join( moveScript );
++
++					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
++
++					expect( result.status ).toBe( 1 );
++					expect( fs.readFileSync( trustStorePath ) ).toEqual( certificate );
++					expect( fs.readFileSync( backupPath! ) ).toEqual( notACAFixture );
++					expect( fs.readdirSync( trustDirectory ) ).toContain( path.basename( backupPath! ) );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it( 'rejects malformed and non-CA inputs before constructing a root command', () => {
++			expect( () =>
++				buildLinuxTrustInstallCommand( Buffer.from( 'not a certificate' ), {
++					id: 'ubuntu',
++					idLike: [ 'debian' ],
++				} )
++			).toThrow( 'exactly one PEM certificate' );
++			expect( () =>
++				buildLinuxTrustInstallCommand( notACAFixture, {
++					id: 'ubuntu',
++					idLike: [ 'debian' ],
++				} )
++			).toThrow( 'self-signed certificate authority' );
++		} );
++
++		it.skipIf( process.platform !== 'linux' )(
++			'refuses to purge a Debian trust anchor whose fingerprint no longer matches',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-deb-fingerprint-' ) );
++				try {
++					const caPath = path.join( tmpDir, 'studio-ca.crt' );
++					const fingerprintPath = path.join( tmpDir, 'studio-ca.crt.sha256' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					const removalScriptPath = path.join( tmpDir, 'postrm.sh' );
++					fs.writeFileSync( caPath, studioCAFixture );
++					fs.writeFileSync( fingerprintPath, `${ '0'.repeat( 64 ) }\n` );
++					const removalScript = fs
++						.readFileSync(
++							path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
++							'utf8'
++						)
++						.replace(
++							'STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"',
++							`STUDIO_CA_PATH="${ caPath }"`
++						)
++						.replace(
++							'STUDIO_CA_FINGERPRINT_PATH="/usr/local/share/ca-certificates/studio-ca.crt.sha256"',
++							`STUDIO_CA_FINGERPRINT_PATH="${ fingerprintPath }"`
++						)
++						.replace(
++							'STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"',
++							`STUDIO_CA_LOCK="${ lockPath }"`
++						);
++					fs.writeFileSync( removalScriptPath, removalScript, { mode: 0o755 } );
++
++					const result = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
++
++					expect( result.status ).not.toBe( 0 );
++					expect( fs.readFileSync( caPath ) ).toEqual( studioCAFixture );
++					expect( fs.existsSync( fingerprintPath ) ).toBe( true );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it( 'uses the Arch trust anchor directory and update command', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'arch',
++				idLike: [],
++			} );
++
++			expect( command ).toContain( `'${ ARCH_LINUX_TRUST_STORE_PATH }'` );
++			expect( command ).toContain( '/usr/bin/update-ca-trust extract' );
++			expect( command ).not.toContain( 'studio-ca.crt.sha256' );
++			expect( command ).not.toContain( '.sha256.tmp' );
++		} );
++	} );
++
++	describe( 'readLinuxTrustCertificate', () => {
++		let tmpDir: string;
++
++		beforeEach( () => {
++			tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-source-test-' ) );
++		} );
++
++		afterEach( () => {
++			fs.rmSync( tmpDir, { recursive: true, force: true } );
++		} );
++
++		it( 'keeps the authorized bytes when the source path is replaced afterwards', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			const replacementPath = path.join( tmpDir, 'replacement.crt' );
++			const authorized = studioCAFixture;
++			const replacement = Buffer.from( 'substituted certificate bytes' );
++			fs.writeFileSync( caPath, authorized );
++			fs.writeFileSync( replacementPath, replacement );
++
++			const snapshot = readLinuxTrustCertificate( caPath );
++			fs.unlinkSync( caPath );
++			fs.symlinkSync( replacementPath, caPath );
++			const command = buildLinuxTrustInstallCommand( snapshot, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).toContain( authorized.toString( 'base64' ) );
++			expect( command ).not.toContain( replacement.toString( 'base64' ) );
++		} );
++
++		it( 'rejects a symlink instead of following it', () => {
++			const realPath = path.join( tmpDir, 'real.crt' );
++			const symlinkPath = path.join( tmpDir, 'studio-ca.crt' );
++			fs.writeFileSync( realPath, 'certificate bytes' );
++			fs.symlinkSync( realPath, symlinkPath );
++
++			expect( () => readLinuxTrustCertificate( symlinkPath ) ).toThrow();
++		} );
++
++		it( 'rejects non-regular sources', () => {
++			expect( () => readLinuxTrustCertificate( tmpDir ) ).toThrow(
++				'The Studio CA must be a regular file'
++			);
++		} );
++
++		it.skipIf( process.platform === 'win32' )(
++			'rejects a FIFO without blocking on a writer',
++			() => {
++				const fifoPath = path.join( tmpDir, 'studio-ca.crt' );
++				execFileSync( 'mkfifo', [ fifoPath ] );
++
++				expect( () => readLinuxTrustCertificate( fifoPath ) ).toThrow(
++					'The Studio CA must be a regular file'
++				);
++			}
++		);
++
++		it( 'accepts a certificate exactly at the bounded-read limit', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			const certificate = Buffer.concat( [
++				studioCAFixture,
++				Buffer.alloc( 64 * 1024 - studioCAFixture.byteLength, 0x0a ),
++			] );
++			fs.writeFileSync( caPath, certificate );
++
++			expect( readLinuxTrustCertificate( caPath ) ).toEqual( certificate );
++		} );
++
++		it( 'rejects a certificate one byte over the bounded-read limit', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			fs.writeFileSync( caPath, Buffer.alloc( 64 * 1024 + 1, 0x41 ) );
++
++			expect( () => readLinuxTrustCertificate( caPath ) ).toThrow(
++				'The Studio CA has an invalid size'
++			);
++		} );
++	} );
++
++	describe( 'isLinuxTrustAnchorCurrent', () => {
++		it( 'requires exact validated bytes at the fixed trust anchor path', () => {
++			const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-anchor-identity-' ) );
++			try {
++				const trustStorePath = path.join( tmpDir, 'studio-ca.crt' );
++				fs.writeFileSync( trustStorePath, studioCAFixture );
++				fs.writeFileSync(
++					`${ trustStorePath }.sha256`,
++					`${ createHash( 'sha256' ).update( studioCAFixture ).digest( 'hex' ) }\n`
++				);
++				expect( isLinuxTrustAnchorCurrent( studioCAFixture, trustStorePath ) ).toBe( true );
++				fs.writeFileSync( trustStorePath, notACAFixture );
++				expect( isLinuxTrustAnchorCurrent( studioCAFixture, trustStorePath ) ).toBe( false );
++			} finally {
++				fs.rmSync( tmpDir, { recursive: true, force: true } );
++			}
++		} );
++
++		it( 'requires the exact root-owned removal fingerprint on Debian-style stores', () => {
++			const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-anchor-fingerprint-' ) );
++			try {
++				const trustStorePath = path.join( tmpDir, 'studio-ca.crt' );
++				fs.writeFileSync( trustStorePath, studioCAFixture );
++				fs.writeFileSync( `${ trustStorePath }.sha256`, `${ '0'.repeat( 64 ) }\n` );
++
++				expect( isLinuxTrustAnchorCurrent( studioCAFixture, trustStorePath ) ).toBe( false );
++			} finally {
++				fs.rmSync( tmpDir, { recursive: true, force: true } );
++			}
++		} );
++	} );
++
++	describe( 'getLinuxTrustStoreConfig', () => {
++		it( 'uses Debian defaults for Ubuntu', () => {
++			expect( getLinuxTrustStoreConfig( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toEqual( {
++				trustStorePath: LINUX_TRUST_STORE_PATH,
++				updateCommand: '/usr/sbin/update-ca-certificates',
++			} );
++		} );
+ 
+-			expect( command ).toContain( '"/home/Some User/.studio/certificates/studio-ca.crt"' );
++		it( 'uses p11-kit anchors for Arch derivatives', () => {
++			expect( getLinuxTrustStoreConfig( { id: 'omarchy', idLike: [ 'arch' ] } ) ).toEqual( {
++				trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
++				updateCommand: '/usr/bin/update-ca-trust extract',
++			} );
+ 		} );
+ 	} );
+ 
+diff --git a/packages/common/lib/tests/port-finder.test.ts b/packages/common/lib/tests/port-finder.test.ts
+index b8e224bbf..f50f5519e 100644
+--- a/packages/common/lib/tests/port-finder.test.ts
++++ b/packages/common/lib/tests/port-finder.test.ts
+@@ -34,11 +34,11 @@ describe( 'portFinder STUDIO_BASE_PORT', () => {
+ 	} );
+ } );
+ 
+-function listenOnLocalhost( port: number ): Promise< net.Server > {
++function listenOnIpv4Loopback( port: number ): Promise< net.Server > {
+ 	return new Promise( ( resolve, reject ) => {
+ 		const server = net.createServer();
+ 		server.once( 'error', reject );
+-		server.listen( port, 'localhost', () => resolve( server ) );
++		server.listen( port, '127.0.0.1', () => resolve( server ) );
+ 	} );
+ }
+ 
+@@ -58,7 +58,7 @@ describe( 'portFinder availability detection', () => {
+ 	it( 'skips an occupied port and returns one that is actually bindable', async () => {
+ 		// Occupy an OS-assigned free port so the test never collides with a port
+ 		// already in use on the machine.
+-		const occupiedServer = await listenOnLocalhost( 0 );
++		const occupiedServer = await listenOnIpv4Loopback( 0 );
+ 		openServers.push( occupiedServer );
+ 		const occupied = ( occupiedServer.address() as net.AddressInfo ).port;
+ 
+@@ -69,6 +69,6 @@ describe( 'portFinder availability detection', () => {
+ 		const port = await portFinder.getOpenPort();
+ 		expect( port ).toBeGreaterThan( occupied );
+ 		// Binding throws if getOpenPort handed back an occupied port.
+-		openServers.push( await listenOnLocalhost( port ) );
++		openServers.push( await listenOnIpv4Loopback( port ) );
+ 	} );
+ } );
