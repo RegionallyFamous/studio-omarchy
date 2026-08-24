@@ -622,7 +622,9 @@ hover_active_tooltip() {
   if (( start > end )); then step=-14; else step=14; fi
   for (( x = start; step < 0 ? x >= end : x <= end; x += step )); do
     move_pointer_exactly "$x" "$y" "$label"
-    sleep 0.35
+    # Base UI tooltips open after 600ms by default. Dwell beyond that contract
+    # so the OCR check never races the popup animation on a fast guest.
+    sleep 0.8
     if screen_contains "$tooltip"; then
       pointer_is_near "$x" "$y" || fail "$label" 'cursor moved after the tooltip appeared'
       ready_name=${label,,}
@@ -1441,7 +1443,7 @@ create_https_site_with_pointer() {
 }
 
 complete_first_site_orientation() {
-  # Studio 1.18 keeps all three guide pages mounted in one fixed centered dialog.
+  # Studio keeps all three guide pages mounted in one fixed centered dialog.
   # Tesseract drops its tiny white-on-blue labels, so target the fixed dialog
   # from the active-window center and guard every click
   # with the exact heading before it and the exact next state after it.
@@ -1740,31 +1742,39 @@ pass 'Studio trust preserves unrelated Chromium and Firefox certificates'
 STUDIO_CA_HASH=$(sha256sum "$STUDIO_CA_PATH" | cut -d ' ' -f 1)
 screenshot 'success-studio-07-first-site-running'
 
-click_active_relative_control 35 14 'the site Settings tab is clicked'
+click_active_phrase 'Settings' '20 5 50 25' 'the visible site Settings tab is clicked'
 wait_until 'the Settings tab renders PHP version controls' 20 screen_contains 'PHP version'
 wait_until 'the Settings tab renders the custom HTTPS domain' 20 screen_contains "$SITE_ONE_DOMAIN"
 wait_until 'the Settings tab reports HTTPS enabled' 20 screen_contains 'Enabled'
 screen_absent 'Trust Certificate' || fail 'the fully trusted HTTPS site exposes no stale Trust Certificate action'
 pass 'the Settings tab reports the custom domain as fully trusted HTTPS'
 screenshot 'success-studio-08-settings-tab'
-click_active_relative_control 41 14 'the site Debugging tab is clicked'
+click_active_phrase 'Debugging' '20 5 50 25' 'the visible site Debugging tab is clicked'
 wait_until 'the Debugging tab renders Xdebug controls' 20 screen_contains 'Xdebug'
 screenshot 'success-studio-09-debugging-tab'
-click_active_relative_control 29 14 'the site Overview tab is clicked'
-wait_until 'the Overview tab renders Customize controls' 20 screen_contains 'Customize'
+click_active_phrase 'Overview' '20 5 50 25' 'the visible site Overview tab is clicked'
+wait_until 'the Overview tab renders Studio 1.19 Shortcuts' 20 screen_contains 'Shortcuts'
 
-click_active_relative_control 55 95 'the initially visible in-app preview is hidden with the pointer'
+click_active_tooltip 'Hide preview' 95 60 50 \
+  'the initially visible in-app preview Hide preview control is clicked with the pointer'
 wait_until 'the initial in-app preview pane is hidden' 20 \
   active_region_absent 'Hello world' '55 12 100 90'
-pass 'the in-app preview begins its explicit toggle sequence hidden'
-click_active_relative_control 97 95 'the in-app Show preview control is clicked with the pointer'
+click_active_tooltip 'Show preview' 95 100 90 \
+  'the hidden in-app preview exposes and clicks its Show preview control'
 wait_until 'the in-app preview renders the site in its right pane' 60 active_region_contains "$SITE_ONE_NAME" '55 12 100 95'
 screenshot 'success-studio-10-preview-shown'
-click_active_relative_control 60 7 'the in-app preview Refresh control is clicked with the pointer'
+click_active_tooltip 'Refresh' 7 55 65 \
+  'the visible in-app preview Refresh control is clicked with the pointer'
 wait_until 'the refreshed preview keeps the site serving' 30 site_frontend_ready "$SITE_ONE_PORT"
-click_active_relative_control 55 95 'the in-app Hide preview control is clicked with the pointer'
+wait_until 'the refreshed preview keeps the site title in its right pane' 30 \
+  active_region_contains "$SITE_ONE_NAME" '55 12 100 95'
+click_active_tooltip 'Hide preview' 95 60 50 \
+  'the visible in-app preview Hide preview control is clicked with the pointer'
 wait_until 'the in-app preview returns to its hidden state' 20 \
   active_region_absent 'Hello world' '55 12 100 90'
+hover_active_tooltip 'Show preview' 95 100 90 \
+  'the hidden in-app preview returns to its Show preview control' >/dev/null
+pass 'the hidden in-app preview returns to its Show preview control'
 screenshot 'success-studio-11-preview-hidden'
 
 click_active_phrase 'Open site' '25 10 60 75' 'the external Open site control is clicked with the pointer'
@@ -1779,7 +1789,8 @@ close_browser_windows
 wait_until 'the external browser closes' 30 browser_window_absent
 wait_until 'focus returns to Studio' 20 active_window_matches "$STUDIO_CLASS"
 
-click_active_relative_control 17 3 'the sidebar Add site icon button is clicked with the pointer'
+click_active_tooltip 'Add site' 3 25 12 \
+  'the sidebar Add site icon button is identified and clicked with the pointer'
 wait_until 'the second Add a site screen appears' 20 screen_contains 'Create a new site'
 create_site_with_pointer "$SITE_TWO_NAME" 'second' "$HOME/Studio/omarchy-acceptance-two"
 wait_until 'the second site creation leaves its progress form' 120 screen_absent 'Creating site'
@@ -1864,14 +1875,17 @@ for site_name in "$SITE_TWO_NAME" "$SITE_ONE_NAME"; do
   click_active_site_row "$site_row" "the $site_name menu is opened for deletion" right false
   click_active_site_delete_action "$site_row" "the $site_name Delete site menu action is clicked"
   wait_until "the Delete $site_name confirmation appears" 20 screen_contains "Delete $site_name"
+  wait_until "Studio remains active for the $site_name confirmation" 20 \
+    active_window_matches "$STUDIO_CLASS"
   screenshot "ready-delete-${site_name// /-}"
-  # The fixed 560px confirmation dialog centers its destructive button 212px
-  # right and 56px below the active window center. Its red label is otherwise
-  # a recurring Tesseract false negative despite being plainly rendered.
   if [[ $site_name == "$SITE_ONE_NAME" ]]; then
     revoke_polkit_temporary_authorizations
   fi
-  click_active_centered_control 212 56 "the $site_name deletion is confirmed with the pointer"
+  # Restrict OCR to the dialog footer's lower-right quadrant. The checkbox also
+  # begins with "Delete site", but it lives left of this region; the destructive
+  # button is therefore the only exact visible target accepted here.
+  click_screen_phrase 'Delete site' '50 50 75 80' \
+    "the $site_name visible bottom-right Delete site button is clicked with the pointer"
   if [[ $site_name == "$SITE_ONE_NAME" ]]; then
     finish_custom_domain_site_deletion "$site_name" "$site_path" "$site_id"
   else
