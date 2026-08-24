@@ -206,6 +206,7 @@ Panel {
           width: parent.width
           bordered: true
           enabled: root.installed
+          opacity: enabled ? 1 : 0.45
           hasCursor: root.actionIndex === 1
           text: "Launch Studio"
           onHovered: function(isHovered) {
@@ -218,6 +219,7 @@ Panel {
           width: parent.width
           bordered: true
           enabled: root.installed
+          opacity: enabled ? 1 : 0.45
           hasCursor: root.actionIndex === 2
           text: "Remove Studio"
           onHovered: function(isHovered) {
