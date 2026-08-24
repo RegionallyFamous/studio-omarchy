@@ -1011,7 +1011,7 @@ find_current_package_handoff_pid() {
 real_root_handoff_present() {
   local run_root=$1
 
-  pgrep -f "[s]udo /usr/bin/bash -p -s -- $run_root/privileged-handoff" >/dev/null
+  pgrep -f "[s]udo /usr/bin/bash -p -s -- $run_root" >/dev/null
 }
 
 verified_package_handoff_present() {

@@ -37,6 +37,11 @@ test('guest executes the exact installer handoff as root without exposing host p
   assert.match(exercise, /expect_rejection "\$run_root\/oversize\/\$package_name"/)
   assert.match(exercise, /\$status == 1 && ! -e \$marker && ! -L \$marker/)
   assert.match(
+    acceptance,
+    /real_root_handoff_present\(\)[\s\S]*pgrep -f "\[s\]udo \/usr\/bin\/bash -p -s -- \$run_root"/
+  )
+  assert.doesNotMatch(acceptance, /\$run_root\/privileged-handoff" >\/dev\/null/)
+  assert.match(
     exercise,
     /omarchy-launch-floating-terminal-with-presentation" "\$terminal_command"[\s\\]*>\/dev\/null 2>&1 &[\s\S]*launcher_pid=\$!/
   )
