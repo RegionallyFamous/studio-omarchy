@@ -75,6 +75,8 @@ test('external Studio builds cannot rewrite trusted packaging or verification po
   assert.match(buildWorkflow, /terminate_user_processes builder/)
   assert.match(buildWorkflow, /terminate_user_processes packager/)
   assert.match(buildWorkflow, /pgrep --uid "\$account_uid"/)
+  assert.match(buildWorkflow, /ps -eo uid=,stat=,pid=,ppid=,args=/)
+  assert.match(buildWorkflow, /\$2 !~ \/\^Z\//)
 
   const pinnedMetadata = buildWorkflow.indexOf(
     'download_root_bounded "$upstream_raw_url/package-lock.json"',

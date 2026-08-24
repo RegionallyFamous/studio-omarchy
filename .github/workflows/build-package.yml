@@ -112,7 +112,7 @@ jobs:
           }
 
           terminate_user_processes() {
-            local account=$1 account_uid attempt
+            local account=$1 account_uid attempt live_processes
 
             account_uid=$(id -u "$account")
             for (( attempt = 0; attempt < 50; attempt++ )); do
@@ -120,9 +120,18 @@ jobs:
               if ! pgrep --uid "$account_uid" >/dev/null 2>&1; then
                 return 0
               fi
+              live_processes=$(
+                /usr/bin/ps -eo uid=,stat=,pid=,ppid=,args= |
+                  /usr/bin/awk -v expected_uid="$account_uid" \
+                    '$1 == expected_uid && $2 !~ /^Z/ { print }'
+              )
+              [[ -z $live_processes ]] && return 0
               sleep 0.1
             done
             pgrep --list-full --uid "$account_uid" >&2 || true
+            /usr/bin/ps -eo uid=,stat=,pid=,ppid=,args= |
+              /usr/bin/awk -v expected_uid="$account_uid" \
+                '$1 == expected_uid && $2 !~ /^Z/ { print }' >&2 || true
             fail "Processes owned by isolated account $account survived forced cleanup."
           }
 
