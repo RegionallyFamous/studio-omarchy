@@ -1008,6 +1008,12 @@ find_current_package_handoff_pid() {
   printf '%s\n' "$match"
 }
 
+real_root_handoff_present() {
+  local run_root=$1
+
+  pgrep -f "[s]udo /usr/bin/bash -p -s -- $run_root/privileged-handoff" >/dev/null
+}
+
 verified_package_handoff_present() {
   find_current_package_handoff_pid >/dev/null
 }
@@ -1125,7 +1131,7 @@ exercise_real_privileged_handoff() {
   local package_name='wordpress-studio-omarchy-0.0.1-1-x86_64.pkg.tar.zst'
   local safe_source safe_bytes safe_hash oversize_hash handoff_script handoff_encoded handoff_hash
   local fake_pacman fake_pacman_encoded root_driver root_driver_encoded terminal_command result
-  local acceptance_uid acceptance_gid installed_package_before_handoff
+  local acceptance_uid acceptance_gid installed_package_before_handoff launcher_pid
 
   safe_source="$run_root/safe/$package_name"
   result="$run_root/result"
@@ -1308,9 +1314,12 @@ ROOT_DRIVER
 
   sudo -K
   "$OMARCHY_PATH/bin/omarchy-launch-floating-terminal-with-presentation" "$terminal_command" \
-    >/dev/null 2>&1
+    >/dev/null 2>&1 &
+  launcher_pid=$!
   wait_until 'the real-root installer handoff terminal opens' 30 window_present "$TERMINAL_CLASS"
   wait_until 'the real-root installer handoff terminal owns focus' 30 active_window_matches "$TERMINAL_CLASS"
+  wait_until 'the real-root installer reaches its exact sudo handoff' 30 \
+    real_root_handoff_present "$run_root"
   wtype 'omarchy'
   wtype -k Return
   wait_until 'the exact installer handoff completes its isolated real-root cases' 90 test -s "$result"
@@ -1321,6 +1330,8 @@ ROOT_DRIVER
   screenshot 'success-studio-03b-real-root-handoff'
   wtype -k space
   wait_until 'the real-root installer handoff terminal closes' 30 window_absent "$TERMINAL_CLASS"
+  wait_until 'the real-root installer presentation process exits' 30 pid_nonrunnable "$launcher_pid"
+  wait "$launcher_pid"
   [[ $(pacman -Q "$PACKAGE_NAME") == "$installed_package_before_handoff" ]] ||
     fail 'the isolated real-root handoff leaves the installed package state unchanged'
 }

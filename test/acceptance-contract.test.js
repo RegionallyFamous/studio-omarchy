@@ -38,6 +38,14 @@ test('guest executes the exact installer handoff as root without exposing host p
   assert.match(exercise, /\$status == 1 && ! -e \$marker && ! -L \$marker/)
   assert.match(
     exercise,
+    /omarchy-launch-floating-terminal-with-presentation" "\$terminal_command"[\s\\]*>\/dev\/null 2>&1 &[\s\S]*launcher_pid=\$!/
+  )
+  assert.match(
+    exercise,
+    /real_root_handoff_present "\$run_root"[\s\S]*wtype 'omarchy'[\s\S]*wait_until 'the real-root installer presentation process exits' 30 pid_nonrunnable "\$launcher_pid"[\s\S]*wait "\$launcher_pid"/
+  )
+  assert.match(
+    exercise,
     /\[\[ \$\(\/usr\/bin\/sha256sum \/usr\/bin\/pacman\) == "\$host_pacman_hash  \/usr\/bin\/pacman" \]\]/
   )
 })
