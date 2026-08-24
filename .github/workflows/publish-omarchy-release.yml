@@ -31,10 +31,13 @@ jobs:
       package_name: ${{ steps.release.outputs.package_name }}
       checksum_name: ${{ steps.release.outputs.checksum_name }}
       release_exists: ${{ steps.release.outputs.release_exists }}
+      source_tag: ${{ steps.release.outputs.source_tag }}
+      trigger_commit: ${{ steps.release.outputs.trigger_commit }}
       should_build: ${{ steps.release.outputs.should_build }}
     env:
       GH_TOKEN: ${{ github.token }}
       INPUT_VERSION: ${{ inputs.version }}
+      TRIGGER_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -45,38 +48,199 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ $GITHUB_REF != "refs/heads/main" ]]; then
-            echo 'Studio packages may be published only from the main branch.' >&2
+          fail() {
+            echo "$*" >&2
             exit 1
+          }
+
+          resolve_remote_tag() {
+            local tag=$1 target
+
+            target=$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk 'NR == 1 { print $1 }')
+            if [[ -z $target ]]; then
+              target=$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')
+            fi
+            [[ $target =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s\n' "$target"
+          }
+
+          resolve_revision_source() {
+            local expected_version=$1 expected_pkgrel=$2 candidate_tag candidate_target
+            local pkgbuild_file tag_pkgrel tag_version
+
+            candidate_tag="$release_tag-r$expected_pkgrel"
+            candidate_target=$(resolve_remote_tag "$candidate_tag" || true)
+            if [[ -z $candidate_target ]]; then
+              candidate_tag=$release_tag
+              candidate_target=$(resolve_remote_tag "$candidate_tag") ||
+                fail "Release $release_tag package revision $expected_pkgrel has no immutable source tag."
+            fi
+            pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-source-pkgbuild.XXXXXXXXXX")
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
+              >"$pkgbuild_file"
+            (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
+              fail "Source tag $candidate_tag has an oversized package recipe."
+            tag_version=$(sed -n 's/^pkgver=//p' "$pkgbuild_file")
+            tag_pkgrel=$(sed -n 's/^pkgrel=//p' "$pkgbuild_file")
+            [[ $tag_version == "$expected_version" && $tag_pkgrel == "$expected_pkgrel" ]] ||
+              fail "Source tag $candidate_tag does not declare Studio $expected_version-$expected_pkgrel."
+            resolved_source_tag=$candidate_tag
+            resolved_source_commit=$candidate_target
+          }
+
+          verify_release_assets() {
+            local release_file=$1 expected_version=$2 expected_pkgrel=$3
+            local asset_count=0 asset_name asset_id asset_digest asset_size
+            local checksum_file checksum_hash checksum_name checksum_extra
+            local checksum_digest checksum_id checksum_size package_digest package_id package_size
+            local pkgrel suffix source_tag tag_target
+            declare -A checksum_digests=() checksum_ids=() checksum_sizes=()
+            declare -A package_digests=() package_ids=() package_sizes=()
+
+            while IFS=$'\t' read -r asset_name asset_id asset_digest asset_size; do
+              [[ -n $asset_name ]] || continue
+              asset_count=$((asset_count + 1))
+              if [[ ! $asset_name =~ ^wordpress-studio-omarchy-([0-9]+\.[0-9]+\.[0-9]+)-([1-9][0-9]*)-x86_64\.pkg\.tar\.zst(\.sha256)?$ ]]; then
+                fail "Release $release_tag contains an unexpected asset: $asset_name"
+              fi
+              [[ ${BASH_REMATCH[1]} == "$expected_version" ]] ||
+                fail "Release $release_tag mixes package versions."
+              pkgrel=${BASH_REMATCH[2]}
+              suffix=${BASH_REMATCH[3]}
+              (( pkgrel <= expected_pkgrel )) ||
+                fail "Release $release_tag contains package revision $pkgrel above repository revision $expected_pkgrel."
+              [[ $asset_id =~ ^[1-9][0-9]*$ && $asset_digest =~ ^sha256:[0-9a-f]{64}$ &&
+                $asset_size =~ ^[1-9][0-9]*$ ]] ||
+                fail "Release $release_tag has incomplete integrity metadata for $asset_name."
+              if [[ $suffix == '.sha256' ]]; then
+                [[ -z ${checksum_ids[$pkgrel]:-} ]] ||
+                  fail "Release $release_tag contains a duplicate checksum for revision $pkgrel."
+                (( asset_size <= 512 )) ||
+                  fail "Release $release_tag checksum for revision $pkgrel exceeds its byte budget."
+                checksum_ids[$pkgrel]=$asset_id
+                checksum_digests[$pkgrel]=${asset_digest#sha256:}
+                checksum_sizes[$pkgrel]=$asset_size
+              else
+                [[ -z ${package_ids[$pkgrel]:-} ]] ||
+                  fail "Release $release_tag contains a duplicate package for revision $pkgrel."
+                (( asset_size <= 2147483648 )) ||
+                  fail "Release $release_tag package revision $pkgrel exceeds its byte budget."
+                package_ids[$pkgrel]=$asset_id
+                package_digests[$pkgrel]=${asset_digest#sha256:}
+                package_sizes[$pkgrel]=$asset_size
+              fi
+            done < <(
+              jq -r '.assets[]? | [.name, (.id | tostring), (.digest // ""), (.size | tostring)] | @tsv' \
+                "$release_file"
+            )
+
+            release_pair_count=0
+            expected_pair_present=false
+            if (( asset_count == 0 )); then
+              return 0
+            fi
+            (( ${#package_ids[@]} == ${#checksum_ids[@]} )) ||
+              fail "Release $release_tag contains an incomplete package/checksum set."
+
+            mapfile -t release_pkgrels < <(printf '%s\n' "${!package_ids[@]}" | sort -n)
+            release_pair_count=${#release_pkgrels[@]}
+            checksum_root=$(mktemp -d "$RUNNER_TEMP/studio-release-checksums.XXXXXXXXXX")
+            for pkgrel in "${release_pkgrels[@]}"; do
+              package_id=${package_ids[$pkgrel]}
+              package_digest=${package_digests[$pkgrel]}
+              package_size=${package_sizes[$pkgrel]}
+              checksum_id=${checksum_ids[$pkgrel]:-}
+              checksum_digest=${checksum_digests[$pkgrel]:-}
+              checksum_size=${checksum_sizes[$pkgrel]:-}
+              [[ -n $checksum_id && -n $checksum_digest && -n $checksum_size ]] ||
+                fail "Release $release_tag has no checksum for revision $pkgrel."
+
+              checksum_file="$checksum_root/$pkgrel.sha256"
+              gh api -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$checksum_id" >"$checksum_file"
+              [[ $(wc -c <"$checksum_file") == "$checksum_size" ]] ||
+                fail "Release $release_tag checksum size changed for revision $pkgrel."
+              [[ $(sha256sum "$checksum_file" | cut -d ' ' -f 1) == "$checksum_digest" ]] ||
+                fail "Release $release_tag checksum asset digest changed for revision $pkgrel."
+              IFS=' ' read -r checksum_hash checksum_name checksum_extra <"$checksum_file" || true
+              [[ $checksum_hash == "$package_digest" &&
+                $checksum_name == "wordpress-studio-omarchy-$expected_version-$pkgrel-x86_64.pkg.tar.zst" &&
+                -z ${checksum_extra:-} ]] ||
+                fail "Release $release_tag checksum does not identify package revision $pkgrel exactly."
+
+              resolve_revision_source "$expected_version" "$pkgrel"
+              source_tag=$resolved_source_tag
+              tag_target=$resolved_source_commit
+
+              if [[ $pkgrel == "$expected_pkgrel" ]]; then
+                expected_pair_present=true
+                expected_source_tag=$source_tag
+                expected_source_commit=$tag_target
+              fi
+              : "$package_id" "$package_size"
+            done
+          }
+
+          if [[ $GITHUB_REF != "refs/heads/main" ]]; then
+            fail 'Studio packages may be published only from the main branch.'
           fi
+          [[ $TRIGGER_COMMIT =~ ^[0-9a-f]{40}$ ]] || fail 'The triggering commit is invalid.'
+          [[ $(git rev-parse HEAD) == "$TRIGGER_COMMIT" ]] ||
+            fail 'The release checkout does not match the triggering commit.'
+          remote_main=$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')
+          [[ $remote_main == "$TRIGGER_COMMIT" ]] ||
+            fail 'origin/main moved after this release workflow started; run it again from current main.'
+
+          latest_release=$(gh api repos/Automattic/studio/releases/latest)
+          latest_tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' \
+            <<<"$latest_release") || fail 'Automattic has no valid latest stable Studio release.'
 
           if [[ -n ${INPUT_VERSION:-} ]]; then
             version=$INPUT_VERSION
             upstream_tag="v$version"
-            gh api "repos/Automattic/studio/git/ref/tags/$upstream_tag" >/dev/null
+            upstream_release=$(gh api "repos/Automattic/studio/releases/tags/$upstream_tag") ||
+              fail "Studio $version is not a published upstream release."
           else
-            upstream_tag=$(gh api repos/Automattic/studio/releases/latest --jq .tag_name)
+            upstream_release=$latest_release
+            upstream_tag=$latest_tag
             version=${upstream_tag#v}
           fi
 
           if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Unsupported Studio release version: $version" >&2
-            exit 1
+            fail "Unsupported Studio release version: $version"
           fi
+          jq -e --arg tag "$upstream_tag" '
+            .tag_name == $tag and
+            .draft == false and
+            .prerelease == false and
+            (.published_at | type == "string" and length > 0)
+          ' <<<"$upstream_release" >/dev/null ||
+            fail "Studio $version is not a non-prerelease published upstream release."
+          [[ $upstream_tag == "$latest_tag" ]] ||
+            fail "Refusing to publish Studio $version as latest; Automattic's latest stable release is ${latest_tag#v}."
+
           upstream_commit=$(gh api "repos/Automattic/studio/commits/$upstream_tag" --jq .sha)
           if [[ ! $upstream_commit =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Unsupported Studio release commit: $upstream_commit" >&2
-            exit 1
+            fail "Unsupported Studio release commit: $upstream_commit"
           fi
 
           repo_version=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
           repo_pkgrel=$(sed -n 's/^pkgrel=//p' packaging/arch/PKGBUILD)
           if [[ ! $repo_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
             ! $repo_pkgrel =~ ^[1-9][0-9]*$ ]]; then
-            echo 'The repository package version is invalid.' >&2
-            exit 1
+            fail 'The repository package version is invalid.'
+          fi
+          repo_upstream_commit=$(<packaging/arch/upstream-commit)
+          [[ $repo_upstream_commit =~ ^[0-9a-f]{40}$ ]] ||
+            fail 'The repository upstream commit pin is invalid.'
+          oldest_version=$(printf '%s\n' "$repo_version" "$version" | sort -V | head -n 1)
+          if [[ $version != "$repo_version" && $oldest_version == "$version" ]]; then
+            fail "Refusing to downgrade the repository from Studio $repo_version to $version."
           fi
           if [[ $version == "$repo_version" ]]; then
+            [[ $repo_upstream_commit == "$upstream_commit" ]] ||
+              fail "Upstream release tag $upstream_tag no longer matches the repository's immutable commit pin."
             pkgrel=$repo_pkgrel
           else
             pkgrel=1
@@ -86,25 +250,35 @@ jobs:
           package_name="wordpress-studio-omarchy-$version-$pkgrel-x86_64.pkg.tar.zst"
           checksum_name="$package_name.sha256"
           release_exists=false
+          source_tag=$release_tag
           should_build=true
+          expected_pair_present=false
+          expected_source_tag=''
+          expected_source_commit=''
+          release_pair_count=0
 
-          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          release_file="$RUNNER_TEMP/studio-release.json"
+          release_error="$RUNNER_TEMP/studio-release-error.log"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" \
+            >"$release_file" 2>"$release_error"; then
             release_exists=true
-            asset_names=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets[].name')
-            package_count=$(grep -Fxc -- "$package_name" <<<"$asset_names" || true)
-            checksum_count=$(grep -Fxc -- "$checksum_name" <<<"$asset_names" || true)
-            if (( package_count > 1 || checksum_count > 1 )); then
-              echo "Release $release_tag contains duplicate immutable assets." >&2
-              exit 1
-            fi
-            if (( package_count != checksum_count )); then
-              echo "Release $release_tag contains an incomplete immutable package pair." >&2
-              exit 1
-            fi
-            if (( package_count == 1 )); then
+            jq -e --arg tag "$release_tag" '
+              .tag_name == $tag and .draft == false and .prerelease == false
+            ' "$release_file" >/dev/null || fail "Release $release_tag is not a published stable Omarchy release."
+            verify_release_assets "$release_file" "$version" "$pkgrel"
+            if [[ $expected_pair_present == true ]]; then
+              [[ $expected_source_commit == "$TRIGGER_COMMIT" ]] ||
+                fail "Existing package $package_name belongs to $expected_source_tag at $expected_source_commit, not triggering commit $TRIGGER_COMMIT. Increment pkgrel before publishing changed source."
+              source_tag=$expected_source_tag
               should_build=false
+            elif [[ $(jq -r '.immutable // false' "$release_file") == true ]]; then
+              fail "Release $release_tag is immutable and cannot accept package revision $pkgrel."
+            elif (( release_pair_count > 0 )); then
+              source_tag="$release_tag-r$pkgrel"
             fi
+          elif ! grep -Eq 'HTTP 404|Not Found' "$release_error"; then
+            cat "$release_error" >&2
+            fail "Could not inspect release $release_tag."
           fi
 
           {
@@ -116,6 +290,8 @@ jobs:
             echo "package_name=$package_name"
             echo "checksum_name=$checksum_name"
             echo "release_exists=$release_exists"
+            echo "source_tag=$source_tag"
+            echo "trigger_commit=$TRIGGER_COMMIT"
             echo "should_build=$should_build"
           } >>"$GITHUB_OUTPUT"
 
@@ -136,10 +312,12 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      source_tag: ${{ steps.source.outputs.source_tag }}
     env:
-      PKGREL: ${{ needs.detect.outputs.pkgrel }}
-      RELEASE_EXISTS: ${{ needs.detect.outputs.release_exists }}
-      RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      SOURCE_TAG: ${{ needs.detect.outputs.source_tag }}
+      TRIGGER_COMMIT: ${{ needs.detect.outputs.trigger_commit }}
       UPSTREAM_COMMIT: ${{ needs.detect.outputs.upstream_commit }}
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
@@ -148,44 +326,68 @@ jobs:
           fetch-depth: 0
 
       - name: Record package version and immutable source tag
+        id: source
         run: |
           set -euo pipefail
+
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+
+          resolve_remote_tag() {
+            local tag=$1 target
+
+            target=$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk 'NR == 1 { print $1 }')
+            if [[ -z $target ]]; then
+              target=$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')
+            fi
+            [[ $target =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s\n' "$target"
+          }
+
+          [[ $TRIGGER_COMMIT =~ ^[0-9a-f]{40}$ && $(git rev-parse HEAD) == "$TRIGGER_COMMIT" ]] ||
+            fail 'The source-tag checkout does not match the triggering commit.'
+          remote_main=$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')
+          [[ $remote_main == "$TRIGGER_COMMIT" ]] ||
+            fail 'origin/main moved while the package was building; run the release again from current main.'
+
           git config user.name 'studio-omarchy-release[bot]'
           git config user.email 'studio-omarchy-release[bot]@users.noreply.github.com'
 
           packaging/arch/set-package-version.sh "$VERSION" "$UPSTREAM_COMMIT"
           if ! git diff --quiet; then
+            unexpected_changes=$(git diff --name-only | grep -Ev \
+              '^(manifest\.json|packaging/arch/(PKGBUILD|build-omarchy-package\.sh|upstream-commit))$' || true)
+            [[ -z $unexpected_changes ]] ||
+              fail "The release version helper changed unexpected paths: $unexpected_changes"
             git add manifest.json packaging/arch/PKGBUILD \
               packaging/arch/build-omarchy-package.sh packaging/arch/upstream-commit
             git commit -m "Release Studio $VERSION for Omarchy"
-            git push origin HEAD:main
+            git push origin HEAD:refs/heads/main
           fi
 
-          if [[ $RELEASE_EXISTS == true ]]; then
-            git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null ||
-              {
-                echo "Existing release $RELEASE_TAG has no immutable base tag." >&2
-                exit 1
-              }
-            source_tag="$RELEASE_TAG-r$PKGREL"
-          else
-            source_tag=$RELEASE_TAG
-          fi
+          [[ -z $(git status --porcelain) ]] || fail 'The source-tag checkout is dirty after version recording.'
+          source_commit=$(git rev-parse HEAD)
+          remote_main=$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')
+          [[ $remote_main == "$source_commit" ]] ||
+            fail 'origin/main moved before source tagging; no release asset will be published.'
 
-          expected_target=$(git rev-parse HEAD)
-          remote_target=$(git ls-remote --tags origin "refs/tags/$source_tag^{}" | awk 'NR == 1 { print $1 }')
-          if [[ -z $remote_target ]]; then
-            remote_target=$(git ls-remote --tags origin "refs/tags/$source_tag" | awk 'NR == 1 { print $1 }')
-          fi
+          remote_target=$(resolve_remote_tag "$SOURCE_TAG" || true)
           if [[ -n $remote_target ]]; then
-            if [[ $remote_target != "$expected_target" ]]; then
-              echo "Refusing to move immutable source tag $source_tag." >&2
-              exit 1
-            fi
+            [[ $remote_target == "$source_commit" ]] ||
+              fail "Refusing to move immutable source tag $SOURCE_TAG."
           else
-            git tag --annotate "$source_tag" --message "Studio $VERSION-$PKGREL for Omarchy"
-            git push origin "refs/tags/$source_tag"
+            git tag --annotate "$SOURCE_TAG" --message "Studio $VERSION for Omarchy"
+            git push origin "refs/tags/$SOURCE_TAG"
           fi
+          [[ $(resolve_remote_tag "$SOURCE_TAG") == "$source_commit" ]] ||
+            fail "Remote source tag $SOURCE_TAG does not resolve to the packaged source commit."
+
+          {
+            echo "source_commit=$source_commit"
+            echo "source_tag=$SOURCE_TAG"
+          } >>"$GITHUB_OUTPUT"
 
   release:
     needs: [detect, build, tag-source]
@@ -201,6 +403,8 @@ jobs:
       PKGREL: ${{ needs.detect.outputs.pkgrel }}
       RELEASE_EXISTS: ${{ needs.detect.outputs.release_exists }}
       RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+      SOURCE_COMMIT: ${{ needs.tag-source.outputs.source_commit }}
+      SOURCE_TAG: ${{ needs.tag-source.outputs.source_tag }}
       UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
@@ -212,12 +416,153 @@ jobs:
       - name: Verify and publish immutable package pair
         run: |
           set -euo pipefail
-          if [[ $RELEASE_EXISTS == true ]]; then
-            source_tag="$RELEASE_TAG-r$PKGREL"
-          else
-            source_tag=$RELEASE_TAG
-          fi
-          release_notes="Native Omarchy package revision $PKGREL for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG), built from immutable [source tag $source_tag](https://github.com/$GITHUB_REPOSITORY/tree/$source_tag). Use the repository's direct installer or install the downloaded package with sudo pacman -U."
+
+          fail() {
+            echo "$*" >&2
+            exit 1
+          }
+
+          resolve_remote_tag() {
+            local tag=$1 target
+
+            target=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" \
+              "refs/tags/$tag^{}" | awk 'NR == 1 { print $1 }')
+            if [[ -z $target ]]; then
+              target=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" \
+                "refs/tags/$tag" | awk 'NR == 1 { print $1 }')
+            fi
+            [[ $target =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s\n' "$target"
+          }
+
+          resolve_revision_source() {
+            local expected_version=$1 expected_pkgrel=$2 candidate_tag candidate_target
+            local pkgbuild_file tag_pkgrel tag_version
+
+            candidate_tag="$RELEASE_TAG-r$expected_pkgrel"
+            candidate_target=$(resolve_remote_tag "$candidate_tag" || true)
+            if [[ -z $candidate_target ]]; then
+              candidate_tag=$RELEASE_TAG
+              candidate_target=$(resolve_remote_tag "$candidate_tag") ||
+                fail "Release $RELEASE_TAG package revision $expected_pkgrel has no immutable source tag."
+            fi
+            pkgbuild_file=$(mktemp "$RUNNER_TEMP/studio-published-pkgbuild.XXXXXXXXXX")
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/packaging/arch/PKGBUILD?ref=$candidate_target" \
+              >"$pkgbuild_file"
+            (( $(wc -c <"$pkgbuild_file") <= 65536 )) ||
+              fail "Source tag $candidate_tag has an oversized package recipe."
+            tag_version=$(sed -n 's/^pkgver=//p' "$pkgbuild_file")
+            tag_pkgrel=$(sed -n 's/^pkgrel=//p' "$pkgbuild_file")
+            [[ $tag_version == "$expected_version" && $tag_pkgrel == "$expected_pkgrel" ]] ||
+              fail "Source tag $candidate_tag does not declare Studio $expected_version-$expected_pkgrel."
+            resolved_source_tag=$candidate_tag
+            resolved_source_commit=$candidate_target
+          }
+
+          verify_release_assets() {
+            local release_file=$1 expected_version=$2 expected_pkgrel=$3 expected_commit=$4
+            local require_expected=${5:-true}
+            local asset_count=0 asset_name asset_id asset_digest asset_size
+            local checksum_file checksum_hash checksum_name checksum_extra
+            local checksum_digest checksum_id checksum_size package_digest pkgrel suffix
+            local source_tag tag_target
+            declare -A checksum_digests=() checksum_ids=() checksum_sizes=()
+            declare -A package_digests=() package_ids=()
+
+            while IFS=$'\t' read -r asset_name asset_id asset_digest asset_size; do
+              [[ -n $asset_name ]] || continue
+              asset_count=$((asset_count + 1))
+              if [[ ! $asset_name =~ ^wordpress-studio-omarchy-([0-9]+\.[0-9]+\.[0-9]+)-([1-9][0-9]*)-x86_64\.pkg\.tar\.zst(\.sha256)?$ ]]; then
+                fail "Release $RELEASE_TAG contains an unexpected asset: $asset_name"
+              fi
+              [[ ${BASH_REMATCH[1]} == "$expected_version" ]] ||
+                fail "Release $RELEASE_TAG mixes package versions."
+              pkgrel=${BASH_REMATCH[2]}
+              suffix=${BASH_REMATCH[3]}
+              (( pkgrel <= expected_pkgrel )) ||
+                fail "Release $RELEASE_TAG contains package revision $pkgrel above published revision $expected_pkgrel."
+              [[ $asset_id =~ ^[1-9][0-9]*$ && $asset_digest =~ ^sha256:[0-9a-f]{64}$ &&
+                $asset_size =~ ^[1-9][0-9]*$ ]] ||
+                fail "Release $RELEASE_TAG has incomplete integrity metadata for $asset_name."
+              if [[ $suffix == '.sha256' ]]; then
+                [[ -z ${checksum_ids[$pkgrel]:-} ]] ||
+                  fail "Release $RELEASE_TAG contains a duplicate checksum for revision $pkgrel."
+                (( asset_size <= 512 )) ||
+                  fail "Release $RELEASE_TAG checksum for revision $pkgrel exceeds its byte budget."
+                checksum_ids[$pkgrel]=$asset_id
+                checksum_digests[$pkgrel]=${asset_digest#sha256:}
+                checksum_sizes[$pkgrel]=$asset_size
+              else
+                [[ -z ${package_ids[$pkgrel]:-} ]] ||
+                  fail "Release $RELEASE_TAG contains a duplicate package for revision $pkgrel."
+                (( asset_size <= 2147483648 )) ||
+                  fail "Release $RELEASE_TAG package revision $pkgrel exceeds its byte budget."
+                package_ids[$pkgrel]=$asset_id
+                package_digests[$pkgrel]=${asset_digest#sha256:}
+              fi
+            done < <(
+              jq -r '.assets[]? | [.name, (.id | tostring), (.digest // ""), (.size | tostring)] | @tsv' \
+                "$release_file"
+            )
+
+            if (( asset_count == 0 )); then
+              [[ $require_expected == false ]] && return 0
+              fail "Release $RELEASE_TAG does not contain an exact package/checksum set."
+            fi
+            (( ${#package_ids[@]} == ${#checksum_ids[@]} )) ||
+              fail "Release $RELEASE_TAG does not contain an exact package/checksum set."
+            mapfile -t release_pkgrels < <(printf '%s\n' "${!package_ids[@]}" | sort -n)
+            expected_pair_present=false
+            checksum_root=$(mktemp -d "$RUNNER_TEMP/studio-published-checksums.XXXXXXXXXX")
+            for pkgrel in "${release_pkgrels[@]}"; do
+              checksum_id=${checksum_ids[$pkgrel]:-}
+              checksum_digest=${checksum_digests[$pkgrel]:-}
+              checksum_size=${checksum_sizes[$pkgrel]:-}
+              package_digest=${package_digests[$pkgrel]}
+              [[ -n $checksum_id && -n $checksum_digest && -n $checksum_size ]] ||
+                fail "Release $RELEASE_TAG has no checksum for revision $pkgrel."
+
+              checksum_file="$checksum_root/$pkgrel.sha256"
+              gh api -H 'Accept: application/octet-stream' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$checksum_id" >"$checksum_file"
+              [[ $(wc -c <"$checksum_file") == "$checksum_size" ]] ||
+                fail "Release $RELEASE_TAG checksum size changed for revision $pkgrel."
+              [[ $(sha256sum "$checksum_file" | cut -d ' ' -f 1) == "$checksum_digest" ]] ||
+                fail "Release $RELEASE_TAG checksum asset digest changed for revision $pkgrel."
+              IFS=' ' read -r checksum_hash checksum_name checksum_extra <"$checksum_file" || true
+              [[ $checksum_hash == "$package_digest" &&
+                $checksum_name == "wordpress-studio-omarchy-$expected_version-$pkgrel-x86_64.pkg.tar.zst" &&
+                -z ${checksum_extra:-} ]] ||
+                fail "Release $RELEASE_TAG checksum does not identify package revision $pkgrel exactly."
+
+              resolve_revision_source "$expected_version" "$pkgrel"
+              source_tag=$resolved_source_tag
+              tag_target=$resolved_source_commit
+              if [[ $pkgrel == "$expected_pkgrel" ]]; then
+                expected_pair_present=true
+                [[ $source_tag == "$SOURCE_TAG" && $tag_target == "$expected_commit" ]] ||
+                  fail "Published package $PACKAGE_NAME is not bound to source tag $SOURCE_TAG at $expected_commit."
+              fi
+            done
+            if [[ $require_expected == true ]]; then
+              [[ $expected_pair_present == true ]] ||
+                fail "Release $RELEASE_TAG is missing the expected package pair $PACKAGE_NAME."
+            else
+              [[ $expected_pair_present == false ]] ||
+                fail "Release $RELEASE_TAG gained package $PACKAGE_NAME after detection."
+            fi
+          }
+
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]] || fail 'The packaged source commit is invalid.'
+          [[ $(resolve_remote_tag "$SOURCE_TAG") == "$SOURCE_COMMIT" ]] ||
+            fail "Source tag $SOURCE_TAG moved or disappeared before publication."
+          remote_main=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" \
+            refs/heads/main | awk 'NR == 1 { print $1 }')
+          [[ $remote_main == "$SOURCE_COMMIT" ]] ||
+            fail 'origin/main moved before asset publication; run the release again from current main.'
+
+          release_notes="Native Omarchy package revision $PKGREL for [upstream Studio $VERSION](https://github.com/Automattic/studio/releases/tag/$UPSTREAM_TAG), built from immutable [source tag $SOURCE_TAG](https://github.com/$GITHUB_REPOSITORY/tree/$SOURCE_TAG). Use the repository's direct installer or install the downloaded package with sudo pacman -U."
           package_path="release-assets/$PACKAGE_NAME"
           checksum_path="release-assets/$CHECKSUM_NAME"
 
@@ -233,13 +578,19 @@ jobs:
             cd release-assets
             sha256sum --check "$CHECKSUM_NAME"
           )
+          IFS=' ' read -r artifact_hash artifact_name artifact_extra <"$checksum_path" || true
+          [[ $artifact_hash =~ ^[0-9a-f]{64}$ && $artifact_name == "$PACKAGE_NAME" &&
+            -z ${artifact_extra:-} ]] || fail 'The built checksum does not identify the expected package exactly.'
 
           if [[ $RELEASE_EXISTS == true ]]; then
-            gh release edit "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --latest \
-              --title "Studio $VERSION for Omarchy" \
-              --notes "$release_notes"
+            before_release="$RUNNER_TEMP/studio-release-before-upload.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$before_release"
+            jq -e --arg package "$PACKAGE_NAME" --arg checksum "$CHECKSUM_NAME" '
+              .immutable != true and
+              ([.assets[]? | select(.name == $package or .name == $checksum)] | length) == 0
+            ' "$before_release" >/dev/null ||
+              fail "Release $RELEASE_TAG changed after detection or cannot accept immutable assets."
+            verify_release_assets "$before_release" "$VERSION" "$PKGREL" "$SOURCE_COMMIT" false
             gh release upload "$RELEASE_TAG" "$package_path" "$checksum_path" \
               --repo "$GITHUB_REPOSITORY"
           else
@@ -250,6 +601,18 @@ jobs:
               --title "Studio $VERSION for Omarchy" \
               --notes "$release_notes"
           fi
+
+          published_release="$RUNNER_TEMP/studio-release-published.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >"$published_release"
+          jq -e --arg tag "$RELEASE_TAG" '
+            .tag_name == $tag and .draft == false and .prerelease == false
+          ' "$published_release" >/dev/null || fail "Release $RELEASE_TAG is not published exactly."
+          verify_release_assets "$published_release" "$VERSION" "$PKGREL" "$SOURCE_COMMIT"
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --latest \
+            --title "Studio $VERSION for Omarchy" \
+            --notes "$release_notes"
 
   report-failure:
     needs: [detect, build, tag-source, release]

@@ -2,6 +2,7 @@
 
 _studio_node='/usr/lib/studio/resources/bin/node'
 _studio_ca='/etc/ca-certificates/trust-source/anchors/studio-ca.crt'
+_studio_ca_lock='/run/lock/wordpress-studio-ca.lock'
 
 _set_studio_capability() {
   if [[ -x $_studio_node ]]; then
@@ -27,9 +28,18 @@ pre_remove() {
 }
 
 post_remove() {
-  if [[ -f $_studio_ca ]]; then
-    rm -f "$_studio_ca"
-    update-ca-trust extract
+  if (
+    umask 077 || exit 1
+    exec 9>"$_studio_ca_lock" || exit 1
+    /usr/bin/flock -x 9 || exit 1
+    if [[ -f $_studio_ca ]]; then
+      rm -f "$_studio_ca" || exit 1
+    fi
+    update-ca-trust extract || exit 1
+  ); then
+    update-desktop-database -q
+  else
+    echo 'WordPress Studio: unable to remove the system trust anchor safely.' >&2
+    return 1
   fi
-  update-desktop-database -q
 }

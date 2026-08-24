@@ -10,7 +10,7 @@ This is a community port maintained by RegionallyFamous. It is not an Automattic
 omarchy plugin add https://github.com/RegionallyFamous/studio-omarchy.git --enable
 ```
 
-The WordPress icon appears in the right side of the Omarchy bar. Open it and choose **Install Studio**. The plugin opens Omarchy's visible terminal, downloads the latest native package and checksum from this repository's GitHub release, verifies the pair, and hands the local package to `pacman`. The visible terminal requests elevation for the package transaction. The package installs a root-owned `/usr/lib/studio/chrome-sandbox` with mode `4755` (setuid) for Chromium's sandbox; after installation, the installer always restores that fixed mode and may repair read and execute permissions under `/usr/lib/studio`. Studio otherwise runs as the current desktop user, and the plugin never reads or supplies the password.
+The WordPress icon appears in the right side of the Omarchy bar. Open it and choose **Install Studio**. The plugin opens Omarchy's visible terminal, downloads the latest native package and checksum from this repository's GitHub release, verifies the pair, and asks for elevation. After authorization, a fixed root-side helper copies the package without following a final symlink into a private root-owned staging directory, enforces the same byte ceiling, verifies its metadata and checksum again, and gives only that immutable staged copy to `pacman`. The package installs a root-owned `/usr/lib/studio/chrome-sandbox` with mode `4755` (setuid) for Chromium's sandbox; after installation, the installer always restores that fixed mode and may repair read and execute permissions under `/usr/lib/studio`. Studio otherwise runs as the current desktop user, and the plugin never reads or supplies the password.
 
 The panel is fully keyboard-driven: use Up and Down to choose an action, Enter to run it, and Escape to close it.
 
@@ -66,7 +66,10 @@ This removes the package, its system Arch trust anchor, and only a matching `Wor
 
 - Uses native Wayland in Hyprland sessions.
 - Uses Arch's p11-kit certificate anchor and `update-ca-trust` flow.
+- Snapshots and validates Studio's generated CA before authorization, installs only those embedded bytes through an atomic root-side trust-store update, and imports browser trust only from the installed system anchor.
+- Updates `/etc/hosts` from an embedded, size-bounded snapshot under a root-side writer lock, with pre-commit conflict detection, exact post-commit verification, and same-directory atomic replacement.
 - Registers the `wp-studio://` login callback and desktop launcher.
+- Binds custom-domain HTTP, HTTPS, health, Playground/Sandbox WordPress, native PHP, and PHP diagnostic listeners only to IPv4 or IPv6 loopback as appropriate.
 - Attempts to grant the bundled proxy runtime access to ports 80 and 443 without running Studio as root, and prints a visible package warning if the filesystem refuses that capability.
 - Replaces the incompatible DEB updater with `studio-omarchy-update`.
 - Adds a theme-native Quattro panel for install, update, launch, status, and removal.
@@ -79,7 +82,7 @@ Open the Quattro panel and choose **Update Studio**, or run:
 studio-omarchy-update
 ```
 
-Both paths select the highest package revision attached to this repository's latest `omarchy-v<version>` release, enforce HTTPS and download timeouts, cap release metadata before parsing, verify the expected checksum filename and SHA-256 value, and install only the verified local package.
+Both paths select the highest package revision attached to this repository's latest `omarchy-v<version>` release, enforce HTTPS and download timeouts, cap release metadata before parsing, verify the expected checksum filename and SHA-256 value, then repeat the size, file-type, and checksum checks on a private root-owned copy immediately before `pacman` opens it.
 
 ## Remove
 
@@ -95,7 +98,7 @@ Removing Studio through the Quattro panel also removes its Arch trust anchor and
 
 Every six hours, CI checks the latest stable [Studio release](https://github.com/Automattic/studio/releases). A new release is checked out in an isolated build directory, the audited Omarchy patch is applied, and the full Studio lint, typecheck, and test suites run. CI then creates and verifies a native Arch package before publishing it here.
 
-Patch conflicts or failed tests stop the release and open an issue. No package is published if the patch, upstream test suite, or package verification fails. For a new upstream release, the package version and plugin manifest version advance together; Omarchy-only rebuilds increment the package revision without changing the manifest's upstream Studio version.
+Patch conflicts or failed tests stop the release and open an issue. No package is published if the patch, upstream test suite, or package verification fails. Publication also stops if `origin/main` moves while the package is building. Manual version requests must identify Automattic's current non-draft, non-prerelease latest release and cannot downgrade the repository. Existing release assets are accepted only when every revision has one exact package/checksum pair, GitHub's SHA-256 asset digests agree with the bounded checksum files, and the expected immutable source tag resolves to the exact source commit. For a new upstream release, the package version and plugin manifest version advance together; Omarchy-only rebuilds increment the package revision without changing the manifest's upstream Studio version.
 
 ## Local development
 
@@ -120,11 +123,11 @@ node --test test/*.test.js
 
 The real-guest acceptance lane runs separately in a disposable x86_64 Omarchy VM; that maintainer infrastructure is not a repository dependency. Together, the checks are designed to cover manifest identity, package/plugin version lockstep, installer ingress ceilings, malformed metadata, failed helpers, checksum and package byte limits, symlink and special-file rejection, bounded package status, plain-text rendering of dynamic panel status, keyboard interaction, a real package install, native Wayland launch, and removal.
 
-The real-guest acceptance flow also uses genuine pointer input to exercise the visible product instead of stopping at process checks. It clicks the Quattro install, update, launch, and remove actions; creates two uniquely named local WordPress sites through Studio; verifies their persisted configuration, WordPress files, SQLite databases, and simultaneous REST availability; loads a running site in an external browser; stops one site and proves it is offline; starts it again and proves it serves WordPress; then deletes both sites and verifies their Studio records and local paths are gone. It creates a final disposable removal fixture, proves removal refuses to run while Studio is open, quits Studio normally, and proves the successful retry stops background serving while preserving that site's record and files. Screenshots are captured for every materially distinct panel, terminal, Studio, and browser state and must be visually reviewed along with any failure screenshots.
+The real-guest acceptance flow also uses genuine pointer input to exercise the visible product instead of stopping at process checks. It clicks the Quattro install, update, launch, and remove actions; creates two uniquely named local WordPress sites through Studio; verifies their persisted configuration, WordPress files, SQLite databases, and simultaneous REST availability; loads a running site in an external browser; stops one site and proves it is offline; starts it again and proves it serves WordPress; then deletes both sites and verifies their Studio records and local paths are gone. It also creates and trusts a custom HTTPS domain, verifies its IPv4 and IPv6 hosts entries, generated certificates, Arch trust anchor, system bundle, Chromium NSS database, and a real Firefox profile NSS database, loads the trusted domain in curl and Chromium, and proves site deletion and package removal clean up only Studio's matching trust material. It creates a final disposable removal fixture, proves removal refuses to run while Studio is open, quits Studio normally, and proves the successful retry stops background serving while preserving that site's record and files. Screenshots are captured for every materially distinct panel, terminal, Studio, and browser state and must be visually reviewed along with any failure screenshots.
 
 ### Tested scope and limitations
 
-The full acceptance lane covers the local two-site lifecycle on x86_64 Omarchy: creation, persistence, simultaneous serving, external-browser loading, stop, restart, deletion, and the Quattro install, update, launch, Escape-close, and removal controls. It does not cover WordPress.com login or signup, connecting or importing remote sites, custom-domain or HTTPS configuration, or aarch64 runtime behavior. Those flows should not be treated as verified by this port's acceptance lane.
+The full acceptance lane covers the local two-site lifecycle on x86_64 Omarchy: creation, persistence, simultaneous serving, external-browser loading, stop, restart, deletion, custom-domain HTTPS and browser/system trust, and the Quattro install, update, launch, Escape-close, and removal controls. It does not cover WordPress.com login or signup, connecting or importing remote sites, Sync, public previews, or aarch64 runtime behavior. Those flows should not be treated as verified by this port's acceptance lane.
 
 ## Marketplace preview
 

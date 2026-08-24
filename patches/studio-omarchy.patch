@@ -1,3 +1,1291 @@
+diff --git a/apps/cli/lib/certificate-manager.ts b/apps/cli/lib/certificate-manager.ts
+index 3f351ce9..bde93dc8 100644
+--- a/apps/cli/lib/certificate-manager.ts
++++ b/apps/cli/lib/certificate-manager.ts
+@@ -7,9 +7,11 @@ import { promisify } from 'node:util';
+ import { CERT_UNTRUSTED_ROOT, SERVER_AUTH_OID } from '@studio/common/constants';
+ import {
+ 	buildLinuxTrustInstallCommand,
++	getLinuxTrustStoreConfig,
+ 	importCAIntoUserNssDbsLinux,
+ 	isCAImportedInUserNssDbsLinux,
+ 	isCATrustedOnLinux,
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
+ import { getCertificatesPath } from '@studio/common/lib/well-known-paths';
+ import sudo from '@vscode/sudo-prompt';
+@@ -230,10 +232,12 @@ export async function trustRootCA(): Promise< void > {
+ 			// otherwise we'd reprompt for the polkit password just to re-sync NSS
+ 			// (the common case when a Chromium-family browser is installed after
+ 			// the initial trust flow).
++			const { trustStorePath } = getLinuxTrustStoreConfig();
+ 			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
++				const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
+ 				await new Promise< void >( ( resolve, reject ) => {
+ 					sudo.exec(
+-						buildLinuxTrustInstallCommand( CA_CERT_PATH ),
++						buildLinuxTrustInstallCommand( certificate ),
+ 						{ name: 'WordPress Studio' },
+ 						( error ) => {
+ 							if ( error ) {
+@@ -249,7 +253,7 @@ export async function trustRootCA(): Promise< void > {
+ 			}
+ 			// Always run NSS imports — they're idempotent (-D before -A) and don't
+ 			// need sudo, so re-running covers the install-browser-after-trust case.
+-			await importCAIntoUserNssDbsLinux( CA_CERT_PATH );
++			await importCAIntoUserNssDbsLinux( trustStorePath );
+ 		} else {
+ 			console.error( 'Unsupported platform for automatic certificate trust:', platform );
+ 		}
+diff --git a/apps/cli/lib/hosts-file.ts b/apps/cli/lib/hosts-file.ts
+index a12908c6..4b2f1da1 100644
+--- a/apps/cli/lib/hosts-file.ts
++++ b/apps/cli/lib/hosts-file.ts
+@@ -1,13 +1,16 @@
+ import fs from 'fs';
++import { createHash, randomBytes } from 'node:crypto';
+ import { domainToASCII } from 'node:url';
+-import { platform, tmpdir } from 'os';
++import { platform } from 'os';
+ import path from 'path';
+ import { promisify } from 'util';
+ import { escapeRegex } from '@studio/common/lib/escape-regex';
+ import { sudoExec } from 'cli/lib/sudo-exec';
+ 
+ const readFile = promisify( fs.readFile );
+-const writeFile = promisify( fs.writeFile );
++// Base64 expansion stays below 96 KiB, leaving headroom under Linux's 128 KiB per-argument limit.
++const MAX_HOSTS_FILE_BYTES = 64 * 1024;
++const LINUX_HOSTS_WRITE_LOCK = '/run/lock/wordpress-studio-hosts.lock';
+ 
+ // Host file paths for different operating systems
+ const HOST_FILES: Record< string, string > = {
+@@ -45,15 +48,45 @@ export const readHostsFile = async (): Promise< string > => {
+ /**
+  * Writes content to the hosts file (requires elevated permissions)
+  */
+-export const writeHostsFile = async ( content: string ): Promise< void > => {
++export const writeHostsFile = async (
++	content: string,
++	expectedCurrentContent?: string
++): Promise< void > => {
+ 	const hostsPath = getHostsFilePath();
+ 	try {
+-		const tempPath = path.join( tmpdir(), 'wp-studio-hosts' );
+-		await writeFile( tempPath, content );
+-		const command =
+-			platform() === 'win32'
+-				? `type ${ tempPath } > ${ hostsPath }`
+-				: `tee ${ hostsPath } < ${ tempPath } > /dev/null`;
++		const currentPlatform = platform();
++		const currentContent = expectedCurrentContent ?? ( await readHostsFile() );
++		const contentBuffer = Buffer.from( content, 'utf8' );
++		if ( contentBuffer.byteLength > MAX_HOSTS_FILE_BYTES ) {
++			throw new Error( `Hosts file content exceeds ${ MAX_HOSTS_FILE_BYTES } bytes` );
++		}
++
++		const encodedContent = contentBuffer.toString( 'base64' );
++		let command: string;
++
++		if ( currentPlatform === 'win32' ) {
++			const escapedHostsPath = hostsPath.replace( /'/g, "''" );
++			const script = `[IO.File]::WriteAllBytes('${ escapedHostsPath }', [Convert]::FromBase64String('${ encodedContent }'))`;
++			const encodedScript = Buffer.from( script, 'utf16le' ).toString( 'base64' );
++			command = `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${ encodedScript }`;
++		} else {
++			const payloadHash = createHash( 'sha256' ).update( contentBuffer ).digest( 'hex' );
++			const currentHash = createHash( 'sha256' ).update( currentContent, 'utf8' ).digest( 'hex' );
++
++			if ( currentPlatform === 'linux' ) {
++				command = createLinuxWriteCommand( encodedContent, payloadHash, currentHash, hostsPath );
++			} else {
++				const script = createDarwinWriteScript(
++					encodedContent,
++					payloadHash,
++					currentHash,
++					hostsPath
++				);
++				const encodedScript = Buffer.from( script, 'utf8' ).toString( 'base64' );
++				command = `/usr/bin/printf '%s' '${ encodedScript }' | /usr/bin/base64 -D | /bin/bash`;
++			}
++		}
++
+ 		await sudoExec( command, {
+ 			name: 'WordPress Studio',
+ 		} );
+@@ -63,6 +96,71 @@ export const writeHostsFile = async ( content: string ): Promise< void > => {
+ 	}
+ };
+ 
++function createLinuxWriteCommand(
++	encodedContent: string,
++	payloadHash: string,
++	currentHash: string,
++	hostsPath: string
++): string {
++	const stagingPath = path.join(
++		path.dirname( hostsPath ),
++		`.wp-studio-hosts-${ randomBytes( 16 ).toString( 'hex' ) }`
++	);
++	return [
++		'set -euo pipefail',
++		'umask 077',
++		'set -C',
++		`: > '${ stagingPath }'`,
++		'set +C',
++		`trap '/bin/rm -f -- ${ stagingPath }' EXIT`,
++		`exec 9>'${ LINUX_HOSTS_WRITE_LOCK }'`,
++		'/usr/bin/flock -x 9',
++		`/usr/bin/printf '%s  %s\\n' '${ currentHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/printf '%s' '${ encodedContent }' | /usr/bin/base64 --decode > '${ stagingPath }'`,
++		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ stagingPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/cp --attributes-only --preserve=all -- '${ hostsPath }' '${ stagingPath }'`,
++		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ stagingPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/printf '%s  %s\\n' '${ currentHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/mv -fT -- '${ stagingPath }' '${ hostsPath }'`,
++		`/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ hostsPath }' | /usr/bin/sha256sum --check --status -`,
++		`/usr/bin/sync -f '${ path.dirname( hostsPath ) }'`,
++	].join( '; ' );
++}
++
++function createDarwinWriteScript(
++	encodedContent: string,
++	payloadHash: string,
++	currentHash: string,
++	hostsPath: string
++): string {
++	return [
++		'set -euo pipefail',
++		'umask 077',
++		`staging_file=$(/usr/bin/mktemp '${ path.dirname( hostsPath ) }/.wp-studio-hosts.XXXXXXXX')`,
++		`backup_file=$(/usr/bin/mktemp '${ path.dirname(
++			hostsPath
++		) }/.wp-studio-hosts-backup.XXXXXXXX')`,
++		`trap '/bin/rm -f -- "$staging_file" "$backup_file"' EXIT`,
++		`current_hash=$(/usr/bin/shasum -a 256 '${ hostsPath }')`,
++		`[[ "${ '${current_hash%% *}' }" == '${ currentHash }' ]]`,
++		`/bin/cp -p '${ hostsPath }' "$backup_file"`,
++		`/usr/bin/printf '%s' '${ encodedContent }' | /usr/bin/base64 -D > "$staging_file"`,
++		'payload_hash=$(/usr/bin/shasum -a 256 "$staging_file")',
++		`[[ "${ '${payload_hash%% *}' }" == '${ payloadHash }' ]]`,
++		`current_hash=$(/usr/bin/shasum -a 256 '${ hostsPath }')`,
++		`[[ "${ '${current_hash%% *}' }" == '${ currentHash }' ]]`,
++		`if ! /usr/bin/tee '${ hostsPath }' < "$staging_file" > /dev/null; then`,
++		`  /usr/bin/tee '${ hostsPath }' < "$backup_file" > /dev/null`,
++		'  exit 1',
++		'fi',
++		`final_hash=$(/usr/bin/shasum -a 256 '${ hostsPath }')`,
++		`if [[ "${ '${final_hash%% *}' }" != '${ payloadHash }' ]]; then`,
++		`  /usr/bin/tee '${ hostsPath }' < "$backup_file" > /dev/null`,
++		'  exit 1',
++		'fi',
++	].join( '\n' );
++}
++
+ /**
+  * Create a regular expression matching the hosts entries for a given domain,
+  * covering both the IPv4 and IPv6 loopback addresses:
+@@ -121,7 +219,7 @@ export const addDomainToHosts = async ( domain: string, port: number ): Promise<
+ 		} );
+ 
+ 		if ( newContent !== hostsContent ) {
+-			await writeHostsFile( newContent );
++			await writeHostsFile( newContent, hostsContent );
+ 		}
+ 	} catch ( error ) {
+ 		console.error( `Error adding domain ${ domain } to hosts file:`, error );
+@@ -144,7 +242,7 @@ export const removeDomainFromHosts = async ( domain: string ): Promise< void > =
+ 
+ 		// Only write if content changed
+ 		if ( newContent !== hostsContent ) {
+-			await writeHostsFile( newContent );
++			await writeHostsFile( newContent, hostsContent );
+ 		}
+ 	} catch ( error ) {
+ 		console.error( `Error removing domain ${ domain } from hosts file:`, error );
+@@ -186,7 +284,7 @@ export const updateDomainInHosts = async (
+ 		} );
+ 
+ 		if ( newContent !== hostsContent ) {
+-			await writeHostsFile( newContent );
++			await writeHostsFile( newContent, hostsContent );
+ 		}
+ 	} catch ( error ) {
+ 		console.error(
+diff --git a/apps/cli/lib/proxy-server.ts b/apps/cli/lib/proxy-server.ts
+index 133bdc20..9cc5aae1 100644
+--- a/apps/cli/lib/proxy-server.ts
++++ b/apps/cli/lib/proxy-server.ts
+@@ -6,8 +6,10 @@ import httpProxy from 'http-proxy';
+ import { generateSiteCertificate } from 'cli/lib/certificate-manager';
+ import { readCliConfig } from 'cli/lib/cli-config/core';
+ 
+-let httpProxyServer: http.Server | null = null;
+-let httpsProxyServer: https.Server | null = null;
++const LOOPBACK_HOSTS = [ '127.0.0.1', '::1' ] as const;
++
++let httpProxyServers: http.Server[] = [];
++let httpsProxyServers: https.Server[] = [];
+ let isHttpProxyRunning = false;
+ let isHttpsProxyRunning = false;
+ 
+@@ -33,6 +35,45 @@ function logProxyBindError( err: NodeJS.ErrnoException, port: number ): void {
+ 	}
+ }
+ 
++async function closeServer( server: http.Server | https.Server ): Promise< void > {
++	if ( ! server.listening ) {
++		return;
++	}
++
++	await new Promise< void >( ( resolve ) => server.close( () => resolve() ) );
++}
++
++async function listenOnLoopback< T extends http.Server | https.Server >(
++	createServer: () => T,
++	port: number
++): Promise< T[] > {
++	const servers: T[] = [];
++
++	try {
++		for ( const host of LOOPBACK_HOSTS ) {
++			const server = createServer();
++			servers.push( server );
++
++			await new Promise< void >( ( resolve, reject ) => {
++				server
++					.listen( port, host, () => {
++						console.log( `[Proxy] Server listening on ${ host }:${ port }` );
++						resolve();
++					} )
++					.on( 'error', ( err ) => {
++						logProxyBindError( err, port );
++						reject( err );
++					} );
++			} );
++		}
++
++		return servers;
++	} catch ( error ) {
++		await Promise.all( servers.map( closeServer ) );
++		throw error;
++	}
++}
++
+ /**
+  * Gets the site details for a given domain
+  */
+@@ -128,20 +169,12 @@ async function startHttpProxy(): Promise< void > {
+ 		return;
+ 	}
+ 
+-	return new Promise< void >( ( resolve, reject ) => {
+-		httpProxyServer = http.createServer( ( req, res ) => handleProxyRequest( req, res, false ) );
+-
+-		httpProxyServer
+-			.listen( 80, () => {
+-				console.log( '[Proxy] HTTP server started on port 80' );
+-				isHttpProxyRunning = true;
+-				resolve();
+-			} )
+-			.on( 'error', ( err ) => {
+-				logProxyBindError( err, 80 );
+-				reject( err );
+-			} );
+-	} );
++	httpProxyServers = await listenOnLoopback(
++		() => http.createServer( ( req, res ) => handleProxyRequest( req, res, false ) ),
++		80
++	);
++	isHttpProxyRunning = true;
++	console.log( '[Proxy] HTTP server started on IPv4 and IPv6 loopback' );
+ }
+ 
+ /**
+@@ -153,49 +186,40 @@ async function startHttpsProxy(): Promise< void > {
+ 		return;
+ 	}
+ 
+-	return new Promise< void >( ( resolve, reject ) => {
+-		const defaultOptions: https.ServerOptions = {
+-			SNICallback: async ( servername, cb ) => {
+-				try {
+-					const site = await getSiteByHost( servername );
+-					if ( ! site || ! site.customDomain || ! site.enableHttps ) {
+-						console.error( `[Proxy] SNI: Invalid hostname: ${ servername }` );
+-						cb( new Error( `Invalid hostname: ${ servername }` ) );
+-						return;
+-					}
+-
+-					// Generate or load certificate from disk
+-					const { cert, key } = await generateSiteCertificate( site.customDomain );
+-
+-					const ctx = createSecureContext( {
+-						key,
+-						cert,
+-						minVersion: 'TLSv1.2',
+-					} );
+-
+-					cb( null, ctx );
+-				} catch ( error ) {
+-					console.error( `[Proxy] SNI callback error for ${ servername }:`, error );
+-					cb( error as Error );
++	const defaultOptions: https.ServerOptions = {
++		SNICallback: async ( servername, cb ) => {
++			try {
++				const site = await getSiteByHost( servername );
++				if ( ! site || ! site.customDomain || ! site.enableHttps ) {
++					console.error( `[Proxy] SNI: Invalid hostname: ${ servername }` );
++					cb( new Error( `Invalid hostname: ${ servername }` ) );
++					return;
+ 				}
+-			},
+-		};
+ 
+-		httpsProxyServer = https.createServer( defaultOptions, ( req, res ) =>
+-			handleProxyRequest( req, res, true )
+-		);
++				// Generate or load certificate from disk
++				const { cert, key } = await generateSiteCertificate( site.customDomain );
+ 
+-		httpsProxyServer
+-			.listen( 443, () => {
+-				console.log( '[Proxy] HTTPS server started on port 443' );
+-				isHttpsProxyRunning = true;
+-				resolve();
+-			} )
+-			.on( 'error', ( err ) => {
+-				logProxyBindError( err, 443 );
+-				reject( err );
+-			} );
+-	} );
++				const ctx = createSecureContext( {
++					key,
++					cert,
++					minVersion: 'TLSv1.2',
++				} );
++
++				cb( null, ctx );
++			} catch ( error ) {
++				console.error( `[Proxy] SNI callback error for ${ servername }:`, error );
++				cb( error as Error );
++			}
++		},
++	};
++
++	httpsProxyServers = await listenOnLoopback(
++		() =>
++			https.createServer( defaultOptions, ( req, res ) => handleProxyRequest( req, res, true ) ),
++		443
++	);
++	isHttpsProxyRunning = true;
++	console.log( '[Proxy] HTTPS server started on IPv4 and IPv6 loopback' );
+ }
+ 
+ /**
+@@ -206,33 +230,19 @@ export async function stopProxyServers(): Promise< void > {
+ 
+ 	const promises: Promise< void >[] = [];
+ 
+-	if ( httpProxyServer ) {
+-		promises.push(
+-			new Promise< void >( ( resolve ) => {
+-				httpProxyServer!.close( () => {
+-					httpProxyServer = null;
+-					isHttpProxyRunning = false;
+-					console.log( '[Proxy] HTTP server stopped' );
+-					resolve();
+-				} );
+-			} )
+-		);
++	if ( httpProxyServers.length > 0 ) {
++		promises.push( Promise.all( httpProxyServers.map( closeServer ) ).then( () => undefined ) );
+ 	}
+ 
+-	if ( httpsProxyServer ) {
+-		promises.push(
+-			new Promise< void >( ( resolve ) => {
+-				httpsProxyServer!.close( () => {
+-					httpsProxyServer = null;
+-					isHttpsProxyRunning = false;
+-					console.log( '[Proxy] HTTPS server stopped' );
+-					resolve();
+-				} );
+-			} )
+-		);
++	if ( httpsProxyServers.length > 0 ) {
++		promises.push( Promise.all( httpsProxyServers.map( closeServer ) ).then( () => undefined ) );
+ 	}
+ 
+ 	await Promise.all( promises );
++	httpProxyServers = [];
++	httpsProxyServers = [];
++	isHttpProxyRunning = false;
++	isHttpsProxyRunning = false;
+ 	console.log( '[Proxy] All servers stopped' );
+ }
+ 
+@@ -265,6 +275,7 @@ export async function startProxyServers(): Promise< void > {
+ 		// The process manager daemon will manage this process and keep it alive
+ 		process.stdin.resume();
+ 	} catch ( error ) {
++		await stopProxyServers();
+ 		console.error( '[Proxy] Failed to start proxy servers:', error );
+ 		throw error;
+ 	}
+diff --git a/apps/cli/lib/tests/certificate-manager.test.ts b/apps/cli/lib/tests/certificate-manager.test.ts
+index 8d8d2632..b127154e 100644
+--- a/apps/cli/lib/tests/certificate-manager.test.ts
++++ b/apps/cli/lib/tests/certificate-manager.test.ts
+@@ -1,9 +1,11 @@
+ import fs from 'node:fs';
+ import {
+ 	buildLinuxTrustInstallCommand,
++	getLinuxTrustStoreConfig,
+ 	importCAIntoUserNssDbsLinux,
+ 	isCAImportedInUserNssDbsLinux,
+ 	isCATrustedOnLinux,
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
+ import sudo from '@vscode/sudo-prompt';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+@@ -15,7 +17,12 @@ vi.mock( '@studio/common/lib/linux-trust-store', () => ( {
+ 	isCATrustedOnLinux: vi.fn(),
+ 	isCAImportedInUserNssDbsLinux: vi.fn(),
+ 	buildLinuxTrustInstallCommand: vi.fn(),
++	getLinuxTrustStoreConfig: vi.fn( () => ( {
++		trustStorePath: '/usr/local/share/ca-certificates/studio-ca.crt',
++		updateCommand: '/usr/sbin/update-ca-certificates',
++	} ) ),
+ 	importCAIntoUserNssDbsLinux: vi.fn(),
++	readLinuxTrustCertificate: vi.fn(),
+ } ) );
+ 
+ vi.mock( '@vscode/sudo-prompt', () => ( {
+@@ -27,7 +34,9 @@ vi.mock( '@vscode/sudo-prompt', () => ( {
+ const mockedIsCATrustedOnLinux = vi.mocked( isCATrustedOnLinux );
+ const mockedIsCAImportedInUserNssDbsLinux = vi.mocked( isCAImportedInUserNssDbsLinux );
+ const mockedBuildLinuxTrustInstallCommand = vi.mocked( buildLinuxTrustInstallCommand );
++const mockedGetLinuxTrustStoreConfig = vi.mocked( getLinuxTrustStoreConfig );
+ const mockedImportCAIntoUserNssDbsLinux = vi.mocked( importCAIntoUserNssDbsLinux );
++const mockedReadLinuxTrustCertificate = vi.mocked( readLinuxTrustCertificate );
+ const mockedSudoExec = vi.mocked( sudo.exec );
+ 
+ type SudoExecCallback = ( error?: Error, stdout?: string, stderr?: string ) => void;
+@@ -50,10 +59,13 @@ describe( 'certificate-manager (Linux)', () => {
+ 		mockedIsCATrustedOnLinux.mockReset();
+ 		mockedIsCAImportedInUserNssDbsLinux.mockReset();
+ 		mockedBuildLinuxTrustInstallCommand.mockReset();
++		mockedGetLinuxTrustStoreConfig.mockClear();
+ 		mockedImportCAIntoUserNssDbsLinux.mockReset();
++		mockedReadLinuxTrustCertificate.mockReset();
+ 		mockedSudoExec.mockReset();
++		mockedReadLinuxTrustCertificate.mockReturnValue( Buffer.from( 'authorized CA bytes' ) );
+ 		mockedBuildLinuxTrustInstallCommand.mockReturnValue(
+-			'install -m 0644 "/home/user/.studio/certificates/studio-ca.crt" "/usr/local/share/ca-certificates/studio-ca.crt" && update-ca-certificates'
++			'write-authorized-bytes-to-fixed-trust-store && update-ca-certificates'
+ 		);
+ 		mockedImportCAIntoUserNssDbsLinux.mockResolvedValue( undefined );
+ 		// Default: NSS DBs are populated. Override per-test for the
+@@ -121,16 +133,34 @@ describe( 'certificate-manager (Linux)', () => {
+ 
+ 			await expect( trustRootCA() ).resolves.toBeUndefined();
+ 
+-			expect( mockedBuildLinuxTrustInstallCommand ).toHaveBeenCalledWith(
++			expect( mockedReadLinuxTrustCertificate ).toHaveBeenCalledWith(
+ 				expect.stringContaining( 'studio-ca.crt' )
+ 			);
++			expect( mockedBuildLinuxTrustInstallCommand ).toHaveBeenCalledWith(
++				Buffer.from( 'authorized CA bytes' )
++			);
+ 			expect( mockedSudoExec ).toHaveBeenCalledTimes( 1 );
+ 			const [ command, options ] = mockedSudoExec.mock.calls[ 0 ];
+ 			expect( command ).toContain( 'update-ca-certificates' );
+-			expect( command ).toContain( '/usr/local/share/ca-certificates/studio-ca.crt' );
++			expect( command ).not.toContain( '/home/' );
+ 			expect( options ).toEqual( { name: 'WordPress Studio' } );
+ 		} );
+ 
++		it( 'snapshots the CA before opening the authorization prompt', async () => {
++			mockedIsCATrustedOnLinux.mockResolvedValue( false );
++			mockedIsCAImportedInUserNssDbsLinux.mockResolvedValue( false );
++			stubSudoExec();
++
++			await trustRootCA();
++
++			expect( mockedReadLinuxTrustCertificate.mock.invocationCallOrder[ 0 ] ).toBeLessThan(
++				mockedSudoExec.mock.invocationCallOrder[ 0 ]
++			);
++			expect( mockedBuildLinuxTrustInstallCommand.mock.invocationCallOrder[ 0 ] ).toBeLessThan(
++				mockedSudoExec.mock.invocationCallOrder[ 0 ]
++			);
++		} );
++
+ 		it( 'imports the CA into per-user NSS DBs after the system install succeeds', async () => {
+ 			mockedIsCATrustedOnLinux.mockResolvedValue( false );
+ 			mockedIsCAImportedInUserNssDbsLinux.mockResolvedValue( false );
+@@ -139,7 +169,7 @@ describe( 'certificate-manager (Linux)', () => {
+ 			await trustRootCA();
+ 
+ 			expect( mockedImportCAIntoUserNssDbsLinux ).toHaveBeenCalledWith(
+-				expect.stringContaining( 'studio-ca.crt' )
++				'/usr/local/share/ca-certificates/studio-ca.crt'
+ 			);
+ 			// NSS import must run *after* the sudo install.
+ 			const sudoOrder = mockedSudoExec.mock.invocationCallOrder[ 0 ];
+diff --git a/apps/cli/lib/tests/hosts-file.test.ts b/apps/cli/lib/tests/hosts-file.test.ts
+index e67d43c2..8904f49b 100644
+--- a/apps/cli/lib/tests/hosts-file.test.ts
++++ b/apps/cli/lib/tests/hosts-file.test.ts
+@@ -1,18 +1,20 @@
++import { createHash } from 'node:crypto';
+ import { platform } from 'os';
+-import path from 'path';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { addDomainToHosts, removeDomainFromHosts, writeHostsFile } from 'cli/lib/hosts-file';
+ import { sudoExec } from 'cli/lib/sudo-exec';
+ 
+ const fsState = vi.hoisted( () => ( {
+ 	readContent: '',
+-	writtenContent: null as string | null,
++	writePaths: [] as string[],
++	files: {} as Record< string, string >,
++	symlinks: {} as Record< string, string >,
+ } ) );
+ 
+ vi.mock( 'os', async ( importOriginal ) => {
+ 	const actual = await importOriginal< typeof import('os') >();
+ 	const platformMock = vi.fn( () => 'linux' );
+-	const tmpdirMock = vi.fn( () => '/tmp/wp-studio-test' );
++	const tmpdirMock = vi.fn( () => '/tmp' );
+ 	return {
+ 		...actual,
+ 		default: { ...actual, platform: platformMock, tmpdir: tmpdirMock },
+@@ -23,8 +25,15 @@ vi.mock( 'os', async ( importOriginal ) => {
+ 
+ vi.mock( 'fs', async ( importOriginal ) => {
+ 	const actual = await importOriginal< typeof import('fs') >();
+-	const writeFile: typeof actual.writeFile = ( ( _p: unknown, data: unknown, cb: unknown ) => {
+-		fsState.writtenContent = data as string;
++	const writeFile: typeof actual.writeFile = ( (
++		filePath: unknown,
++		data: unknown,
++		cb: unknown
++	) => {
++		const fileName = String( filePath );
++		const target = fsState.symlinks[ fileName ] ?? fileName;
++		fsState.writePaths.push( fileName );
++		fsState.files[ target ] = String( data );
+ 		( cb as ( err: null ) => void )( null );
+ 	} ) as typeof actual.writeFile;
+ 	const readFile: typeof actual.readFile = ( ( _p: unknown, _opts: unknown, cb: unknown ) => {
+@@ -42,15 +51,56 @@ vi.mock( 'cli/lib/sudo-exec', () => ( {
+ 	sudoExec: vi.fn().mockResolvedValue( undefined ),
+ } ) );
+ 
+-const FAKE_TMPDIR = '/tmp/wp-studio-test';
+-const FAKE_TEMP_PATH = path.join( FAKE_TMPDIR, 'wp-studio-hosts' );
++const LEGACY_TEMP_PATH = '/tmp/wp-studio-hosts';
+ const FAKE_WINDOWS_ROOT = 'C:\\Windows';
+ 
++function decodeWrittenContent( command: string, osPlatform: string ): string {
++	if ( osPlatform === 'win32' ) {
++		const encodedScript = command.split( ' -EncodedCommand ' )[ 1 ];
++		if ( ! encodedScript ) {
++			throw new Error( 'Missing encoded PowerShell script' );
++		}
++		const script = Buffer.from( encodedScript, 'base64' ).toString( 'utf16le' );
++		const encodedContent = script.match( /FromBase64String\('([^']*)'\)/ )?.[ 1 ];
++		if ( encodedContent === undefined ) {
++			throw new Error( 'Missing encoded hosts content' );
++		}
++		return Buffer.from( encodedContent, 'base64' ).toString( 'utf8' );
++	}
++
++	const script = osPlatform === 'linux' ? command : decodeUnixScript( command );
++	const encodedContent = script.match( /\/usr\/bin\/printf '%s' '([^']*)'/ )?.[ 1 ];
++	if ( encodedContent === undefined ) {
++		throw new Error( 'Missing encoded hosts content' );
++	}
++	return Buffer.from( encodedContent, 'base64' ).toString( 'utf8' );
++}
++
++function decodeUnixScript( command: string ): string {
++	const encodedScript = command.match( /^\/usr\/bin\/printf '%s' '([^']*)'/ )?.[ 1 ];
++	if ( encodedScript === undefined ) {
++		throw new Error( 'Missing encoded shell script' );
++	}
++	return Buffer.from( encodedScript, 'base64' ).toString( 'utf8' );
++}
++
++function getWrittenContent(): string {
++	const [ command ] = vi.mocked( sudoExec ).mock.calls.at( -1 ) ?? [];
++	if ( ! command ) {
++		throw new Error( 'Missing elevated command' );
++	}
++	return decodeWrittenContent( command, vi.mocked( platform )() );
++}
++
+ describe( 'writeHostsFile', () => {
+ 	let originalSystemRoot: string | undefined;
+ 
+ 	beforeEach( () => {
+ 		vi.mocked( sudoExec ).mockClear();
++		fsState.writePaths = [];
++		fsState.files = {};
++		fsState.symlinks = {};
++		fsState.readContent = '127.0.0.1 localhost\n';
+ 		originalSystemRoot = process.env.SystemRoot;
+ 		process.env.SystemRoot = FAKE_WINDOWS_ROOT;
+ 	} );
+@@ -64,28 +114,267 @@ describe( 'writeHostsFile', () => {
+ 	} );
+ 
+ 	it.each( [ 'linux', 'darwin' ] as const )(
+-		'uses `tee` instead of redirecting directly to `/etc/hosts` on %s',
++		'stages and verifies an encoded payload before committing on %s',
+ 		async ( osPlatform ) => {
+ 			vi.mocked( platform ).mockReturnValue( osPlatform );
+ 
+ 			await writeHostsFile( '127.0.0.1 mysite.local' );
+ 
+ 			const [ command, options ] = vi.mocked( sudoExec ).mock.calls[ 0 ];
+-			expect( command ).toBe( `tee /etc/hosts < ${ FAKE_TEMP_PATH } > /dev/null` );
++			const script = osPlatform === 'linux' ? command : decodeUnixScript( command );
++			expect( script ).toContain(
++				osPlatform === 'linux' ? 'set -euo pipefail; umask 077' : 'set -euo pipefail\numask 077'
++			);
++			expect( script ).toMatch(
++				osPlatform === 'linux'
++					? /\/etc\/\.wp-studio-hosts-[a-f0-9]{32}/
++					: /\/etc\/\.wp-studio-hosts\.XXXXXXXX/
++			);
++			expect( script ).toContain(
++				`/usr/bin/base64 ${ osPlatform === 'darwin' ? '-D' : '--decode' }`
++			);
++			if ( osPlatform === 'linux' ) {
++				const currentHash = createHash( 'sha256' ).update( fsState.readContent ).digest( 'hex' );
++				const payloadHash = createHash( 'sha256' )
++					.update( '127.0.0.1 mysite.local' )
++					.digest( 'hex' );
++				const snapshotCheck = `/usr/bin/printf '%s  %s\\n' '${ currentHash }' '/etc/hosts' | /usr/bin/sha256sum --check --status -`;
++				const stagingPath = script.match( /: > '([^']+)'/ )?.[ 1 ];
++				expect( stagingPath ).toBeTypeOf( 'string' );
++				const stagingCheck = `/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '${ stagingPath }' | /usr/bin/sha256sum --check --status -`;
++				const destinationCheck = `/usr/bin/printf '%s  %s\\n' '${ payloadHash }' '/etc/hosts' | /usr/bin/sha256sum --check --status -`;
++				const lock = "exec 9>'/run/lock/wordpress-studio-hosts.lock'; /usr/bin/flock -x 9";
++				const attributesCopy = `/usr/bin/cp --attributes-only --preserve=all -- '/etc/hosts' '${ stagingPath }'`;
++				expect( script ).toContain( "/usr/bin/mv -fT -- '/etc/.wp-studio-hosts-" );
++				expect( script ).toContain( "/usr/bin/sync -f '/etc'" );
++				expect( script ).toContain( lock );
++				expect( script.indexOf( lock ) ).toBeLessThan( script.indexOf( snapshotCheck ) );
++				expect( script.split( snapshotCheck ) ).toHaveLength( 3 );
++				expect( script.split( stagingCheck ) ).toHaveLength( 3 );
++				expect( script.split( destinationCheck ) ).toHaveLength( 2 );
++				expect( script.indexOf( attributesCopy ) ).toBeGreaterThan(
++					script.indexOf( stagingCheck )
++				);
++				expect( script.lastIndexOf( stagingCheck ) ).toBeGreaterThan(
++					script.indexOf( attributesCopy )
++				);
++				expect( script.lastIndexOf( snapshotCheck ) ).toBeLessThan(
++					script.indexOf( '/usr/bin/mv -fT' )
++				);
++				expect( script.indexOf( destinationCheck ) ).toBeGreaterThan(
++					script.indexOf( '/usr/bin/mv -fT' )
++				);
++				expect( script ).not.toMatch( /[$`\r\n"]/ );
++			} else {
++				expect( script ).toContain( `/usr/bin/tee '/etc/hosts' < "$staging_file"` );
++			}
++			expect( getWrittenContent() ).toBe( '127.0.0.1 mysite.local' );
++			expect( script ).toContain(
++				createHash( 'sha256' ).update( '127.0.0.1 mysite.local' ).digest( 'hex' )
++			);
++			expect( script ).toContain(
++				createHash( 'sha256' ).update( fsState.readContent ).digest( 'hex' )
++			);
+ 			expect( options ).toMatchObject( { name: 'WordPress Studio' } );
++			expect( fsState.writePaths ).toEqual( [] );
+ 		}
+ 	);
+ 
+-	it( 'uses `type … > …` on win32', async () => {
++	it( 'passes an encoded payload to PowerShell on win32', async () => {
+ 		vi.mocked( platform ).mockReturnValue( 'win32' );
+ 
+ 		await writeHostsFile( '127.0.0.1 mysite.local' );
+ 
+ 		const [ command, options ] = vi.mocked( sudoExec ).mock.calls[ 0 ];
+-		expect( command ).toContain( `type ${ FAKE_TEMP_PATH } >` );
+-		expect( command ).toContain( 'hosts' );
+-		expect( command ).not.toContain( 'tee ' );
++		expect( command ).toMatch(
++			/^powershell\.exe -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/
++		);
++		expect( getWrittenContent() ).toBe( '127.0.0.1 mysite.local' );
+ 		expect( options ).toMatchObject( { name: 'WordPress Studio' } );
++		expect( fsState.writePaths ).toEqual( [] );
++	} );
++
++	it( 'accepts UTF-8 content at the 64 KiB raw-byte limit', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		const content = 'é'.repeat( ( 64 * 1024 ) / 2 );
++
++		await writeHostsFile( content );
++
++		expect( Buffer.byteLength( content, 'utf8' ) ).toBe( 64 * 1024 );
++		const [ command ] = vi.mocked( sudoExec ).mock.calls[ 0 ];
++		expect( Buffer.byteLength( command, 'utf8' ) ).toBeLessThan( 96 * 1024 );
++		expect( getWrittenContent() ).toBe( content );
++	} );
++
++	it( 'rejects UTF-8 content one raw byte over the 64 KiB limit', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		const content = `${ 'é'.repeat( ( 64 * 1024 ) / 2 ) }a`;
++
++		await expect( writeHostsFile( content ) ).rejects.toThrow(
++			'Hosts file content exceeds 65536 bytes'
++		);
++		expect( Buffer.byteLength( content, 'utf8' ) ).toBe( 64 * 1024 + 1 );
++		expect( sudoExec ).not.toHaveBeenCalled();
++	} );
++
++	it( 'is unaffected by replacement, symlink, and content mutation during authorization', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		let finishAuthorization: () => void = () => undefined;
++		const authorizationPending = new Promise< void >( ( resolve ) => {
++			finishAuthorization = resolve;
++		} );
++		let elevatedContent = '';
++		vi.mocked( sudoExec ).mockImplementationOnce( async ( command ) => {
++			await authorizationPending;
++			const script = command.includes( '| /bin/bash' ) ? decodeUnixScript( command ) : command;
++			if ( script.includes( `< ${ LEGACY_TEMP_PATH }` ) ) {
++				const target = fsState.symlinks[ LEGACY_TEMP_PATH ] ?? LEGACY_TEMP_PATH;
++				elevatedContent = fsState.files[ target ];
++			} else {
++				elevatedContent = decodeWrittenContent( command, 'linux' );
++			}
++		} );
++
++		const originalContent = '127.0.0.1 original.local\n::1 original.local';
++		const writePromise = writeHostsFile( originalContent );
++		await vi.waitFor( () => expect( sudoExec ).toHaveBeenCalledOnce() );
++
++		fsState.files[ LEGACY_TEMP_PATH ] = 'attacker-controlled replacement';
++		fsState.symlinks[ LEGACY_TEMP_PATH ] = '/tmp/attacker-target';
++		fsState.files[ '/tmp/attacker-target' ] = 'mutated after authorization began';
++		finishAuthorization();
++		await writePromise;
++
++		const [ command ] = vi.mocked( sudoExec ).mock.calls[ 0 ];
++		expect( command ).not.toMatch( /< \/tmp\/wp-studio-hosts(?:\s|>)/ );
++		expect( elevatedContent ).toBe( originalContent );
++	} );
++
++	it( 'fails closed if the literal staging path is replaced with a symlink during authorization', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		let finishAuthorization: () => void = () => undefined;
++		const authorizationPending = new Promise< void >( ( resolve ) => {
++			finishAuthorization = resolve;
++		} );
++		vi.mocked( sudoExec ).mockImplementationOnce( async ( command ) => {
++			await authorizationPending;
++			const stagingPath = command.match( /: > '([^']+)'/ )?.[ 1 ];
++			if ( ! stagingPath ) {
++				throw new Error( 'missing staging path' );
++			}
++			if ( fsState.files[ stagingPath ] !== undefined || fsState.symlinks[ stagingPath ] ) {
++				throw new Error( 'noclobber refused staging path' );
++			}
++		} );
++
++		const writePromise = writeHostsFile( '127.0.0.1 replacement.local' );
++		await vi.waitFor( () => expect( sudoExec ).toHaveBeenCalledOnce() );
++		const [ command ] = vi.mocked( sudoExec ).mock.calls[ 0 ];
++		const stagingPath = command.match( /: > '([^']+)'/ )?.[ 1 ];
++		expect( stagingPath ).toBeTypeOf( 'string' );
++		fsState.files[ stagingPath! ] = 'attacker replacement';
++		fsState.symlinks[ stagingPath! ] = '/tmp/attacker-target';
++		fsState.files[ '/tmp/attacker-target' ] = 'mutated content';
++		finishAuthorization();
++
++		await expect( writePromise ).rejects.toThrow( 'noclobber refused staging path' );
++	} );
++
++	it( 'aborts if the pre-authorization hosts snapshot changes', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		const snapshot = '127.0.0.1 localhost\n';
++		fsState.readContent = snapshot;
++		let finishAuthorization: () => void = () => undefined;
++		const authorizationPending = new Promise< void >( ( resolve ) => {
++			finishAuthorization = resolve;
++		} );
++		let committed = false;
++		vi.mocked( sudoExec ).mockImplementationOnce( async ( command ) => {
++			await authorizationPending;
++			const script = command;
++			const expectedHash = createHash( 'sha256' ).update( snapshot ).digest( 'hex' );
++			const currentHash = createHash( 'sha256' ).update( fsState.readContent ).digest( 'hex' );
++			expect( script ).toContain( expectedHash );
++			if ( currentHash !== expectedHash ) {
++				throw new Error( 'hosts snapshot changed' );
++			}
++			committed = true;
++		} );
++
++		const writePromise = writeHostsFile( '127.0.0.1 replacement.local', snapshot );
++		await vi.waitFor( () => expect( sudoExec ).toHaveBeenCalledOnce() );
++		fsState.readContent = `${ snapshot }127.0.0.1 concurrent.local\n`;
++		finishAuthorization();
++
++		await expect( writePromise ).rejects.toThrow( 'hosts snapshot changed' );
++		expect( committed ).toBe( false );
++	} );
++
++	it( 'serializes concurrent writers and commits only the first exact payload', async () => {
++		vi.mocked( platform ).mockReturnValue( 'linux' );
++		const snapshot = '127.0.0.1 localhost\n';
++		const firstPayload = `${ snapshot }127.0.0.1 first.local\n`;
++		const secondPayload = `${ snapshot }127.0.0.1 second.local\n`;
++		const snapshotHash = createHash( 'sha256' ).update( snapshot ).digest( 'hex' );
++		fsState.readContent = snapshot;
++
++		let releaseFirstWriter: () => void = () => undefined;
++		const firstWriterBlocked = new Promise< void >( ( resolve ) => {
++			releaseFirstWriter = resolve;
++		} );
++		let firstWriterEntered: () => void = () => undefined;
++		const firstWriterEnteredLock = new Promise< void >( ( resolve ) => {
++			firstWriterEntered = resolve;
++		} );
++		let lockTail = Promise.resolve();
++		let writerCount = 0;
++
++		const runElevatedWriter = async ( command: string ) => {
++			const writerIndex = writerCount++;
++			const previousWriter = lockTail;
++			let releaseLock: () => void = () => undefined;
++			lockTail = new Promise< void >( ( resolve ) => {
++				releaseLock = resolve;
++			} );
++			await previousWriter;
++
++			try {
++				expect( command ).toContain(
++					"exec 9>'/run/lock/wordpress-studio-hosts.lock'; /usr/bin/flock -x 9"
++				);
++				const currentHash = createHash( 'sha256' ).update( fsState.readContent ).digest( 'hex' );
++				if ( currentHash !== snapshotHash || ! command.includes( snapshotHash ) ) {
++					throw new Error( 'hosts snapshot changed while waiting for the root lock' );
++				}
++
++				if ( writerIndex === 0 ) {
++					firstWriterEntered();
++					await firstWriterBlocked;
++				}
++
++				const committedContent = decodeWrittenContent( command, 'linux' );
++				const committedHash = createHash( 'sha256' ).update( committedContent ).digest( 'hex' );
++				expect( command ).toContain( committedHash );
++				fsState.readContent = committedContent;
++			} finally {
++				releaseLock();
++			}
++		};
++		vi.mocked( sudoExec )
++			.mockImplementationOnce( runElevatedWriter )
++			.mockImplementationOnce( runElevatedWriter );
++
++		const firstWrite = writeHostsFile( firstPayload, snapshot );
++		await firstWriterEnteredLock;
++		const secondWrite = writeHostsFile( secondPayload, snapshot );
++		await vi.waitFor( () => expect( sudoExec ).toHaveBeenCalledTimes( 2 ) );
++		releaseFirstWriter();
++
++		await expect( firstWrite ).resolves.toBeUndefined();
++		await expect( secondWrite ).rejects.toThrow(
++			'hosts snapshot changed while waiting for the root lock'
++		);
++		expect( fsState.readContent ).toBe( firstPayload );
+ 	} );
+ } );
+ 
+@@ -93,16 +382,15 @@ describe( 'addDomainToHosts', () => {
+ 	beforeEach( () => {
+ 		vi.mocked( platform ).mockReturnValue( 'darwin' );
+ 		fsState.readContent = '';
+-		fsState.writtenContent = null;
+ 	} );
+ 
+ 	it( 'writes both an IPv4 and an IPv6 loopback entry for a new domain', async () => {
+ 		await addDomainToHosts( 'my-project.local', 8000 );
+ 
+-		expect( fsState.writtenContent ).toContain( '127.0.0.1 my-project.local # Port 8000' );
+-		expect( fsState.writtenContent ).toContain( '::1 my-project.local # Port 8000' );
+-		expect( fsState.writtenContent ).toContain( '# BEGIN WordPress Studio' );
+-		expect( fsState.writtenContent ).toContain( '# END WordPress Studio' );
++		expect( getWrittenContent() ).toContain( '127.0.0.1 my-project.local # Port 8000' );
++		expect( getWrittenContent() ).toContain( '::1 my-project.local # Port 8000' );
++		expect( getWrittenContent() ).toContain( '# BEGIN WordPress Studio' );
++		expect( getWrittenContent() ).toContain( '# END WordPress Studio' );
+ 	} );
+ 
+ 	it( 'migrates a legacy IPv4-only entry by adding the IPv6 entry', async () => {
+@@ -114,8 +402,8 @@ describe( 'addDomainToHosts', () => {
+ 
+ 		await addDomainToHosts( 'my-project.local', 8000 );
+ 
+-		expect( fsState.writtenContent ).toContain( '127.0.0.1 my-project.local # Port 8000' );
+-		expect( fsState.writtenContent ).toContain( '::1 my-project.local # Port 8000' );
++		expect( getWrittenContent() ).toContain( '127.0.0.1 my-project.local # Port 8000' );
++		expect( getWrittenContent() ).toContain( '::1 my-project.local # Port 8000' );
+ 	} );
+ 
+ 	it( 'does not rewrite the hosts file when the entries are already present', async () => {
+@@ -128,7 +416,6 @@ describe( 'addDomainToHosts', () => {
+ 
+ 		await addDomainToHosts( 'my-project.local', 8000 );
+ 
+-		expect( fsState.writtenContent ).toBeNull();
+ 		expect( vi.mocked( sudoExec ) ).not.toHaveBeenCalled();
+ 	} );
+ } );
+@@ -142,14 +429,13 @@ describe( 'removeDomainFromHosts', () => {
+ 			'::1 my-project.local # Port 8000',
+ 			'# END WordPress Studio',
+ 		].join( '\n' );
+-		fsState.writtenContent = null;
+ 	} );
+ 
+ 	it( 'removes both the IPv4 and IPv6 entries', async () => {
+ 		await removeDomainFromHosts( 'my-project.local' );
+ 
+ 		// The block is emptied and removed entirely.
+-		expect( fsState.writtenContent ).not.toContain( 'my-project.local' );
+-		expect( fsState.writtenContent ).not.toContain( '# BEGIN WordPress Studio' );
++		expect( getWrittenContent() ).not.toContain( 'my-project.local' );
++		expect( getWrittenContent() ).not.toContain( '# BEGIN WordPress Studio' );
+ 	} );
+ } );
+diff --git a/apps/cli/php-server-child.ts b/apps/cli/php-server-child.ts
+index 41258378..6d647063 100644
+--- a/apps/cli/php-server-child.ts
++++ b/apps/cli/php-server-child.ts
+@@ -450,7 +450,7 @@ function proxyRequestToPhpWorker(
+ 	req.pipe( proxyReq );
+ }
+ 
+-async function startPhpProxyServer(
++export async function startPhpProxyServer(
+ 	config: ServerConfig,
+ 	stopSignal?: AbortSignal
+ ): Promise< http.Server > {
+@@ -464,7 +464,7 @@ async function startPhpProxyServer(
+ 			proxyServer.close();
+ 			reject( new DOMException( 'Aborted', 'AbortError' ) );
+ 		} );
+-		proxyServer.listen( config.port, 'localhost', () => {
++		proxyServer.listen( config.port, '127.0.0.1', () => {
+ 			resolve();
+ 		} );
+ 	} );
+diff --git a/apps/cli/playground-server-child.ts b/apps/cli/playground-server-child.ts
+index dc14d0f2..6192dcc2 100644
+--- a/apps/cli/playground-server-child.ts
++++ b/apps/cli/playground-server-child.ts
+@@ -10,6 +10,7 @@
+  * - Sends response back when ready
+  * - Sends activity heartbeats to prevent timeout during long operations
+  */
++import net from 'node:net';
+ import { rootCertificates } from 'node:tls';
+ import path, { dirname } from 'path';
+ import { setPhpIniEntries } from '@php-wasm/universal';
+@@ -58,6 +59,65 @@ import {
+ let server: RunCLIServer | null = null;
+ let lastCliArgs: Record< string, unknown > | null = null;
+ 
++const PLAYGROUND_LOOPBACK_HOST = '127.0.0.1';
++type MutableServerPrototype = {
++	listen: ( this: net.Server, ...args: unknown[] ) => net.Server;
++};
++let activeLoopbackBindings = 0;
++let originalServerListen: MutableServerPrototype[ 'listen' ] | null = null;
++let loopbackServerListen: MutableServerPrototype[ 'listen' ] | null = null;
++
++/**
++ * Playground CLI 3.1.45 does not expose a host option and otherwise calls
++ * server.listen(port), which binds to every interface. This child owns a single
++ * Playground operation, so confine every TCP listener created while runCLI is
++ * starting and restore Node's prototype as soon as the operation settles.
++ */
++export async function withPlaygroundCliLoopbackBinding< T >(
++	callback: () => Promise< T >
++): Promise< T > {
++	const serverPrototype = net.Server.prototype as unknown as MutableServerPrototype;
++	if ( activeLoopbackBindings === 0 ) {
++		const originalListen = serverPrototype.listen;
++		originalServerListen = originalListen;
++		loopbackServerListen = function ( ...args: unknown[] ) {
++			let loopbackArgs = args;
++			const firstArg = args[ 0 ];
++
++			if ( typeof firstArg === 'number' ) {
++				loopbackArgs =
++					typeof args[ 1 ] === 'string'
++						? [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 2 ) ]
++						: [ firstArg, PLAYGROUND_LOOPBACK_HOST, ...args.slice( 1 ) ];
++			} else if (
++				typeof firstArg === 'object' &&
++				firstArg !== null &&
++				'port' in firstArg &&
++				typeof firstArg.port === 'number'
++			) {
++				loopbackArgs = [ { ...firstArg, host: PLAYGROUND_LOOPBACK_HOST }, ...args.slice( 1 ) ];
++			}
++
++			return originalListen.apply( this, loopbackArgs );
++		};
++		serverPrototype.listen = loopbackServerListen;
++	}
++
++	activeLoopbackBindings++;
++	try {
++		return await callback();
++	} finally {
++		activeLoopbackBindings--;
++		if ( activeLoopbackBindings === 0 ) {
++			if ( serverPrototype.listen === loopbackServerListen && originalServerListen ) {
++				serverPrototype.listen = originalServerListen;
++			}
++			originalServerListen = null;
++			loopbackServerListen = null;
++		}
++	}
++}
++
+ // Intercept and prefix all console output from playground-cli
+ const originalConsoleLog = console.log;
+ const originalConsoleError = console.error;
+@@ -429,7 +489,7 @@ const startServer = wrapWithStartingPromise(
+ 
+ 			const args = await getBaseRunCLIArgs( 'server', config );
+ 
+-			server = await runCLI( args );
++			server = await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
+ 
+ 			stopSignal.throwIfAborted();
+ 
+@@ -516,7 +576,7 @@ async function runBlueprint( config: ServerConfig, signal: AbortSignal ): Promis
+ 		signal.throwIfAborted();
+ 
+ 		const args = await getBaseRunCLIArgs( 'run-blueprint', config );
+-		await runCLI( args );
++		await withPlaygroundCliLoopbackBinding( () => runCLI( args ) );
+ 
+ 		signal.throwIfAborted();
+ 
+diff --git a/apps/studio/forge.config.ts b/apps/studio/forge.config.ts
+index 3742fc52..260fc774 100644
+--- a/apps/studio/forge.config.ts
++++ b/apps/studio/forge.config.ts
+@@ -105,7 +105,13 @@ const config: ForgeConfig = {
+ 				// dependency resolvable on both.
+ 				// ca-certificates: ships `update-ca-certificates` and the system trust bundle.
+ 				// libnss3-tools: ships `certutil`, used to import the CA into per-user NSS DBs.
+-				depends: [ 'libcap2-bin', 'pkexec | policykit-1', 'ca-certificates', 'libnss3-tools' ],
++				depends: [
++					'libcap2-bin',
++					'pkexec | policykit-1',
++					'ca-certificates',
++					'libnss3-tools',
++					'util-linux',
++				],
+ 				scripts: {
+ 					postinst: path.join( __dirname, 'installers', 'linux', 'postinst.sh' ),
+ 					postrm: path.join( __dirname, 'installers', 'linux', 'postrm.sh' ),
+diff --git a/apps/studio/installers/linux/postrm.sh b/apps/studio/installers/linux/postrm.sh
+index fc71ddad..b4c95133 100755
+--- a/apps/studio/installers/linux/postrm.sh
++++ b/apps/studio/installers/linux/postrm.sh
+@@ -6,12 +6,16 @@ set -e
+ case "$1" in
+ 	purge)
+ 		STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"
+-		if [ -f "$STUDIO_CA_PATH" ]; then
+-			rm -f "$STUDIO_CA_PATH"
+-			if command -v update-ca-certificates >/dev/null 2>&1; then
+-				update-ca-certificates --fresh >/dev/null || true
++		STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"
++		(
++			umask 077
++			exec 9>"$STUDIO_CA_LOCK"
++			/usr/bin/flock -x 9
++			if [ -f "$STUDIO_CA_PATH" ]; then
++				rm -f "$STUDIO_CA_PATH"
+ 			fi
+-		fi
++			/usr/sbin/update-ca-certificates --fresh >/dev/null
++		)
+ 		;;
+ esac
+ 
+diff --git a/apps/studio/src/lib/certificate-manager.ts b/apps/studio/src/lib/certificate-manager.ts
+index 304ee753..c81d0a58 100644
+--- a/apps/studio/src/lib/certificate-manager.ts
++++ b/apps/studio/src/lib/certificate-manager.ts
+@@ -8,10 +8,12 @@ import { CERT_UNTRUSTED_ROOT, SERVER_AUTH_OID } from '@studio/common/constants';
+ import {
+ 	areAllFirefoxProfilesTrustedLinux,
+ 	buildLinuxTrustInstallCommand,
++	getLinuxTrustStoreConfig,
+ 	importCAIntoFirefoxProfilesLinux,
+ 	importCAIntoUserNssDbsLinux,
+ 	isCAImportedInUserNssDbsLinux,
+ 	isCATrustedOnLinux,
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
+ import { getCertificatesPath } from '@studio/common/lib/well-known-paths';
+ import sudo from '@vscode/sudo-prompt';
+@@ -103,10 +105,12 @@ export async function trustRootCA(): Promise< void > {
+ 			// otherwise we'd reprompt for the polkit password just to re-sync NSS
+ 			// (the common case when a Chromium-family browser is installed after
+ 			// the initial trust flow).
++			const { trustStorePath } = getLinuxTrustStoreConfig();
+ 			if ( ! ( await isCATrustedOnLinux( CA_CERT_PATH ) ) ) {
++				const certificate = readLinuxTrustCertificate( CA_CERT_PATH );
+ 				await new Promise< void >( ( resolve, reject ) => {
+ 					sudo.exec(
+-						buildLinuxTrustInstallCommand( CA_CERT_PATH ),
++						buildLinuxTrustInstallCommand( certificate ),
+ 						{ name: 'WordPress Studio' },
+ 						( error ) => {
+ 							if ( error ) {
+@@ -122,13 +126,13 @@ export async function trustRootCA(): Promise< void > {
+ 			}
+ 			// Always run NSS imports — they're idempotent (-D before -A) and don't
+ 			// need sudo, so re-running covers the install-browser-after-trust case.
+-			await importCAIntoUserNssDbsLinux( CA_CERT_PATH );
++			await importCAIntoUserNssDbsLinux( trustStorePath );
+ 			// Firefox keeps a per-profile NSS DB; the system + Chromium imports
+ 			// above don't reach it. Profiles that don't exist yet are skipped —
+ 			// when the user later opens Firefox for the first time, the trust
+ 			// check flips back to untrusted on refetch and the user clicks Trust
+ 			// again to import into the newly created profile.
+-			await importCAIntoFirefoxProfilesLinux( CA_CERT_PATH );
++			await importCAIntoFirefoxProfilesLinux( trustStorePath );
+ 		} else {
+ 			console.error( 'Unsupported platform for automatic certificate trust:', platform );
+ 		}
+diff --git a/apps/studio/src/lib/php-error-recovery.ts b/apps/studio/src/lib/php-error-recovery.ts
+index d65123e7..0ee0d72e 100644
+--- a/apps/studio/src/lib/php-error-recovery.ts
++++ b/apps/studio/src/lib/php-error-recovery.ts
+@@ -105,7 +105,7 @@ export async function startErrorRecovery(
+ 
+ 	await new Promise< void >( ( resolve, reject ) => {
+ 		errorServer.on( 'error', reject );
+-		errorServer.listen( port, () => resolve() );
++		errorServer.listen( port, '127.0.0.1', () => resolve() );
+ 	} );
+ 
+ 	let retrying = false;
+diff --git a/apps/studio/src/lib/tests/php-error-recovery.test.ts b/apps/studio/src/lib/tests/php-error-recovery.test.ts
+index 51e8b9d5..cf17e5ff 100644
+--- a/apps/studio/src/lib/tests/php-error-recovery.test.ts
++++ b/apps/studio/src/lib/tests/php-error-recovery.test.ts
+@@ -15,7 +15,7 @@ function getFreePort(): Promise< number > {
+ 	return new Promise( ( resolve, reject ) => {
+ 		const srv = http.createServer();
+ 		srv.once( 'error', reject );
+-		srv.listen( 0, () => {
++		srv.listen( 0, '127.0.0.1', () => {
+ 			const address = srv.address();
+ 			const port = typeof address === 'object' && address ? address.port : 0;
+ 			srv.close( () => resolve( port ) );
+@@ -27,7 +27,7 @@ function canBind( port: number ): Promise< boolean > {
+ 	return new Promise( ( resolve ) => {
+ 		const srv = http.createServer();
+ 		srv.once( 'error', () => resolve( false ) );
+-		srv.listen( port, () => srv.close( () => resolve( true ) ) );
++		srv.listen( port, '127.0.0.1', () => srv.close( () => resolve( true ) ) );
+ 	} );
+ }
+ 
+@@ -109,6 +109,7 @@ describe( 'error recovery port lifecycle', () => {
+ 	test( 'holds the port and marks the site running, then releases both on stop', async () => {
+ 		const port = await getFreePort();
+ 		const dir = fs.mkdtempSync( nodePath.join( os.tmpdir(), 'php-recovery-test-' ) );
++		const listenSpy = vi.spyOn( http.Server.prototype, 'listen' );
+ 		const siteServer = {
+ 			details: { id: 'test-site', port, path: dir } as {
+ 				id: string;
+@@ -124,6 +125,7 @@ describe( 'error recovery port lifecycle', () => {
+ 
+ 		try {
+ 			await startErrorRecovery( siteServer as never, 'Fatal error: boom', () => ( {} ) );
++			expect( listenSpy ).toHaveBeenCalledWith( port, '127.0.0.1', expect.any( Function ) );
+ 			expect( isInErrorRecovery( 'test-site' ) ).toBe( true );
+ 			// The recovery error server holds the port; the site shows as running and in recovery.
+ 			expect( await canBind( port ) ).toBe( false );
+@@ -149,6 +151,7 @@ describe( 'error recovery port lifecycle', () => {
+ 			expect( siteServer.inErrorRecovery ).toBe( false );
+ 		} finally {
+ 			await stopErrorRecovery( 'test-site' );
++			listenSpy.mockRestore();
+ 			fs.rmSync( dir, { recursive: true, force: true } );
+ 		}
+ 	} );
+diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
+index 4bb9bf6c..f54ecf4a 100644
+--- a/apps/studio/src/site-server.ts
++++ b/apps/studio/src/site-server.ts
+@@ -265,6 +265,7 @@ export class SiteServer {
+ 
+ 		console.log( `Starting server for '${ this.details.name }'` );
+ 		await this.server.start();
++		this.adoptRunningState( true );
+ 	}
+ 
+ 	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
+diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
+index bbc02940..3f9a444e 100644
+--- a/apps/studio/src/tests/site-server.test.ts
++++ b/apps/studio/src/tests/site-server.test.ts
+@@ -195,5 +195,31 @@ describe( 'SiteServer', () => {
+ 				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
+ 			);
+ 		} );
++
++		it( 'marks a successful CLI start as running before it resolves', async () => {
++			mockStartServer.mockResolvedValueOnce( {
++				url: 'http://localhost:1234',
++				options: { port: 1234, phpVersion: '8.0' },
++				_internal: { mode: 'wordpress', port: 1234 },
++			} );
++
++			const server = SiteServer.register( {
++				id: 'successful-start',
++				name: 'successful-start',
++				path: '/tmp/successful-start',
++				port: 1234,
++				adminPassword: 'test-password',
++				phpVersion: '8.4',
++				running: false,
++				themeDetails: undefined,
++			} );
++
++			await server.start();
++
++			expect( server.details.running ).toBe( true );
++			if ( server.details.running ) {
++				expect( server.details.url ).toBe( 'http://localhost:1234' );
++			}
++		} );
+ 	} );
+ } );
 diff --git a/apps/studio/src/tests/updates.test.ts b/apps/studio/src/tests/updates.test.ts
 index b90c9371..1241f667 100644
 --- a/apps/studio/src/tests/updates.test.ts
@@ -142,10 +1430,23 @@ index 142b6b7a..bb075f16 100644
  	} catch {
  		Sentry.captureException( new Error( `Malformed downloadUrl: ${ downloadUrl }` ) );
 diff --git a/packages/common/lib/linux-trust-store.ts b/packages/common/lib/linux-trust-store.ts
-index 485387ab..77309501 100644
+index 485387ab..56045ba8 100644
 --- a/packages/common/lib/linux-trust-store.ts
 +++ b/packages/common/lib/linux-trust-store.ts
-@@ -3,13 +3,41 @@ import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+@@ -1,15 +1,105 @@
+ import { execFile } from 'node:child_process';
+-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
++import { createHash, randomBytes, X509Certificate } from 'node:crypto';
++import {
++	closeSync,
++	constants as fsConstants,
++	existsSync,
++	fstatSync,
++	mkdirSync,
++	openSync,
++	readSync,
++	readdirSync,
++} from 'node:fs';
  import os from 'node:os';
  import path from 'node:path';
  import { promisify } from 'node:util';
@@ -168,51 +1469,235 @@ index 485387ab..77309501 100644
 +	updateCommand: string;
 +}
 +
++const MAX_LINUX_CA_SIZE = 64 * 1024;
++const STUDIO_CA_COMMON_NAME = 'CN=WordPress Studio CA';
++const STUDIO_CA_ORGANIZATION = 'O=WordPress Studio';
++const STUDIO_CA_INSTALL_LOCK = '/run/lock/wordpress-studio-ca.lock';
++
++interface LinuxTrustCertificateFingerprints {
++	file: string;
++	der: string;
++}
++
++function validateLinuxTrustCertificate(
++	certificateBytes: Buffer
++): LinuxTrustCertificateFingerprints {
++	if ( certificateBytes.byteLength <= 0 || certificateBytes.byteLength > MAX_LINUX_CA_SIZE ) {
++		throw new Error( 'The Studio CA has an invalid size' );
++	}
++
++	const pem = certificateBytes.toString( 'utf8' );
++	const pemCertificates = pem.match(
++		/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
++	);
++	if ( pemCertificates?.length !== 1 || pem.trim() !== pemCertificates[ 0 ] ) {
++		throw new Error( 'The Studio CA must contain exactly one PEM certificate' );
++	}
++
++	let certificate: X509Certificate;
++	try {
++		certificate = new X509Certificate( certificateBytes );
++	} catch {
++		throw new Error( 'The Studio CA is not a valid X.509 certificate' );
++	}
++
++	if (
++		! certificate.ca ||
++		certificate.subject !== certificate.issuer ||
++		! certificate.checkIssued( certificate ) ||
++		! certificate.verify( certificate.publicKey )
++	) {
++		throw new Error( 'The Studio CA must be a self-signed certificate authority' );
++	}
++	if (
++		! certificate.subject.split( '\n' ).includes( STUDIO_CA_COMMON_NAME ) ||
++		! certificate.subject.split( '\n' ).includes( STUDIO_CA_ORGANIZATION )
++	) {
++		throw new Error( 'The Studio CA has an unexpected identity' );
++	}
++	return {
++		file: createHash( 'sha256' ).update( certificateBytes ).digest( 'hex' ),
++		der: certificate.fingerprint256.replace( /:/g, '' ).toLowerCase(),
++	};
++}
++
 +export function getLinuxTrustStoreConfig(
 +	distribution: LinuxDistribution = getLinuxDistribution()
 +): LinuxTrustStoreConfig {
 +	if ( isArchBasedLinux( distribution ) ) {
 +		return {
 +			trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
-+			updateCommand: 'update-ca-trust extract',
++			updateCommand: '/usr/bin/update-ca-trust extract',
 +		};
 +	}
 +
 +	return {
 +		trustStorePath: LINUX_TRUST_STORE_PATH,
-+		updateCommand: 'update-ca-certificates',
++		updateCommand: '/usr/sbin/update-ca-certificates',
 +	};
 +}
 +
  export async function isCATrustedOnLinux( caPath: string ): Promise< boolean > {
  	try {
  		await execFilePromise( 'openssl', [ 'verify', '-CAfile', LINUX_SYSTEM_CA_BUNDLE, caPath ] );
-@@ -37,8 +65,18 @@ export async function isCAImportedInUserNssDbsLinux(
+@@ -37,8 +127,121 @@ export async function isCAImportedInUserNssDbsLinux(
  	return true;
  }
  
 -export function buildLinuxTrustInstallCommand( caPath: string ): string {
 -	return `install -m 0644 "${ caPath }" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`;
-+function quoteShellArgument( value: string ): string {
-+	return `'${ value.replace( /'/g, `'"'"'` ) }'`;
++export function readLinuxTrustCertificate( caPath: string ): Buffer {
++	const fd = openSync(
++		caPath,
++		fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
++	);
++	try {
++		const initialStat = fstatSync( fd, { bigint: true } );
++		if ( ! initialStat.isFile() ) {
++			throw new Error( 'The Studio CA must be a regular file' );
++		}
++		if ( initialStat.size <= BigInt( 0 ) || initialStat.size > BigInt( MAX_LINUX_CA_SIZE ) ) {
++			throw new Error( 'The Studio CA has an invalid size' );
++		}
++
++		const certificate = Buffer.allocUnsafe( Number( initialStat.size ) );
++		let offset = 0;
++		while ( offset < certificate.byteLength ) {
++			const bytesRead = readSync( fd, certificate, offset, certificate.byteLength - offset, null );
++			if ( bytesRead === 0 ) {
++				throw new Error( 'The Studio CA changed while it was being read' );
++			}
++			offset += bytesRead;
++		}
++
++		const extraByte = Buffer.allocUnsafe( 1 );
++		const grewDuringRead = readSync( fd, extraByte, 0, 1, null ) !== 0;
++		const finalStat = fstatSync( fd, { bigint: true } );
++		if (
++			grewDuringRead ||
++			finalStat.size !== initialStat.size ||
++			finalStat.dev !== initialStat.dev ||
++			finalStat.ino !== initialStat.ino ||
++			finalStat.ctimeNs !== initialStat.ctimeNs ||
++			finalStat.mtimeNs !== initialStat.mtimeNs
++		) {
++			throw new Error( 'The Studio CA changed while it was being read' );
++		}
++		validateLinuxTrustCertificate( certificate );
++		return certificate;
++	} finally {
++		closeSync( fd );
++	}
 +}
 +
 +export function buildLinuxTrustInstallCommand(
-+	caPath: string,
++	certificate: Buffer,
 +	distribution: LinuxDistribution = getLinuxDistribution()
 +): string {
 +	const { trustStorePath, updateCommand } = getLinuxTrustStoreConfig( distribution );
-+	return `install -m 0644 ${ quoteShellArgument( caPath ) } ${ quoteShellArgument(
++	const fingerprints = validateLinuxTrustCertificate( certificate );
++	const encodedCertificate = certificate.toString( 'base64' );
++	const nonce = randomBytes( 16 ).toString( 'hex' );
++	const trustStoreDirectory = path.posix.dirname( trustStorePath );
++	const stagingPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.tmp` );
++	const derPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.der` );
++	const backupCopyPath = path.posix.join(
++		trustStoreDirectory,
++		`.studio-ca-${ nonce }.backup-copy`
++	);
++	const backupPath = path.posix.join( trustStoreDirectory, `.studio-ca-${ nonce }.backup` );
++	const noPreviousAnchorPath = path.posix.join(
++		trustStoreDirectory,
++		`.studio-ca-${ nonce }.no-previous-anchor`
++	);
++	const cleanupPaths = [ stagingPath, derPath, backupCopyPath, backupPath, noPreviousAnchorPath ]
++		.map( ( filePath ) => `'${ filePath }'` )
++		.join( ' ' );
++	const rollbackFailureCleanupPaths = [ stagingPath, derPath, backupCopyPath, noPreviousAnchorPath ]
++		.map( ( filePath ) => `'${ filePath }'` )
++		.join( ' ' );
++	const verifyFile = ( filePath: string ) =>
++		`/usr/bin/printf '%s  %s\\n' '${ fingerprints.file }' '${ filePath }' | /usr/bin/sha256sum --check --strict --status`;
++	const verifyDer = ( filePath: string ) =>
++		`/usr/bin/openssl x509 -in '${ filePath }' -outform DER -out '${ derPath }' && /usr/bin/printf '%s  %s\\n' '${ fingerprints.der }' '${ derPath }' | /usr/bin/sha256sum --check --strict --status && /usr/bin/rm -f -- '${ derPath }'`;
++	const verifyInstalledAnchor = `${ verifyFile( trustStorePath ) } && ${ verifyDer(
 +		trustStorePath
-+	) } && ${ updateCommand }`;
++	) }`;
++	const preservePreviousAnchor =
++		`if [ -e '${ trustStorePath }' ] || [ -L '${ trustStorePath }' ]; then ` +
++		`/usr/bin/cp -a -- '${ trustStorePath }' '${ backupCopyPath }' && ` +
++		`/usr/bin/mv -fT -- '${ backupCopyPath }' '${ backupPath }'; else ` +
++		`/usr/bin/touch '${ noPreviousAnchorPath }'; fi`;
++	const rollback =
++		`if { ${ verifyInstalledAnchor }; }; then ` +
++		`if [ -e '${ backupPath }' ] || [ -L '${ backupPath }' ]; then ` +
++		`/usr/bin/mv -fT -- '${ backupPath }' '${ trustStorePath }' || { ` +
++		`${ updateCommand } >/dev/null 2>&1 || true; ` +
++		`/usr/bin/rm -f -- ${ rollbackFailureCleanupPaths }; exit 1; }; ` +
++		`elif [ -e '${ noPreviousAnchorPath }' ]; then ` +
++		`/usr/bin/rm -f -- '${ trustStorePath }' || { ` +
++		`${ updateCommand } >/dev/null 2>&1 || true; ` +
++		`/usr/bin/rm -f -- ${ rollbackFailureCleanupPaths }; exit 1; }; fi; fi; ` +
++		`${ updateCommand } >/dev/null 2>&1 || true; ` +
++		`/usr/bin/rm -f -- ${ cleanupPaths }; exit 1`;
++
++	return (
++		[
++			'umask 077',
++			`exec 9>'${ STUDIO_CA_INSTALL_LOCK }'`,
++			'/usr/bin/flock -x 9',
++			`/usr/bin/rm -f -- ${ cleanupPaths }`,
++			`/usr/bin/printf '%s' '${ encodedCertificate }' | /usr/bin/base64 --decode > '${ stagingPath }'`,
++			verifyFile( stagingPath ),
++			verifyDer( stagingPath ),
++			`/usr/bin/chmod 0644 '${ stagingPath }'`,
++			preservePreviousAnchor,
++			`/usr/bin/mv -fT -- '${ stagingPath }' '${ trustStorePath }'`,
++			verifyInstalledAnchor,
++			updateCommand,
++			verifyInstalledAnchor,
++			`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ trustStorePath }'`,
++			verifyInstalledAnchor,
++			`/usr/bin/rm -f -- '${ backupPath }' '${ noPreviousAnchorPath }'`,
++		].join( ' && ' ) + ` || { ${ rollback }; }`
++	);
  }
  
  // Snap-Chromium uses a sandboxed NSS DB under ~/snap/chromium/, separate
+diff --git a/packages/common/lib/port-finder.ts b/packages/common/lib/port-finder.ts
+index 9da2e3b8..6d9d1cc7 100644
+--- a/packages/common/lib/port-finder.ts
++++ b/packages/common/lib/port-finder.ts
+@@ -8,16 +8,14 @@ let searchPort = DEFAULT_PORT;
+ let openPort: number | null = null;
+ const unavailablePorts: Array< number > = [];
+ 
+-// Bind the same host the site server uses (localhost, see php-server-child.ts)
+-// so a successful probe means the server can bind the port too; probing a fixed
+-// 127.0.0.1 could disagree with the server when localhost resolves to ::1. A
+-// single bind also avoids the connect/destroy socket churn that crashed Node on
+-// Windows.
++// Bind the same literal loopback address as the site server so a successful
++// probe means the server can bind the port too. A single bind also avoids the
++// connect/destroy socket churn that crashed Node on Windows.
+ function isPortFree( portToCheck: number ): Promise< boolean > {
+ 	return new Promise( ( resolve ) => {
+ 		const server = net.createServer();
+ 		server.once( 'error', () => resolve( false ) );
+-		server.listen( portToCheck, 'localhost', () => server.close( () => resolve( true ) ) );
++		server.listen( portToCheck, '127.0.0.1', () => server.close( () => resolve( true ) ) );
+ 	} );
+ }
+ 
 diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/common/lib/tests/linux-trust-store.test.ts
-index c69b9ebd..696a3380 100644
+index c69b9ebd..48a039bc 100644
 --- a/packages/common/lib/tests/linux-trust-store.test.ts
 +++ b/packages/common/lib/tests/linux-trust-store.test.ts
-@@ -3,9 +3,11 @@ import os from 'node:os';
+@@ -1,17 +1,31 @@
++import { execFileSync, spawnSync } from 'node:child_process';
++import { createHash, X509Certificate } from 'node:crypto';
+ import fs from 'node:fs';
+ import os from 'node:os';
  import path from 'node:path';
  import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  import {
@@ -224,50 +1709,367 @@ index c69b9ebd..696a3380 100644
  	LINUX_NSS_NICKNAME,
  	LINUX_SYSTEM_CA_BUNDLE,
  	LINUX_TRUST_STORE_PATH,
-@@ -28,19 +30,59 @@ describe( 'linux-trust-store', () => {
++	readLinuxTrustCertificate,
+ } from '@studio/common/lib/linux-trust-store';
  
+ describe( 'linux-trust-store', () => {
++	const studioCAFixturePath = path.join(
++		process.cwd(),
++		'packages/common/lib/tests/fixtures/studio-ca.crt'
++	);
++	const studioCAFixture = fs.readFileSync( studioCAFixturePath );
++	const notACAFixture = fs.readFileSync(
++		path.join( process.cwd(), 'packages/common/lib/tests/fixtures/not-a-ca.crt' )
++	);
++
+ 	describe( 'constants', () => {
+ 		it( 'targets the Debian/Ubuntu system trust bundle', () => {
+ 			expect( LINUX_SYSTEM_CA_BUNDLE ).toBe( '/etc/ssl/certs/ca-certificates.crt' );
+@@ -26,21 +40,357 @@ describe( 'linux-trust-store', () => {
+ 		} );
+ 	} );
+ 
++	it.skipIf( process.platform === 'win32' )(
++		'uses the generated critical .local name constraint in the Studio CA fixture',
++		() => {
++			const certificateText = execFileSync(
++				'openssl',
++				[ 'x509', '-in', studioCAFixturePath, '-noout', '-text' ],
++				{ encoding: 'utf8' }
++			);
++
++			expect( certificateText ).toMatch( /X509v3 Name Constraints: critical/ );
++			expect( certificateText ).toMatch( /Permitted:\s+DNS:\.local/ );
++		}
++	);
++
  	describe( 'buildLinuxTrustInstallCommand', () => {
- 		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
+-		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
 -			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt' );
-+			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt', {
++		const certificate = studioCAFixture;
++
++		it( 'binds the exact certificate bytes and fingerprint to a fixed Debian trust destination', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++			const fingerprint = createHash( 'sha256' ).update( certificate ).digest( 'hex' );
++			const derFingerprint = new X509Certificate( certificate ).fingerprint256
++				.replace( /:/g, '' )
++				.toLowerCase();
++
++			expect( command ).toContain( certificate.toString( 'base64' ) );
++			expect( command ).toContain( fingerprint );
++			expect( command.match( new RegExp( fingerprint, 'g' ) ) ).toHaveLength( 5 );
++			expect( command.match( new RegExp( derFingerprint, 'g' ) ) ).toHaveLength( 5 );
++			expect( command ).toContain( `'${ LINUX_TRUST_STORE_PATH }'` );
++			expect( command ).toContain( '/usr/sbin/update-ca-certificates' );
++			expect( command ).toMatch(
++				/\/usr\/local\/share\/ca-certificates\/\.studio-ca-[a-f0-9]{32}\.tmp/
++			);
++		} );
++
++		it( 'does not give the privileged shell a mutable source path or expansion syntax', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
 +				id: 'ubuntu',
 +				idLike: [ 'debian' ],
 +			} );
  
- 			expect( command ).toBe(
+-			expect( command ).toBe(
 -				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
-+				`install -m 0644 '/home/u/.studio/certificates/studio-ca.crt' '${ LINUX_TRUST_STORE_PATH }' && update-ca-certificates`
++			expect( command ).not.toContain( '/home/' );
++			expect( command ).not.toMatch( /[\r\n`$"]/ );
++		} );
++
++		it( 'restores the previous anchor and re-extracts trust after a failed replacement', () => {
++			const command = buildLinuxTrustInstallCommand( certificate, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.backup/ );
++			expect( command ).toMatch( /\.studio-ca-[a-f0-9]{32}\.no-previous-anchor/ );
++			expect( command ).toContain(
++				`/usr/bin/mv -fT -- '/usr/local/share/ca-certificates/.studio-ca-`
++			);
++			expect( command ).toMatch(
++				/\.backup' '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{/
++			);
++			expect( command ).toMatch(
++				/\/usr\/bin\/rm -f -- '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{/
++			);
++			expect( command.match( /\/usr\/sbin\/update-ca-certificates/g ) ).toHaveLength( 4 );
++			expect( command ).toContain( "exec 9>'/run/lock/wordpress-studio-ca.lock'" );
++			expect( command ).toContain( '/usr/bin/flock -x 9' );
++			expect( command ).toMatch(
++				/\|\| \{ if \{ \/usr\/bin\/printf[^}]+studio-ca\.crt[^}]+\/usr\/bin\/openssl x509[^}]+studio-ca\.crt[^}]+\}; then if /
++			);
++			expect( command ).toContain(
++				`/usr/bin/openssl verify -CAfile '${ LINUX_SYSTEM_CA_BUNDLE }' '${ LINUX_TRUST_STORE_PATH }'`
++			);
++			expect( command ).toMatch(
++				/\/usr\/sbin\/update-ca-certificates && \/usr\/bin\/printf[^&]+studio-ca\.crt/
++			);
++			expect( command ).toMatch(
++				/openssl verify -CAfile [^&]+studio-ca\.crt' && \/usr\/bin\/printf[^&]+studio-ca\.crt/
++			);
++			expect( command ).toMatch(
++				/\.backup' '\/usr\/local\/share\/ca-certificates\/studio-ca\.crt' \|\| \{[\s\S]+update-ca-certificates[^}]+\/usr\/bin\/rm -f --[^}]+exit 1/
  			);
  		} );
  
- 		it( 'quotes the source path so home directories with spaces are handled', () => {
- 			const command = buildLinuxTrustInstallCommand(
+-		it( 'quotes the source path so home directories with spaces are handled', () => {
+-			const command = buildLinuxTrustInstallCommand(
 -				'/home/Some User/.studio/certificates/studio-ca.crt'
-+				'/home/Some User/.studio/certificates/studio-ca.crt',
-+				{ id: 'ubuntu', idLike: [ 'debian' ] }
++		it( 'shares the certificate transaction lock with Debian package removal', () => {
++			const debianRemovalScript = fs.readFileSync(
++				path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
++				'utf8'
++			);
++
++			expect( debianRemovalScript ).toContain( '/run/lock/wordpress-studio-ca.lock' );
++			expect( debianRemovalScript ).toContain( '/usr/bin/flock -x 9' );
++			expect( debianRemovalScript ).toContain(
++				'/usr/sbin/update-ca-certificates --fresh >/dev/null'
  			);
- 
--			expect( command ).toContain( '"/home/Some User/.studio/certificates/studio-ca.crt"' );
-+			expect( command ).toContain( "'/home/Some User/.studio/certificates/studio-ca.crt'" );
++			expect( debianRemovalScript ).not.toContain( 'update-ca-certificates --fresh >/dev/null ||' );
 +		} );
 +
-+		it( 'escapes single quotes in the source path', () => {
-+			const command = buildLinuxTrustInstallCommand( "/home/O'Neil/studio-ca.crt", {
-+				id: 'ubuntu',
-+				idLike: [ 'debian' ],
-+			} );
++		it.skipIf( process.platform !== 'linux' )(
++			'retries Debian trust extraction after an earlier refresh failure',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-deb-trust-retry-' ) );
++				try {
++					const caPath = path.join( tmpDir, 'studio-ca.crt' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					const counterPath = path.join( tmpDir, 'update-count' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const removalScriptPath = path.join( tmpDir, 'postrm.sh' );
++					fs.writeFileSync( caPath, studioCAFixture );
++					fs.writeFileSync(
++						updateScript,
++						`#!/bin/sh\ncount=0\n[ ! -e '${ counterPath }' ] || read -r count <'${ counterPath }'\ncount=$((count + 1))\nprintf '%s\\n' "$count" >'${ counterPath }'\n[ "$count" -gt 1 ]\n`,
++						{ mode: 0o755 }
++					);
++					const removalScript = fs
++						.readFileSync(
++							path.join( process.cwd(), 'apps/studio/installers/linux/postrm.sh' ),
++							'utf8'
++						)
++						.replace(
++							'STUDIO_CA_PATH="/usr/local/share/ca-certificates/studio-ca.crt"',
++							`STUDIO_CA_PATH="${ caPath }"`
++						)
++						.replace(
++							'STUDIO_CA_LOCK="/run/lock/wordpress-studio-ca.lock"',
++							`STUDIO_CA_LOCK="${ lockPath }"`
++						)
++						.replace( '/usr/sbin/update-ca-certificates --fresh >/dev/null', updateScript );
++					fs.writeFileSync( removalScriptPath, removalScript, { mode: 0o755 } );
 +
-+			expect( command ).toContain( "'/home/O'\"'\"'Neil/studio-ca.crt'" );
++					const first = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
++					expect( first.status ).not.toBe( 0 );
++					expect( fs.existsSync( caPath ) ).toBe( false );
++					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '1' );
++
++					const second = spawnSync( removalScriptPath, [ 'purge' ], { encoding: 'utf8' } );
++					expect( second.status ).toBe( 0 );
++					expect( fs.readFileSync( counterPath, 'utf8' ).trim() ).toBe( '2' );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it.skipIf( process.platform !== 'linux' )(
++			'does not roll back over an anchor replaced by another authorized operation',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-cas-test-' ) );
++				try {
++					const trustDirectory = path.join( tmpDir, 'trust' );
++					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
++					const replacementPath = path.join( tmpDir, 'replacement.crt' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					const replacement = Buffer.from( 'concurrent authorized replacement' );
++					fs.mkdirSync( trustDirectory );
++					fs.writeFileSync( trustStorePath, notACAFixture );
++					fs.writeFileSync( replacementPath, replacement );
++					fs.writeFileSync(
++						updateScript,
++						`#!/bin/sh\n/usr/bin/cp -- '${ replacementPath }' '${ trustStorePath }'\nexit 0\n`,
++						{ mode: 0o755 }
++					);
++
++					const command = buildLinuxTrustInstallCommand( certificate, {
++						id: 'ubuntu',
++						idLike: [ 'debian' ],
++					} )
++						.split( '/usr/local/share/ca-certificates/' )
++						.join( `${ trustDirectory }/` )
++						.split( '/usr/sbin/update-ca-certificates' )
++						.join( updateScript )
++						.split( '/run/lock/wordpress-studio-ca.lock' )
++						.join( lockPath );
++					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
++
++					expect( result.status ).toBe( 1 );
++					expect( fs.readFileSync( trustStorePath ) ).toEqual( replacement );
++					expect( fs.readdirSync( trustDirectory ) ).toEqual( [ 'studio-ca.crt' ] );
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it.skipIf( process.platform !== 'linux' )(
++			'preserves the previous anchor backup when rollback restoration fails',
++			() => {
++				const tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-restore-test-' ) );
++				try {
++					const trustDirectory = path.join( tmpDir, 'trust' );
++					const trustStorePath = path.join( trustDirectory, 'studio-ca.crt' );
++					const updateScript = path.join( tmpDir, 'update-trust' );
++					const moveScript = path.join( tmpDir, 'move' );
++					const lockPath = path.join( tmpDir, 'studio-ca.lock' );
++					fs.mkdirSync( trustDirectory );
++					fs.writeFileSync( trustStorePath, notACAFixture );
++					fs.writeFileSync( updateScript, '#!/bin/sh\nexit 1\n', { mode: 0o755 } );
++
++					let command = buildLinuxTrustInstallCommand( certificate, {
++						id: 'ubuntu',
++						idLike: [ 'debian' ],
++					} )
++						.split( '/usr/local/share/ca-certificates/' )
++						.join( `${ trustDirectory }/` )
++						.split( '/usr/sbin/update-ca-certificates' )
++						.join( updateScript )
++						.split( '/run/lock/wordpress-studio-ca.lock' )
++						.join( lockPath );
++					const backupPath = command.match( /'([^']+\.backup)'/ )?.[ 1 ];
++					expect( backupPath ).toBeTypeOf( 'string' );
++					fs.writeFileSync(
++						moveScript,
++						`#!/bin/sh\nif [ "$3" = '${ backupPath }' ]; then exit 1; fi\nexec /usr/bin/mv "$@"\n`,
++						{ mode: 0o755 }
++					);
++					command = command.split( '/usr/bin/mv' ).join( moveScript );
++
++					const result = spawnSync( '/bin/bash', [ '-c', command ], { encoding: 'utf8' } );
++
++					expect( result.status ).toBe( 1 );
++					expect( fs.readFileSync( trustStorePath ) ).toEqual( certificate );
++					expect( fs.readFileSync( backupPath! ) ).toEqual( notACAFixture );
++					expect( fs.readdirSync( trustDirectory ).sort() ).toEqual(
++						[ path.basename( backupPath! ), 'studio-ca.crt' ].sort()
++					);
++				} finally {
++					fs.rmSync( tmpDir, { recursive: true, force: true } );
++				}
++			}
++		);
++
++		it( 'rejects malformed and non-CA inputs before constructing a root command', () => {
++			expect( () =>
++				buildLinuxTrustInstallCommand( Buffer.from( 'not a certificate' ), {
++					id: 'ubuntu',
++					idLike: [ 'debian' ],
++				} )
++			).toThrow( 'exactly one PEM certificate' );
++			expect( () =>
++				buildLinuxTrustInstallCommand( notACAFixture, {
++					id: 'ubuntu',
++					idLike: [ 'debian' ],
++				} )
++			).toThrow( 'self-signed certificate authority' );
 +		} );
 +
 +		it( 'uses the Arch trust anchor directory and update command', () => {
-+			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt', {
++			const command = buildLinuxTrustInstallCommand( certificate, {
 +				id: 'arch',
 +				idLike: [],
 +			} );
 +
-+			expect( command ).toBe(
-+				`install -m 0644 '/home/u/.studio/certificates/studio-ca.crt' '${ ARCH_LINUX_TRUST_STORE_PATH }' && update-ca-trust extract`
++			expect( command ).toContain( `'${ ARCH_LINUX_TRUST_STORE_PATH }'` );
++			expect( command ).toContain( '/usr/bin/update-ca-trust extract' );
++		} );
++	} );
++
++	describe( 'readLinuxTrustCertificate', () => {
++		let tmpDir: string;
++
++		beforeEach( () => {
++			tmpDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-trust-source-test-' ) );
++		} );
++
++		afterEach( () => {
++			fs.rmSync( tmpDir, { recursive: true, force: true } );
++		} );
++
++		it( 'keeps the authorized bytes when the source path is replaced afterwards', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			const replacementPath = path.join( tmpDir, 'replacement.crt' );
++			const authorized = studioCAFixture;
++			const replacement = Buffer.from( 'substituted certificate bytes' );
++			fs.writeFileSync( caPath, authorized );
++			fs.writeFileSync( replacementPath, replacement );
++
++			const snapshot = readLinuxTrustCertificate( caPath );
++			fs.unlinkSync( caPath );
++			fs.symlinkSync( replacementPath, caPath );
++			const command = buildLinuxTrustInstallCommand( snapshot, {
++				id: 'ubuntu',
++				idLike: [ 'debian' ],
++			} );
++
++			expect( command ).toContain( authorized.toString( 'base64' ) );
++			expect( command ).not.toContain( replacement.toString( 'base64' ) );
++		} );
++
++		it( 'rejects a symlink instead of following it', () => {
++			const realPath = path.join( tmpDir, 'real.crt' );
++			const symlinkPath = path.join( tmpDir, 'studio-ca.crt' );
++			fs.writeFileSync( realPath, 'certificate bytes' );
++			fs.symlinkSync( realPath, symlinkPath );
++
++			expect( () => readLinuxTrustCertificate( symlinkPath ) ).toThrow();
++		} );
++
++		it( 'rejects non-regular sources', () => {
++			expect( () => readLinuxTrustCertificate( tmpDir ) ).toThrow(
++				'The Studio CA must be a regular file'
++			);
++		} );
++
++		it.skipIf( process.platform === 'win32' )(
++			'rejects a FIFO without blocking on a writer',
++			() => {
++				const fifoPath = path.join( tmpDir, 'studio-ca.crt' );
++				execFileSync( 'mkfifo', [ fifoPath ] );
++
++				expect( () => readLinuxTrustCertificate( fifoPath ) ).toThrow(
++					'The Studio CA must be a regular file'
++				);
++			}
++		);
++
++		it( 'accepts a certificate exactly at the bounded-read limit', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			const certificate = Buffer.concat( [
++				studioCAFixture,
++				Buffer.alloc( 64 * 1024 - studioCAFixture.byteLength, 0x0a ),
++			] );
++			fs.writeFileSync( caPath, certificate );
++
++			expect( readLinuxTrustCertificate( caPath ) ).toEqual( certificate );
++		} );
++
++		it( 'rejects a certificate one byte over the bounded-read limit', () => {
++			const caPath = path.join( tmpDir, 'studio-ca.crt' );
++			fs.writeFileSync( caPath, Buffer.alloc( 64 * 1024 + 1, 0x41 ) );
++
++			expect( () => readLinuxTrustCertificate( caPath ) ).toThrow(
++				'The Studio CA has an invalid size'
 +			);
 +		} );
 +	} );
@@ -276,18 +2078,503 @@ index c69b9ebd..696a3380 100644
 +		it( 'uses Debian defaults for Ubuntu', () => {
 +			expect( getLinuxTrustStoreConfig( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toEqual( {
 +				trustStorePath: LINUX_TRUST_STORE_PATH,
-+				updateCommand: 'update-ca-certificates',
++				updateCommand: '/usr/sbin/update-ca-certificates',
 +			} );
 +		} );
-+
+ 
+-			expect( command ).toContain( '"/home/Some User/.studio/certificates/studio-ca.crt"' );
 +		it( 'uses p11-kit anchors for Arch derivatives', () => {
 +			expect( getLinuxTrustStoreConfig( { id: 'omarchy', idLike: [ 'arch' ] } ) ).toEqual( {
 +				trustStorePath: ARCH_LINUX_TRUST_STORE_PATH,
-+				updateCommand: 'update-ca-trust extract',
++				updateCommand: '/usr/bin/update-ca-trust extract',
 +			} );
  		} );
  	} );
  
+diff --git a/packages/common/lib/tests/port-finder.test.ts b/packages/common/lib/tests/port-finder.test.ts
+index b8e224bb..f50f5519 100644
+--- a/packages/common/lib/tests/port-finder.test.ts
++++ b/packages/common/lib/tests/port-finder.test.ts
+@@ -34,11 +34,11 @@ describe( 'portFinder STUDIO_BASE_PORT', () => {
+ 	} );
+ } );
+ 
+-function listenOnLocalhost( port: number ): Promise< net.Server > {
++function listenOnIpv4Loopback( port: number ): Promise< net.Server > {
+ 	return new Promise( ( resolve, reject ) => {
+ 		const server = net.createServer();
+ 		server.once( 'error', reject );
+-		server.listen( port, 'localhost', () => resolve( server ) );
++		server.listen( port, '127.0.0.1', () => resolve( server ) );
+ 	} );
+ }
+ 
+@@ -58,7 +58,7 @@ describe( 'portFinder availability detection', () => {
+ 	it( 'skips an occupied port and returns one that is actually bindable', async () => {
+ 		// Occupy an OS-assigned free port so the test never collides with a port
+ 		// already in use on the machine.
+-		const occupiedServer = await listenOnLocalhost( 0 );
++		const occupiedServer = await listenOnIpv4Loopback( 0 );
+ 		openServers.push( occupiedServer );
+ 		const occupied = ( occupiedServer.address() as net.AddressInfo ).port;
+ 
+@@ -69,6 +69,6 @@ describe( 'portFinder availability detection', () => {
+ 		const port = await portFinder.getOpenPort();
+ 		expect( port ).toBeGreaterThan( occupied );
+ 		// Binding throws if getOpenPort handed back an occupied port.
+-		openServers.push( await listenOnLocalhost( port ) );
++		openServers.push( await listenOnIpv4Loopback( port ) );
+ 	} );
+ } );
+diff --git a/apps/cli/lib/tests/proxy-server.test.ts b/apps/cli/lib/tests/proxy-server.test.ts
+new file mode 100644
+index 00000000..530f6394
+--- /dev/null
++++ b/apps/cli/lib/tests/proxy-server.test.ts
+@@ -0,0 +1,211 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { readCliConfig } from 'cli/lib/cli-config/core';
++import { isProxyRunning, startProxyServers, stopProxyServers } from 'cli/lib/proxy-server';
++import type { IncomingMessage, ServerResponse } from 'node:http';
++
++const mocks = vi.hoisted( () => {
++	const httpServers: Array< ReturnType< typeof createServer > > = [];
++	const httpsServers: Array< ReturnType< typeof createServer > > = [];
++	const proxyWeb = vi.fn();
++
++	function createServer( handler: ( req: unknown, res: unknown ) => unknown ) {
++		const server = {
++			handler,
++			listening: false,
++			listen: vi.fn(),
++			on: vi.fn(),
++			close: vi.fn(),
++		};
++
++		server.listen.mockImplementation( ( _port: number, _host: string, callback: () => void ) => {
++			server.listening = true;
++			callback();
++			return server;
++		} );
++		server.on.mockReturnValue( server );
++		server.close.mockImplementation( ( callback: () => void ) => {
++			server.listening = false;
++			callback();
++			return server;
++		} );
++
++		return server;
++	}
++
++	return {
++		httpServers,
++		httpsServers,
++		proxyWeb,
++		createHttpServer: vi.fn( ( handler ) => {
++			const server = createServer( handler );
++			httpServers.push( server );
++			return server;
++		} ),
++		createHttpsServer: vi.fn( ( _options, handler ) => {
++			const server = createServer( handler );
++			httpsServers.push( server );
++			return server;
++		} ),
++	};
++} );
++
++vi.mock( 'http', () => ( {
++	default: {
++		createServer: mocks.createHttpServer,
++		ServerResponse: class ServerResponse {},
++	},
++} ) );
++
++vi.mock( 'https', () => ( {
++	default: {
++		createServer: mocks.createHttpsServer,
++	},
++} ) );
++
++vi.mock( 'http-proxy', () => ( {
++	default: {
++		createProxyServer: () => ( {
++			on: vi.fn(),
++			web: mocks.proxyWeb,
++		} ),
++	},
++} ) );
++
++vi.mock( 'cli/lib/certificate-manager', () => ( {
++	generateSiteCertificate: vi.fn(),
++} ) );
++
++vi.mock( 'cli/lib/cli-config/core', () => ( {
++	readCliConfig: vi.fn(),
++} ) );
++
++function createResponse() {
++	return {
++		writeHead: vi.fn(),
++		end: vi.fn(),
++	} as unknown as ServerResponse;
++}
++
++async function dispatch(
++	server: ( typeof mocks.httpServers )[ number ],
++	request: Partial< IncomingMessage >,
++	response: ServerResponse
++): Promise< void > {
++	await server.handler( request as IncomingMessage, response );
++}
++
++describe( 'proxy-server loopback listeners', () => {
++	beforeEach( () => {
++		mocks.httpServers.length = 0;
++		mocks.httpsServers.length = 0;
++		mocks.createHttpServer.mockClear();
++		mocks.createHttpsServer.mockClear();
++		mocks.proxyWeb.mockReset();
++		vi.mocked( readCliConfig ).mockReset();
++		vi.spyOn( console, 'log' ).mockImplementation( () => undefined );
++		vi.spyOn( console, 'error' ).mockImplementation( () => undefined );
++		vi.spyOn( process, 'on' ).mockImplementation( () => process );
++		vi.spyOn( process.stdin, 'resume' ).mockImplementation( () => process.stdin );
++	} );
++
++	afterEach( async () => {
++		await stopProxyServers();
++		vi.restoreAllMocks();
++	} );
++
++	it( 'binds HTTP, HTTPS, and their health handlers only to IPv4 and IPv6 loopback', async () => {
++		await startProxyServers();
++
++		const httpBindings = mocks.httpServers.map( ( server ) => server.listen.mock.calls[ 0 ] );
++		const httpsBindings = mocks.httpsServers.map( ( server ) => server.listen.mock.calls[ 0 ] );
++
++		expect( httpBindings.map( ( [ port, host ] ) => [ port, host ] ) ).toEqual( [
++			[ 80, '127.0.0.1' ],
++			[ 80, '::1' ],
++		] );
++		expect( httpsBindings.map( ( [ port, host ] ) => [ port, host ] ) ).toEqual( [
++			[ 443, '127.0.0.1' ],
++			[ 443, '::1' ],
++		] );
++
++		for ( const [ , host ] of [ ...httpBindings, ...httpsBindings ] ) {
++			expect( host ).not.toBeUndefined();
++			expect( host ).not.toBe( '0.0.0.0' );
++			expect( host ).not.toBe( '::' );
++		}
++
++		const response = createResponse();
++		await dispatch( mocks.httpServers[ 0 ], { url: '/__studio_health', headers: {} }, response );
++
++		expect( response.writeHead ).toHaveBeenCalledWith( 200, {
++			'Content-Type': 'application/json',
++		} );
++		expect( JSON.parse( vi.mocked( response.end ).mock.calls[ 0 ][ 0 ] as string ) ).toMatchObject(
++			{
++				status: 'ok',
++				http: true,
++				https: true,
++			}
++		);
++		expect( isProxyRunning() ).toBe( true );
++	} );
++
++	it( 'proxies a local custom domain through both IPv4 and IPv6 HTTP listeners', async () => {
++		vi.mocked( readCliConfig ).mockResolvedValue( {
++			sites: [
++				{
++					customDomain: 'custom-site.local',
++					port: 8881,
++					enableHttps: false,
++				},
++			],
++		} as Awaited< ReturnType< typeof readCliConfig > > );
++		await startProxyServers();
++
++		for ( const server of mocks.httpServers ) {
++			await dispatch(
++				server,
++				{ url: '/wp-json/', headers: { host: 'custom-site.local' } },
++				createResponse()
++			);
++		}
++
++		expect( mocks.proxyWeb ).toHaveBeenCalledTimes( 2 );
++		for ( const call of mocks.proxyWeb.mock.calls ) {
++			expect( call[ 2 ] ).toEqual( {
++				target: 'http://localhost:8881',
++				xfwd: true,
++				headers: {},
++			} );
++		}
++	} );
++
++	it( 'proxies an HTTPS custom domain locally and preserves forwarded protocol', async () => {
++		vi.mocked( readCliConfig ).mockResolvedValue( {
++			sites: [
++				{
++					customDomain: 'secure-site.local',
++					port: 8882,
++					enableHttps: true,
++				},
++			],
++		} as Awaited< ReturnType< typeof readCliConfig > > );
++		await startProxyServers();
++
++		await dispatch(
++			mocks.httpsServers[ 1 ],
++			{ url: '/', headers: { host: 'secure-site.local' } },
++			createResponse()
++		);
++
++		expect( mocks.proxyWeb ).toHaveBeenCalledWith(
++			expect.objectContaining( { headers: { host: 'secure-site.local' } } ),
++			expect.anything(),
++			{
++				target: 'http://localhost:8882',
++				xfwd: true,
++				headers: { 'X-Forwarded-Proto': 'https' },
++			}
++		);
++	} );
++} );
+diff --git a/apps/cli/tests/php-server-child.test.ts b/apps/cli/tests/php-server-child.test.ts
+new file mode 100644
+index 00000000..c3d69f2f
+--- /dev/null
++++ b/apps/cli/tests/php-server-child.test.ts
+@@ -0,0 +1,65 @@
++import { beforeAll, describe, expect, it, vi } from 'vitest';
++import type { ServerConfig } from 'cli/lib/types/wordpress-server-ipc';
++import type { EventEmitter } from 'node:events';
++import type { Server } from 'node:http';
++import type { AddressInfo } from 'node:net';
++
++type PhpServerChildModule = typeof import('../php-server-child');
++
++let phpServerChild: PhpServerChildModule;
++
++function removeAddedListeners(
++	emitter: EventEmitter,
++	event: string,
++	originalListeners: ReturnType< EventEmitter[ 'listeners' ] >
++): void {
++	for ( const listener of emitter.listeners( event ) ) {
++		if ( ! originalListeners.includes( listener ) ) {
++			emitter.removeListener( event, listener as ( ...args: unknown[] ) => void );
++		}
++	}
++}
++
++beforeAll( async () => {
++	const processEmitter = process as EventEmitter;
++	const originalSend = process.send;
++	const originalListeners = {
++		exit: process.listeners( 'exit' ),
++		disconnect: process.listeners( 'disconnect' ),
++		SIGTERM: process.listeners( 'SIGTERM' ),
++		SIGINT: process.listeners( 'SIGINT' ),
++		message: process.listeners( 'message' ),
++	};
++
++	process.send = vi.fn() as typeof process.send;
++	try {
++		phpServerChild = await import( '../php-server-child' );
++	} finally {
++		removeAddedListeners( processEmitter, 'exit', originalListeners.exit );
++		removeAddedListeners( processEmitter, 'disconnect', originalListeners.disconnect );
++		removeAddedListeners( processEmitter, 'SIGTERM', originalListeners.SIGTERM );
++		removeAddedListeners( processEmitter, 'SIGINT', originalListeners.SIGINT );
++		removeAddedListeners( processEmitter, 'message', originalListeners.message );
++		process.send = originalSend;
++	}
++} );
++
++async function closeServer( server: Server ): Promise< void > {
++	await new Promise< void >( ( resolve ) => server.close( () => resolve() ) );
++}
++
++describe( 'native PHP proxy network binding', () => {
++	it( 'listens only on IPv4 loopback', async () => {
++		const server = await phpServerChild.startPhpProxyServer( {
++			port: 0,
++		} as ServerConfig );
++
++		try {
++			const address = server.address() as AddressInfo;
++			expect( address.address ).toBe( '127.0.0.1' );
++			expect( address.family ).toBe( 'IPv4' );
++		} finally {
++			await closeServer( server );
++		}
++	} );
++} );
+diff --git a/apps/cli/tests/playground-server-child.test.ts b/apps/cli/tests/playground-server-child.test.ts
+new file mode 100644
+index 00000000..fdd4b95c
+--- /dev/null
++++ b/apps/cli/tests/playground-server-child.test.ts
+@@ -0,0 +1,155 @@
++import http from 'node:http';
++import net from 'node:net';
++import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
++import type { EventEmitter } from 'node:events';
++
++vi.mock( '@wp-playground/cli', () => ( { runCLI: vi.fn() } ) );
++vi.mock( '@wp-playground/storage', () => ( {
++	FetchFilesystem: class {},
++	InMemoryFilesystem: class {},
++	NodeJsFilesystem: class {},
++	OverlayFilesystem: class {},
++} ) );
++
++type PlaygroundServerChildModule = typeof import('../playground-server-child');
++
++let playgroundServerChild: PlaygroundServerChildModule;
++
++function removeAddedListeners(
++	emitter: EventEmitter,
++	event: string,
++	originalListeners: ReturnType< EventEmitter[ 'listeners' ] >
++): void {
++	for ( const listener of emitter.listeners( event ) ) {
++		if ( ! originalListeners.includes( listener ) ) {
++			emitter.removeListener( event, listener as ( ...args: unknown[] ) => void );
++		}
++	}
++}
++
++beforeAll( async () => {
++	const processEmitter = process as EventEmitter;
++	const originalSend = process.send;
++	const originalConsole = {
++		log: console.log,
++		error: console.error,
++		warn: console.warn,
++	};
++	const originalStdoutWrite = process.stdout.write;
++	const originalStderrWrite = process.stderr.write;
++	const originalListeners = {
++		message: process.listeners( 'message' ),
++		uncaughtException: process.listeners( 'uncaughtException' ),
++		unhandledRejection: process.listeners( 'unhandledRejection' ),
++	};
++
++	process.send = vi.fn() as typeof process.send;
++	try {
++		playgroundServerChild = await import( '../playground-server-child' );
++	} finally {
++		console.log = originalConsole.log;
++		console.error = originalConsole.error;
++		console.warn = originalConsole.warn;
++		process.stdout.write = originalStdoutWrite;
++		process.stderr.write = originalStderrWrite;
++
++		removeAddedListeners( processEmitter, 'message', originalListeners.message );
++		removeAddedListeners(
++			processEmitter,
++			'uncaughtException',
++			originalListeners.uncaughtException
++		);
++		removeAddedListeners(
++			processEmitter,
++			'unhandledRejection',
++			originalListeners.unhandledRejection
++		);
++
++		process.send = originalSend;
++	}
++} );
++
++afterAll( () => {
++	vi.restoreAllMocks();
++} );
++
++async function closeServer( server: http.Server ): Promise< void > {
++	await new Promise< void >( ( resolve ) => server.close( () => resolve() ) );
++}
++
++function expectIpv4Loopback( server: http.Server ): void {
++	const address = server.address();
++	expect( address ).not.toBeNull();
++	expect( typeof address ).toBe( 'object' );
++	expect( ( address as net.AddressInfo ).address ).toBe( '127.0.0.1' );
++}
++
++describe( 'Playground CLI network binding', () => {
++	it( 'confines the hostless listen signature used by Playground CLI to IPv4 loopback', async () => {
++		const server = http.createServer();
++
++		await playgroundServerChild.withPlaygroundCliLoopbackBinding(
++			() =>
++				new Promise< void >( ( resolve, reject ) => {
++					server.once( 'error', reject );
++					server.listen( 0, resolve );
++				} )
++		);
++
++		expectIpv4Loopback( server );
++		await closeServer( server );
++	} );
++
++	it( 'overrides an explicit wildcard host in listen options', async () => {
++		const server = http.createServer();
++
++		await playgroundServerChild.withPlaygroundCliLoopbackBinding(
++			() =>
++				new Promise< void >( ( resolve, reject ) => {
++					server.once( 'error', reject );
++					server.listen( { port: 0, host: '0.0.0.0' }, resolve );
++				} )
++		);
++
++		expectIpv4Loopback( server );
++		await closeServer( server );
++	} );
++
++	it( 'restores the Node listener after startup failure', async () => {
++		const originalListen = net.Server.prototype.listen;
++
++		await expect(
++			playgroundServerChild.withPlaygroundCliLoopbackBinding( async () => {
++				throw new Error( 'startup failed' );
++			} )
++		).rejects.toThrow( 'startup failed' );
++
++		expect( net.Server.prototype.listen ).toBe( originalListen );
++	} );
++
++	it( 'keeps concurrent Playground startup operations confined until both settle', async () => {
++		const originalListen = net.Server.prototype.listen;
++		let releaseFirst = () => {};
++		let releaseSecond = () => {};
++		const first = playgroundServerChild.withPlaygroundCliLoopbackBinding(
++			() =>
++				new Promise< void >( ( resolve ) => {
++					releaseFirst = resolve;
++				} )
++		);
++		const second = playgroundServerChild.withPlaygroundCliLoopbackBinding(
++			() =>
++				new Promise< void >( ( resolve ) => {
++					releaseSecond = resolve;
++				} )
++		);
++
++		expect( net.Server.prototype.listen ).not.toBe( originalListen );
++		releaseFirst();
++		await first;
++		expect( net.Server.prototype.listen ).not.toBe( originalListen );
++		releaseSecond();
++		await second;
++		expect( net.Server.prototype.listen ).toBe( originalListen );
++	} );
++} );
 diff --git a/apps/studio/src/lib/linux-update.ts b/apps/studio/src/lib/linux-update.ts
 new file mode 100644
 index 00000000..f4d96a90
@@ -319,6 +2606,142 @@ index 00000000..f4d96a90
 +		shouldDownload: true,
 +	};
 +}
+diff --git a/apps/studio/src/lib/tests/certificate-manager.test.ts b/apps/studio/src/lib/tests/certificate-manager.test.ts
+new file mode 100644
+index 00000000..f17b2bfc
+--- /dev/null
++++ b/apps/studio/src/lib/tests/certificate-manager.test.ts
+@@ -0,0 +1,130 @@
++/**
++ * @vitest-environment node
++ */
++import fs from 'node:fs';
++import {
++	areAllFirefoxProfilesTrustedLinux,
++	buildLinuxTrustInstallCommand,
++	getLinuxTrustStoreConfig,
++	importCAIntoFirefoxProfilesLinux,
++	importCAIntoUserNssDbsLinux,
++	isCAImportedInUserNssDbsLinux,
++	isCATrustedOnLinux,
++	readLinuxTrustCertificate,
++} from '@studio/common/lib/linux-trust-store';
++import sudo from '@vscode/sudo-prompt';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { trustRootCA } from 'src/lib/certificate-manager';
++
++vi.mock( 'electron', () => ( {
++	shell: { showItemInFolder: vi.fn() },
++} ) );
++
++vi.mock( '@sentry/electron/main', () => ( {
++	captureException: vi.fn(),
++} ) );
++
++vi.mock( '@studio/common/lib/well-known-paths', () => ( {
++	getCertificatesPath: () => '/home/user/.studio/certificates',
++} ) );
++
++vi.mock( '@studio/common/lib/linux-trust-store', () => ( {
++	areAllFirefoxProfilesTrustedLinux: vi.fn(),
++	buildLinuxTrustInstallCommand: vi.fn(),
++	getLinuxTrustStoreConfig: vi.fn( () => ( {
++		trustStorePath: '/usr/local/share/ca-certificates/studio-ca.crt',
++		updateCommand: '/usr/sbin/update-ca-certificates',
++	} ) ),
++	importCAIntoFirefoxProfilesLinux: vi.fn(),
++	importCAIntoUserNssDbsLinux: vi.fn(),
++	isCAImportedInUserNssDbsLinux: vi.fn(),
++	isCATrustedOnLinux: vi.fn(),
++	readLinuxTrustCertificate: vi.fn(),
++} ) );
++
++vi.mock( '@vscode/sudo-prompt', () => ( {
++	default: { exec: vi.fn() },
++} ) );
++
++const mockedAreAllFirefoxProfilesTrustedLinux = vi.mocked( areAllFirefoxProfilesTrustedLinux );
++const mockedBuildLinuxTrustInstallCommand = vi.mocked( buildLinuxTrustInstallCommand );
++const mockedGetLinuxTrustStoreConfig = vi.mocked( getLinuxTrustStoreConfig );
++const mockedImportCAIntoFirefoxProfilesLinux = vi.mocked( importCAIntoFirefoxProfilesLinux );
++const mockedImportCAIntoUserNssDbsLinux = vi.mocked( importCAIntoUserNssDbsLinux );
++const mockedIsCAImportedInUserNssDbsLinux = vi.mocked( isCAImportedInUserNssDbsLinux );
++const mockedIsCATrustedOnLinux = vi.mocked( isCATrustedOnLinux );
++const mockedReadLinuxTrustCertificate = vi.mocked( readLinuxTrustCertificate );
++const mockedSudoExec = vi.mocked( sudo.exec );
++
++type SudoExecCallback = ( error?: Error, stdout?: string, stderr?: string ) => void;
++
++const setPlatform = ( platform: NodeJS.Platform ) => {
++	Object.defineProperty( process, 'platform', { value: platform, configurable: true } );
++};
++
++describe( 'certificate-manager Linux trust install', () => {
++	const originalPlatform = process.platform;
++	let existsSpy: ReturnType< typeof vi.spyOn >;
++
++	beforeEach( () => {
++		setPlatform( 'linux' );
++		existsSpy = vi.spyOn( fs, 'existsSync' ).mockReturnValue( true );
++		mockedAreAllFirefoxProfilesTrustedLinux.mockReset().mockResolvedValue( false );
++		mockedBuildLinuxTrustInstallCommand
++			.mockReset()
++			.mockReturnValue( 'write-authorized-bytes-to-fixed-trust-store' );
++		mockedGetLinuxTrustStoreConfig.mockClear();
++		mockedImportCAIntoFirefoxProfilesLinux.mockReset().mockResolvedValue( undefined );
++		mockedImportCAIntoUserNssDbsLinux.mockReset().mockResolvedValue( undefined );
++		mockedIsCAImportedInUserNssDbsLinux.mockReset().mockResolvedValue( false );
++		mockedIsCATrustedOnLinux.mockReset().mockResolvedValue( false );
++		mockedReadLinuxTrustCertificate
++			.mockReset()
++			.mockReturnValue( Buffer.from( 'authorized CA bytes' ) );
++		mockedSudoExec.mockReset().mockImplementation( ( ( ...args: unknown[] ) => {
++			const callback = args[ args.length - 1 ] as SudoExecCallback;
++			callback();
++		} ) as unknown as typeof sudo.exec );
++	} );
++
++	afterEach( () => {
++		existsSpy.mockRestore();
++		setPlatform( originalPlatform );
++	} );
++
++	it( 'snapshots the CA and builds the privileged command before authorization', async () => {
++		await trustRootCA();
++
++		expect( mockedReadLinuxTrustCertificate ).toHaveBeenCalledWith(
++			'/home/user/.studio/certificates/studio-ca.crt'
++		);
++		expect( mockedBuildLinuxTrustInstallCommand ).toHaveBeenCalledWith(
++			Buffer.from( 'authorized CA bytes' )
++		);
++		expect( mockedReadLinuxTrustCertificate.mock.invocationCallOrder[ 0 ] ).toBeLessThan(
++			mockedSudoExec.mock.invocationCallOrder[ 0 ]
++		);
++		expect( mockedBuildLinuxTrustInstallCommand.mock.invocationCallOrder[ 0 ] ).toBeLessThan(
++			mockedSudoExec.mock.invocationCallOrder[ 0 ]
++		);
++		expect( mockedSudoExec.mock.calls[ 0 ][ 0 ] ).not.toContain( '/home/user' );
++		expect( mockedImportCAIntoUserNssDbsLinux ).toHaveBeenCalledWith(
++			'/usr/local/share/ca-certificates/studio-ca.crt'
++		);
++		expect( mockedImportCAIntoFirefoxProfilesLinux ).toHaveBeenCalledWith(
++			'/usr/local/share/ca-certificates/studio-ca.crt'
++		);
++	} );
++
++	it( 'does not continue to authorization or NSS imports when the source is unsafe', async () => {
++		mockedReadLinuxTrustCertificate.mockImplementation( () => {
++			throw new Error( 'unsafe certificate source' );
++		} );
++
++		await expect( trustRootCA() ).rejects.toThrow( 'unsafe certificate source' );
++
++		expect( mockedSudoExec ).not.toHaveBeenCalled();
++		expect( mockedImportCAIntoUserNssDbsLinux ).not.toHaveBeenCalled();
++		expect( mockedImportCAIntoFirefoxProfilesLinux ).not.toHaveBeenCalled();
++	} );
++} );
 diff --git a/apps/studio/src/lib/tests/linux-update.test.ts b/apps/studio/src/lib/tests/linux-update.test.ts
 new file mode 100644
 index 00000000..2d4c95c9
@@ -422,6 +2845,62 @@ index 00000000..7ca83c00
 +export function isArchBasedLinux( distribution: LinuxDistribution = getLinuxDistribution() ) {
 +	return [ distribution.id, ...distribution.idLike ].includes( 'arch' );
 +}
+diff --git a/packages/common/lib/tests/fixtures/not-a-ca.crt b/packages/common/lib/tests/fixtures/not-a-ca.crt
+new file mode 100644
+index 00000000..48f481e9
+--- /dev/null
++++ b/packages/common/lib/tests/fixtures/not-a-ca.crt
+@@ -0,0 +1,22 @@
++-----BEGIN CERTIFICATE-----
++MIIDlDCCAnygAwIBAgIUYNc6yDn3dEDH710SZeE17PrRyiowDQYJKoZIhvcNAQEL
++BQAwRjELMAkGA1UEBhMCVVMxGTAXBgNVBAoMEFdvcmRQcmVzcyBTdHVkaW8xHDAa
++BgNVBAMME1dvcmRQcmVzcyBTdHVkaW8gQ0EwHhcNMjYwODI0MTMxMTA0WhcNMzYw
++ODIxMTMxMTA0WjBGMQswCQYDVQQGEwJVUzEZMBcGA1UECgwQV29yZFByZXNzIFN0
++dWRpbzEcMBoGA1UEAwwTV29yZFByZXNzIFN0dWRpbyBDQTCCASIwDQYJKoZIhvcN
++AQEBBQADggEPADCCAQoCggEBAMv5ZrybHTIXnyFrzZB0UcACFYJfkd+JN7gz5Ykw
++FaOTVZEzsNhd+bk8ioBXBTDVIw8MH20esCCLpOfiY1PZRkpgVcBe78d2DSlmT9iY
++1LE6XtFF/SdiqNh2+yHObVflSknQxMvd1XZ0rGkfrojW9YpjyKrsFLH2mXap6aRh
++qCfkbzVL0DMHK4i4U2exQ6jUyJze9GW+bNhDNTW5b+8o1Q4zYG0XdTmH4Rk4BcIV
++RJBukPR9H2ajKuU4lUGo+QhXKzSJ6FOQAdMH1X3fPp17duCWdtBsykKQO1KjwSnd
++TF5baTpfa4y97HI/HxbGC5nw8u4Yzo9b5it6sdmAU+ZPgWsCAwEAAaN6MHgwHQYD
++VR0OBBYEFKO7F2Mn6OiY63VSyPDyeIrUwvwYMB8GA1UdIwQYMBaAFKO7F2Mn6OiY
++63VSyPDyeIrUwvwYMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBgGA1Ud
++HgEB/wQOMAygCjAIggYubG9jYWwwDQYJKoZIhvcNAQELBQADggEBALOryEWsMJpe
++O8Wupd5iQsDM5+mCc+BwQ4ee/lomS4b1avlMKGX0R9Ulz9ElOH7e4EaslzsIV2l2
++FfAwLINAl4jH54yJee/EtXNe0VN5jVPw/bvSDa1p1UBxfaxgtPInODM2yNiIuZSn
++Y7XBITkO9pWXV1IvqDTUMEABko0yaTkVhLWZ7UZCTcmB3RgmbyaVPLyksmfdZosd
++QI+yHc0qOB/0LvX29NuEE+jc+SMNmvmhFSLqpa0QjJoSIAlpefiBzy75AfbK3SR9
++5Taw1lAkAM6rdqkV9p4z1+R5RXKWwYP5VsPOoShTq/KHfAgVyCBHl/pz4nRkwXKc
++Z2wmttWv1IQ=
++-----END CERTIFICATE-----
+diff --git a/packages/common/lib/tests/fixtures/studio-ca.crt b/packages/common/lib/tests/fixtures/studio-ca.crt
+new file mode 100644
+index 00000000..16db6ca7
+--- /dev/null
++++ b/packages/common/lib/tests/fixtures/studio-ca.crt
+@@ -0,0 +1,22 @@
++-----BEGIN CERTIFICATE-----
++MIIDuzCCAqOgAwIBAgIUB55qIqvxZK6wNo1w631Pj/aGPJgwDQYJKoZIhvcNAQEL
++BQAwRjELMAkGA1UEBhMCVVMxGTAXBgNVBAoMEFdvcmRQcmVzcyBTdHVkaW8xHDAa
++BgNVBAMME1dvcmRQcmVzcyBTdHVkaW8gQ0EwHhcNMjYwODI0MTMwNjA0WhcNMzYw
++ODIxMTMwNjA0WjBGMQswCQYDVQQGEwJVUzEZMBcGA1UECgwQV29yZFByZXNzIFN0
++dWRpbzEcMBoGA1UEAwwTV29yZFByZXNzIFN0dWRpbyBDQTCCASIwDQYJKoZIhvcN
++AQEBBQADggEPADCCAQoCggEBAOb9AU2Xj9+MHgiykKDwFk4VokCeqXDSYIP/qVft
++i+hcsnCh8BKBssmb5F9QOd6HKhtlJdlnaoDdR8Z57muySXVrgpTITN3gckViljhj
++x7vQRdHZ1SR6h1MD5l/rwK6UQTiOVy0PjvG5MboOy403LrWizZOfTHkmdAxnyIqI
++6bjfCRDqy2bCxRErzs1WTnCOxE/iV+S8G6P4BHZakoJX1wAFVR8HXQJhS00Ii8MM
++V9n8VF6vVv4jdYqkSP3VqO3NQzfWwAvxx1//KzugbnWE1cOkPCC3Bv8T+r+vb8gw
++OWrQEugMehUGNurJpqd9tmmJApCvPh30sO2R+V61vcLcaccCAwEAAaOBoDCBnTAd
++BgNVHQ4EFgQUILdaCFj9cy514pdy3vqj+/ykotwwHwYDVR0jBBgwFoAUILdaCFj9
++cy514pdy3vqj+/ykotwwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMC
++AQYwHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMBgGA1UdHgEB/wQOMAyg
++CjAIggYubG9jYWwwDQYJKoZIhvcNAQELBQADggEBAIAi5Bg/1p34l4Skedzu6NII
++gg66RG6p0U6zavmCfcTIjrhshAy5EAUUFWWbaae/a3Pd4479D82m0TPdEPJ3Dq4F
++Lul15Lw6j8RvtAyHySZ1jnWO0eg+W6lQs8W/4UENcCbfrOWmwXEHCpKQBdkW/odw
+++DN6w3KQEjyso+ddbVvaUOUaj3cutl2mT7J+DWBeEJlQDcnFzxYGXOzrqqN3jboE
++dYcUPF8wMEQ/XMlBaAtJUaDS5BoNeFQpIrau3luhCS+fyh8QXim62FoVHQkSVOPg
++rDsEoi/4x8cDgz9RGaqWGP9ToNcFzG6tskGdj0b0Tb6cWB1ksg934WCAUmq48MU=
++-----END CERTIFICATE-----
 diff --git a/packages/common/lib/tests/linux-distribution.test.ts b/packages/common/lib/tests/linux-distribution.test.ts
 new file mode 100644
 index 00000000..9d6e1768
@@ -452,49 +2931,3 @@ index 00000000..9d6e1768
 +		expect( isArchBasedLinux( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toBe( false );
 +	} );
 +} );
-diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
---- a/apps/studio/src/site-server.ts
-+++ b/apps/studio/src/site-server.ts
-@@ -264,6 +264,7 @@ export class SiteServer {
- 
- 		console.log( `Starting server for '${ this.details.name }'` );
- 		await this.server.start();
-+		this.adoptRunningState( true );
- 	}
- 
- 	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
-diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
---- a/apps/studio/src/tests/site-server.test.ts
-+++ b/apps/studio/src/tests/site-server.test.ts
-@@ -228,5 +228,31 @@ describe( 'SiteServer', () => {
- 				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
- 			);
- 		} );
-+
-+		it( 'marks a successful CLI start as running before it resolves', async () => {
-+			mockStartServer.mockResolvedValueOnce( {
-+				url: 'http://localhost:1234',
-+				options: { port: 1234, phpVersion: '8.0' },
-+				_internal: { mode: 'wordpress', port: 1234 },
-+			} );
-+
-+			const server = SiteServer.register( {
-+				id: 'successful-start',
-+				name: 'successful-start',
-+				path: '/tmp/successful-start',
-+				port: 1234,
-+				adminPassword: 'test-password',
-+				phpVersion: '8.4',
-+				running: false,
-+				themeDetails: undefined,
-+			} );
-+
-+			await server.start();
-+
-+			expect( server.details.running ).toBe( true );
-+			if ( server.details.running ) {
-+				expect( server.details.url ).toBe( 'http://localhost:1234' );
-+			}
-+		} );
- 	} );
- } );

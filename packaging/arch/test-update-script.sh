@@ -28,6 +28,50 @@ shift 3
 exec "$@"
 EOF
 
+cat >"$test_root/bin/dd-no-follow" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+input=''
+output=''
+count=''
+for argument in "$@"; do
+  case $argument in
+    if=*) input=${argument#if=} ;;
+    of=*) output=${argument#of=} ;;
+    count=*) count=${argument#count=} ;;
+    iflag=nofollow,nonblock,fullblock,count_bytes | bs=1M | status=none) ;;
+    *) exit 2 ;;
+  esac
+done
+[[ -n $input && -n $output && $count =~ ^[1-9][0-9]*$ && ! -L $input ]] || exit 1
+exec /bin/dd if="$input" of="$output" bs=1 count="$count" 2>/dev/null
+EOF
+
+cat >"$test_root/bin/chmod-gnu" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[[ ${1:-} == "600" && ${2:-} == "--" && $# == 3 ]]
+exec /bin/chmod 600 "$3"
+EOF
+
+cat >"$test_root/bin/gnu-stat" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+[[ ${1:-} == "-c" && ${3:-} == "--" && $# == 4 ]]
+format=$2
+path=$4
+
+if [[ $format == "%s" ]]; then
+  /usr/bin/stat -f '%z' "$path"
+elif [[ $format == "%F|%u|%g|%a|%h|%s" ]]; then
+  IFS='|' read -r type mode links size < <(/usr/bin/stat -f '%HT|%Lp|%l|%z' "$path")
+  [[ $type == "Regular File" ]]
+  printf 'regular file|0|0|%s|%s|%s\n' "$mode" "$links" "$size"
+else
+  exit 2
+fi
+EOF
+
 cat >"$test_root/bin/curl" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -54,12 +98,44 @@ EOF
 
 cat >"$test_root/bin/sudo" <<'EOF'
 #!/bin/bash
+set -euo pipefail
 printf '%s\n' "$*" >"$STUDIO_UPDATE_RUN_ROOT/sudo-command"
+id -u >"$STUDIO_UPDATE_RUN_ROOT/sudo-uid"
+
+if [[ -n ${STUDIO_UPDATE_ADVERSARY_DIR:-} ]]; then
+  : >"$STUDIO_UPDATE_ADVERSARY_DIR/sudo-boundary"
+  for (( attempt = 0; attempt < 500; attempt++ )); do
+    [[ ! -e $STUDIO_UPDATE_ADVERSARY_DIR/substitution-complete ]] || break
+    sleep 0.01
+  done
+  [[ -e $STUDIO_UPDATE_ADVERSARY_DIR/substitution-complete ]]
+fi
+
+[[ ${1:-} == "/usr/bin/bash" && ${2:-} == "-c" && -n ${3:-} ]]
+script=$3
+shift 3
+script=${script//\/usr\/bin\/bash/\/bin\/bash}
+script=${script//\/usr\/bin\/chmod/$STUDIO_UPDATE_TEST_BIN\/chmod-gnu}
+script=${script//\/usr\/bin\/dd/$STUDIO_UPDATE_TEST_BIN\/dd-no-follow}
+script=${script//\/usr\/bin\/pacman/$STUDIO_UPDATE_TEST_BIN\/pacman}
+script=${script//\/usr\/bin\/rm/\/bin\/rm}
+script=${script//\/usr\/bin\/sha256sum/$STUDIO_UPDATE_TEST_SHA256SUM}
+script=${script//\/usr\/bin\/stat/$STUDIO_UPDATE_TEST_BIN\/gnu-stat}
+script=${script//\/usr\/bin\/timeout/$STUDIO_UPDATE_TEST_BIN\/timeout}
+exec /bin/bash -c "$script" "$@"
 EOF
 
 cat >"$test_root/bin/pacman" <<'EOF'
 #!/bin/bash
-exit 0
+set -euo pipefail
+printf '%s\n' "$*" >"$STUDIO_UPDATE_RUN_ROOT/pacman-command"
+package_path=''
+for argument in "$@"; do
+  package_path=$argument
+done
+[[ -n $package_path ]]
+printf '%s\n' "$package_path" >"$STUDIO_UPDATE_RUN_ROOT/pacman-package-path"
+cp -- "$package_path" "$STUDIO_UPDATE_RUN_ROOT/pacman-package"
 EOF
 
 cat >"$test_root/bin/uname" <<'EOF'
@@ -108,6 +184,9 @@ run_installer() {
     STUDIO_UPDATE_FIXTURES="$test_root/fixtures" \
     STUDIO_UPDATE_RELEASE_FILE="$release_file" \
     STUDIO_UPDATE_RUN_ROOT="$run_root" \
+    STUDIO_UPDATE_ADVERSARY_DIR="${STUDIO_UPDATE_ADVERSARY_DIR:-}" \
+    STUDIO_UPDATE_TEST_BIN="$test_root/bin" \
+    STUDIO_UPDATE_TEST_SHA256SUM="$(command -v sha256sum)" \
     STUDIO_UPDATE_TEST_ARCH="${STUDIO_UPDATE_TEST_ARCH:-x86_64}" \
     PATH="$test_root/bin:$PATH" \
     "$@" \
@@ -153,7 +232,88 @@ run_installer "$success_root" "$exact_release"
 [[ -f $success_root/downloads/$package_name ]]
 [[ -f $success_root/downloads/$checksum_name ]]
 resolved_success_downloads=$(realpath -- "$success_root/downloads")
-grep -qxF "pacman -U --needed --noconfirm -- $resolved_success_downloads/$package_name" "$success_root/sudo-command"
+grep -qF -- "/usr/bin/bash -c" "$success_root/sudo-command"
+grep -qF -- "/usr/bin/dd" "$success_root/sudo-command"
+grep -qF -- "/usr/bin/pacman" "$success_root/sudo-command"
+if grep -qF -- "$test_root/bin" "$success_root/sudo-command"; then
+  echo 'The production sudo handoff accepted a test-controlled executable path.' >&2
+  exit 1
+fi
+grep -qF -- "$resolved_success_downloads/$package_name $package_name" "$success_root/sudo-command"
+grep -Eq "^-U --needed --noconfirm -- /var/tmp/studio-omarchy-install\.[^/]+/$package_name$" \
+  "$success_root/pacman-command"
+cmp "$package_fixture" "$success_root/pacman-package"
+staged_success_package=$(<"$success_root/pacman-package-path")
+[[ $staged_success_package != "$resolved_success_downloads/$package_name" ]]
+[[ ! -e ${staged_success_package%/*} ]]
+
+substitution_root="$test_root/runs/same-uid-substitution"
+substitution_sync="$substitution_root/adversary"
+mkdir -p "$substitution_sync"
+(
+  for (( attempt = 0; attempt < 500; attempt++ )); do
+    [[ ! -e $substitution_sync/sudo-boundary ]] || break
+    sleep 0.01
+  done
+  [[ -e $substitution_sync/sudo-boundary ]]
+  ln -s "$package_fixture" "$substitution_sync/package-link"
+  mv -f -- "$substitution_sync/package-link" "$substitution_root/downloads/$package_name"
+  id -u >"$substitution_sync/uid"
+  : >"$substitution_sync/substitution-complete"
+) &
+substitution_pid=$!
+export STUDIO_UPDATE_ADVERSARY_DIR="$substitution_sync"
+expect_failure 'same-UID symlink substitution at the privileged handoff' \
+  run_installer "$substitution_root" "$exact_release"
+unset STUDIO_UPDATE_ADVERSARY_DIR
+wait "$substitution_pid"
+grep -qF 'the privileged package handoff copy failed or exceeded its deadline' "$test_root/failure-output"
+[[ $(<"$substitution_sync/uid") == "$(<"$substitution_root/sudo-uid")" ]]
+[[ ! -e $substitution_root/pacman-command ]]
+
+mutation_root="$test_root/runs/same-uid-inode-mutation"
+mutation_sync="$mutation_root/adversary"
+mkdir -p "$mutation_sync"
+(
+  for (( attempt = 0; attempt < 500; attempt++ )); do
+    [[ ! -e $mutation_sync/sudo-boundary ]] || break
+    sleep 0.01
+  done
+  [[ -e $mutation_sync/sudo-boundary ]]
+  printf '%s\n' 'same-UID mutated package' >"$mutation_root/downloads/$package_name"
+  id -u >"$mutation_sync/uid"
+  : >"$mutation_sync/substitution-complete"
+) &
+mutation_pid=$!
+export STUDIO_UPDATE_ADVERSARY_DIR="$mutation_sync"
+expect_failure 'same-UID in-place mutation at the privileged handoff' \
+  run_installer "$mutation_root" "$exact_release"
+unset STUDIO_UPDATE_ADVERSARY_DIR
+wait "$mutation_pid"
+grep -qF 'the package changed before the privileged installation handoff' "$test_root/failure-output"
+[[ $(<"$mutation_sync/uid") == "$(<"$mutation_root/sudo-uid")" ]]
+[[ ! -e $mutation_root/pacman-command ]]
+
+handoff_overflow_root="$test_root/runs/same-uid-handoff-overflow"
+handoff_overflow_sync="$handoff_overflow_root/adversary"
+mkdir -p "$handoff_overflow_sync"
+(
+  for (( attempt = 0; attempt < 500; attempt++ )); do
+    [[ ! -e $handoff_overflow_sync/sudo-boundary ]] || break
+    sleep 0.01
+  done
+  [[ -e $handoff_overflow_sync/sudo-boundary ]]
+  printf x >>"$handoff_overflow_root/downloads/$package_name"
+  : >"$handoff_overflow_sync/substitution-complete"
+) &
+handoff_overflow_pid=$!
+export STUDIO_UPDATE_ADVERSARY_DIR="$handoff_overflow_sync"
+expect_failure 'same-UID growth one byte over the privileged handoff ceiling' \
+  run_installer "$handoff_overflow_root" "$exact_release"
+unset STUDIO_UPDATE_ADVERSARY_DIR
+wait "$handoff_overflow_pid"
+grep -qF 'the package changed beyond its byte budget before installation' "$test_root/failure-output"
+[[ ! -e $handoff_overflow_root/pacman-command ]]
 
 oversized_release="$test_root/release-oversized.json"
 write_release "$oversized_release" 2 262145
@@ -226,4 +386,4 @@ expect_failure 'non-directory download path' env \
 
 cmp "$script_dir/../../install.sh" "$script_dir/studio-omarchy-update"
 
-echo 'Verified x86_64-only release selection, bounded metadata/package/checksum ingress, malformed and failed children, safe paths, checksum validation, and pacman handoff.'
+echo 'Verified x86_64-only release selection, bounded metadata/package/checksum ingress, malformed and failed children, safe paths, checksum validation, root-private pacman staging, and same-UID substitution rejection.'

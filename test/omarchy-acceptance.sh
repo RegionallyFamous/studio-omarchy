@@ -22,6 +22,7 @@ BUNDLED_CLI='/usr/lib/studio/resources/cli/main.mjs'
 QMLLINT_BIN=$(command -v qmllint || true)
 containment_root="/tmp/studio-status-containment-$$"
 SITE_ONE_NAME='Omarchy Acceptance One'
+SITE_ONE_DOMAIN='omarchy-acceptance-one.local'
 SITE_TWO_NAME='Omarchy Acceptance Two'
 SITE_ONE_ID=''
 SITE_ONE_PATH=''
@@ -37,9 +38,19 @@ SITE_REMOVAL_SENTINEL_HASH=''
 SITE_REMOVAL_WP_CONFIG_HASH=''
 SITE_REMOVAL_WP_LOAD_HASH=''
 SITE_REMOVAL_DATABASE_HASH=''
+STUDIO_CA_PATH="$HOME/.studio/certificates/studio-ca.crt"
+STUDIO_CA_KEY_PATH="$HOME/.studio/certificates/studio-ca.key"
+STUDIO_SYSTEM_CA_PATH='/etc/ca-certificates/trust-source/anchors/studio-ca.crt'
+STUDIO_NSS_NICKNAME='WordPress Studio CA'
+UNRELATED_NSS_NICKNAME='Omarchy Acceptance Unrelated CA'
+STANDARD_NSS_DB="$HOME/.pki/nssdb"
+FIREFOX_NSS_DB="$HOME/.mozilla/firefox/omarchy-acceptance.default-release"
+TRUST_FIXTURE_DIR="$containment_root/browser-trust"
+STUDIO_CA_HASH=''
 installed_package_before_update=''
 studio_hash_before_update=''
 pacman_log_line_before_update=''
+PACKAGE_HANDOFF_BASELINE_IDENTITIES=''
 bar_widget_click_index=0
 : "${QMLLINT_BIN:=/usr/lib/qt6/bin/qmllint}"
 
@@ -659,6 +670,8 @@ STUB
   fi
   wait "$controller_pid" 2>/dev/null || true
   wait_until "the $mode containment group becomes non-runnable" 8 group_nonrunnable "$child_pgid"
+  : >"$run_root/child.pid"
+  : >"$run_root/controller.pid"
 }
 
 exercise_status_pre_ready_containment() {
@@ -705,6 +718,7 @@ STUB
   (( controller_status == 137 )) || fail 'the pre-query status SIGKILL records its controller death'
   [[ ! -e $run_root/child.pid ]] || fail 'pre-query status controller death never starts pacman'
   pass 'pre-query status controller death remains fail-closed'
+  : >"$run_root/controller.pid"
 }
 
 exercise_remove_pre_ready_containment() {
@@ -774,6 +788,8 @@ STUB
   [[ ! -e $run_root/node-started ]] || fail 'pre-ready controller death never opens the Node start gate'
   [[ ! -e $run_root/package.log ]] || fail 'pre-ready controller death never reaches package removal'
   pass 'pre-ready controller death remains fail-closed'
+  : >"$run_root/controller.pid"
+  : >"$run_root/worker.pid"
 }
 
 exercise_remove_containment() {
@@ -853,35 +869,113 @@ STUB
     pids_nonrunnable "$node_pid" "$nested_pid" "$detached_pid"
   [[ ! -e $run_root/package.log ]] || fail "the remover $mode containment path never reaches package removal"
   pass "the remover $mode containment path never reaches package removal"
+  : >"$run_root/controller.pid"
+  : >"$run_root/pids"
+}
+
+package_handoff_process_identity() {
+  local pid=$1 start_time
+
+  [[ -r /proc/$pid/stat ]] || return 1
+  start_time=$(awk '{ print $22 }' "/proc/$pid/stat") || return 1
+  [[ $start_time =~ ^[0-9]+$ ]] || return 1
+  printf '%s:%s\n' "$pid" "$start_time"
+}
+
+record_package_handoff_baseline() {
+  local pid identity
+
+  PACKAGE_HANDOFF_BASELINE_IDENTITIES=''
+  while IFS= read -r pid; do
+    identity=$(package_handoff_process_identity "$pid") || continue
+    PACKAGE_HANDOFF_BASELINE_IDENTITIES+="$identity"$'\n'
+  done < <(pgrep -f '[s]udo /usr/bin/bash -c .*wordpress-studio-omarchy-' || true)
+}
+
+find_current_package_handoff_pid() {
+  local pid identity match='' count=0
+
+  while IFS= read -r pid; do
+    identity=$(package_handoff_process_identity "$pid") || continue
+    if [[ -n $PACKAGE_HANDOFF_BASELINE_IDENTITIES ]] &&
+      grep -Fxq "$identity" <<<"$PACKAGE_HANDOFF_BASELINE_IDENTITIES"; then
+      continue
+    fi
+    match=$pid
+    (( count += 1 ))
+  done < <(pgrep -f '[s]udo /usr/bin/bash -c .*wordpress-studio-omarchy-' || true)
+  (( count == 1 )) || return 1
+  printf '%s\n' "$match"
 }
 
 verified_package_handoff_present() {
-  pgrep -f '[s]udo pacman -U --needed --noconfirm -- .*/wordpress-studio-omarchy-' >/dev/null ||
-    pgrep -f '[p]acman -U --needed --noconfirm -- .*/wordpress-studio-omarchy-' >/dev/null
+  find_current_package_handoff_pid >/dev/null
 }
 
-verify_staged_package_handoff() {
-  local pid package_path='' package_name checksum_path checksum_name expected_hash expected_name extra actual_hash argument
+verify_package_handoff_contract() {
+  local pid root_script package_path package_name checksum_path checksum_name checksum_encoded checksum_padding checksum_bytes expected_hash expected_name extra actual_hash hash_limit
+  local staged_path_literal="\$staged_path"
+  local copy_limit_assignment="copy_limit=\$((max_bytes + 1))"
+  local copy_limit_argument="count=\"\$copy_limit\""
+  local staged_hash_guard="[[ \$staged_hash == \"\$expected_hash\" ]]"
+  local metadata_guard="[[ \$staged_type == \"regular file\" && \$staged_uid == 0 && \$staged_gid == 0 &&"
+  local bounded_hash_script="set -o pipefail; /usr/bin/head -c \"\$1\" \"\$2\" | /usr/bin/sha256sum | /usr/bin/cut -d \" \" -f 1"
+  local bounded_checksum_script="set -o pipefail; /usr/bin/head -c 513 \"\$1\" | /usr/bin/base64 -w 0"
+  local cleanup_rm="/usr/bin/rm -rf -- \"\$staging_dir\""
   local -a arguments
 
-  pid=$(pgrep -f '[s]udo pacman -U --needed --noconfirm -- .*/wordpress-studio-omarchy-' | head -n 1) || return 1
+  pid=$(find_current_package_handoff_pid) || return 1
   mapfile -d '' -t arguments <"/proc/$pid/cmdline" || return 1
-  (( ${#arguments[@]} == 7 )) || return 1
-  [[ ${arguments[0]##*/} == "sudo" && ${arguments[1]} == "pacman" && ${arguments[2]} == "-U" &&
-    ${arguments[3]} == "--needed" && ${arguments[4]} == "--noconfirm" && ${arguments[5]} == "--" ]] || return 1
-  argument=${arguments[6]}
-  [[ $argument == /* ]] || return 1
-  package_path=$argument
-  package_name=${package_path##*/}
+  (( ${#arguments[@]} == 9 )) || return 1
+  [[ ${arguments[0]##*/} == "sudo" && ${arguments[1]} == "/usr/bin/bash" &&
+    ${arguments[2]} == "-c" && ${arguments[4]} == "bash" && ${arguments[5]} == /* &&
+    ${arguments[7]} =~ ^[0-9a-f]{64}$ && ${arguments[8]} == "2147483648" ]] || return 1
+  root_script=${arguments[3]}
+  package_path=${arguments[5]}
+  package_name=${arguments[6]}
+  [[ ${package_path##*/} == "$package_name" ]] || return 1
   [[ $package_name =~ ^wordpress-studio-omarchy-([0-9]+\.[0-9]+\.[0-9]+)-[1-9][0-9]*-x86_64\.pkg\.tar\.zst$ ]] || return 1
   [[ ${BASH_REMATCH[1]} == "$PLUGIN_VERSION" ]] || return 1
   checksum_path="$package_path.sha256"
   checksum_name="$package_name.sha256"
   [[ -f $package_path && ! -L $package_path && -s $package_path && -f $checksum_path && ! -L $checksum_path && -s $checksum_path ]] || return 1
-  IFS=' ' read -r expected_hash expected_name extra <"$checksum_path" || return 1
+  checksum_encoded=$(
+    /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+      /usr/bin/bash -c "$bounded_checksum_script" \
+      bash "$checksum_path"
+  ) || return 1
+  (( ${#checksum_encoded} % 4 == 0 )) || return 1
+  checksum_padding=${checksum_encoded: -2}
+  checksum_bytes=$(( ${#checksum_encoded} * 3 / 4 ))
+  [[ $checksum_padding != *'='* ]] || (( checksum_bytes -= 1 ))
+  [[ $checksum_padding != '==' ]] || (( checksum_bytes -= 1 ))
+  (( checksum_bytes > 0 && checksum_bytes <= 512 )) || return 1
+  IFS=' ' read -r expected_hash expected_name extra < <(
+    /usr/bin/printf '%s' "$checksum_encoded" | /usr/bin/base64 --decode
+  ) || return 1
   [[ $expected_hash =~ ^[0-9a-f]{64}$ && $expected_name == "$package_name" && -z $extra ]] || return 1
-  actual_hash=$(sha256sum "$package_path" | cut -d ' ' -f 1) || return 1
-  [[ $actual_hash == "$expected_hash" && ${checksum_path##*/} == "$checksum_name" ]]
+  hash_limit=$(( arguments[8] + 1 ))
+  actual_hash=$(
+    /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+      /usr/bin/bash -c "$bounded_hash_script" \
+      bash "$hash_limit" "$package_path"
+  ) || return 1
+  [[ $actual_hash == "$expected_hash" && ${arguments[7]} == "$expected_hash" &&
+    ${checksum_path##*/} == "$checksum_name" ]] || return 1
+  grep -qF '/usr/bin/mktemp -d /var/tmp/studio-omarchy-install.XXXXXXXXXX' <<<"$root_script" &&
+    grep -qF 'trap cleanup EXIT' <<<"$root_script" &&
+    grep -qF "$cleanup_rm" <<<"$root_script" &&
+    grep -qF "$copy_limit_assignment" <<<"$root_script" &&
+    (( $(grep -cF '/usr/bin/timeout --signal=TERM --kill-after=5s 120s' <<<"$root_script") >= 2 )) &&
+    grep -qF '/usr/bin/dd' <<<"$root_script" &&
+    grep -qF 'iflag=nofollow,nonblock,fullblock,count_bytes' <<<"$root_script" &&
+    grep -qF "$copy_limit_argument" <<<"$root_script" &&
+    grep -qF "/usr/bin/chmod 600 -- \"$staged_path_literal\"" <<<"$root_script" &&
+    grep -qF '/usr/bin/stat -c "%F|%u|%g|%a|%h|%s"' <<<"$root_script" &&
+    grep -qF "$metadata_guard" <<<"$root_script" &&
+    grep -qF "/usr/bin/sha256sum \"$staged_path_literal\"" <<<"$root_script" &&
+    grep -qF "$staged_hash_guard" <<<"$root_script" &&
+    grep -qF "/usr/bin/pacman -U --needed --noconfirm -- \"$staged_path_literal\"" <<<"$root_script"
 }
 
 studio_updater_process_absent() {
@@ -912,7 +1006,7 @@ finish_package_install_or_update() {
   local operation=$1 shot=$2
 
   wait_until "the $operation reaches its checksum-verified pacman handoff" 1900 verified_package_handoff_present
-  wait_until "the $operation stages one independently verified release package" 15 verify_staged_package_handoff
+  wait_until "the $operation prepares one verified package and fixed root-staging contract" 135 verify_package_handoff_contract
   screenshot "success-studio-$operation-checksum"
   wait_until "the $operation password prompt owns the active terminal" 10 active_window_matches "$TERMINAL_CLASS"
   wtype 'omarchy'
@@ -1049,6 +1143,185 @@ same_version_update_log_is_idempotent() {
   ! grep -E "\[ALPM\] (installed|upgraded|downgraded) ${PACKAGE_NAME}([[:space:]]|$)" "$segment" >/dev/null
 }
 
+certificate_fingerprint() {
+  local certificate=$1 output fingerprint
+
+  output=$(openssl x509 -in "$certificate" -noout -fingerprint -sha256 2>/dev/null) || return 1
+  fingerprint=${output#*=}
+  fingerprint=${fingerprint//:/}
+  fingerprint=${fingerprint//[[:space:]]/}
+  [[ $fingerprint =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+  printf '%s\n' "${fingerprint,,}"
+}
+
+nss_certificate_fingerprint() {
+  local database=$1 nickname=$2 output fingerprint
+
+  output=$(certutil -L -d "sql:$database" -n "$nickname" -a 2>/dev/null |
+    openssl x509 -noout -fingerprint -sha256 2>/dev/null) || return 1
+  fingerprint=${output#*=}
+  fingerprint=${fingerprint//:/}
+  fingerprint=${fingerprint//[[:space:]]/}
+  [[ $fingerprint =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+  printf '%s\n' "${fingerprint,,}"
+}
+
+nss_has_certificate() {
+  certutil -L -d "sql:$1" -n "$2" >/dev/null 2>&1
+}
+
+nss_certificate_matches_file() {
+  local database=$1 nickname=$2 certificate=$3 database_fingerprint file_fingerprint
+
+  database_fingerprint=$(nss_certificate_fingerprint "$database" "$nickname") || return 1
+  file_fingerprint=$(certificate_fingerprint "$certificate") || return 1
+  [[ $database_fingerprint == "$file_fingerprint" ]]
+}
+
+prepare_browser_trust_fixture() {
+  local database unrelated_certificate="$TRUST_FIXTURE_DIR/unrelated-ca.crt"
+  local unrelated_key="$TRUST_FIXTURE_DIR/unrelated-ca.key"
+
+  command -v certutil >/dev/null 2>&1 || fail 'the Studio package provides certutil for browser trust coverage'
+  command -v openssl >/dev/null 2>&1 || fail 'the guest provides openssl for certificate coverage'
+  mkdir -p "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB" "$TRUST_FIXTURE_DIR"
+  chmod 700 "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB" "$TRUST_FIXTURE_DIR"
+  if ! openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+    -subj '/CN=Omarchy Acceptance Unrelated CA' \
+    -keyout "$unrelated_key" -out "$unrelated_certificate" \
+    >"$ARTIFACTS/studio-unrelated-ca.log" 2>&1; then
+    fail 'the acceptance lane creates its unrelated browser certificate fixture'
+  fi
+  chmod 600 "$unrelated_key" "$unrelated_certificate"
+
+  for database in "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB"; do
+    if [[ ! -f $database/cert9.db ]]; then
+      certutil -N --empty-password -d "sql:$database" >/dev/null 2>&1 ||
+        fail 'the acceptance lane initializes its user-owned NSS fixture'
+    fi
+    certutil -D -d "sql:$database" -n "$UNRELATED_NSS_NICKNAME" >/dev/null 2>&1 || true
+    certutil -A -d "sql:$database" -t 'C,,' -n "$UNRELATED_NSS_NICKNAME" \
+      -i "$unrelated_certificate" >/dev/null 2>&1 ||
+      fail 'the acceptance lane imports its unrelated NSS certificate fixture'
+    nss_has_certificate "$database" "$UNRELATED_NSS_NICKNAME" ||
+      fail 'the unrelated NSS certificate fixture is readable before Studio trust'
+  done
+  pass 'the user-owned Chromium and Firefox NSS fixtures are ready'
+}
+
+studio_hosts_entries_present() {
+  local domain=$1 port=$2
+
+  [[ $(grep -Fxc "127.0.0.1 $domain # Port $port" /etc/hosts) == "1" &&
+    $(grep -Fxc "::1 $domain # Port $port" /etc/hosts) == "1" ]]
+}
+
+studio_hosts_entries_absent() {
+  local domain=$1
+
+  ! awk -v domain="$domain" \
+    '($1 == "127.0.0.1" || $1 == "::1") && $2 == domain { found = 1 } END { exit found ? 0 : 1 }' \
+    /etc/hosts
+}
+
+site_https_record_ready() {
+  local name=$1 expected_path=$2 domain=$3
+
+  [[ -s $STUDIO_CONFIG ]] &&
+    jq -e --arg name "$name" --arg path "$expected_path" --arg domain "$domain" '
+      [.sites[]? | select(
+        .name == $name and
+        .path == $path and
+        .customDomain == $domain and
+        .enableHttps == true
+      )] | length == 1
+    ' "$STUDIO_CONFIG" >/dev/null
+}
+
+site_https_rest_ready() {
+  local domain=$1
+
+  curl --noproxy '*' --resolve "$domain:443:127.0.0.1" -fsSL --max-time 10 \
+    "https://$domain/wp-json/" |
+    jq -e '(.namespaces | index("wp/v2")) != null'
+}
+
+studio_https_certificates_ready() {
+  local domain=$1 site_certificate="$HOME/.studio/certificates/domains/$1.crt"
+  local site_key="$HOME/.studio/certificates/domains/$1.key"
+
+  [[ -f $STUDIO_CA_PATH && ! -L $STUDIO_CA_PATH && -O $STUDIO_CA_PATH &&
+    -f $STUDIO_CA_KEY_PATH && ! -L $STUDIO_CA_KEY_PATH && -O $STUDIO_CA_KEY_PATH &&
+    -f $site_certificate && ! -L $site_certificate && -O $site_certificate &&
+    -f $site_key && ! -L $site_key && -O $site_key ]] || return 1
+  openssl verify -CAfile "$STUDIO_CA_PATH" -verify_hostname "$domain" \
+    "$site_certificate" >/dev/null 2>&1
+}
+
+studio_system_and_browser_trust_ready() {
+  [[ -f $STUDIO_SYSTEM_CA_PATH && ! -L $STUDIO_SYSTEM_CA_PATH &&
+    $(stat -c %U "$STUDIO_SYSTEM_CA_PATH") == "root" ]] || return 1
+  cmp -s "$STUDIO_CA_PATH" "$STUDIO_SYSTEM_CA_PATH" || return 1
+  openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$STUDIO_CA_PATH" >/dev/null 2>&1 ||
+    return 1
+  nss_certificate_matches_file "$STANDARD_NSS_DB" "$STUDIO_NSS_NICKNAME" "$STUDIO_CA_PATH" ||
+    return 1
+  nss_certificate_matches_file "$FIREFOX_NSS_DB" "$STUDIO_NSS_NICKNAME" "$STUDIO_CA_PATH"
+}
+
+revoke_polkit_temporary_authorizations() {
+  pkcheck --revoke-temp >/dev/null 2>&1 ||
+    fail 'the guest revokes cached polkit authorization before a privilege-boundary check'
+}
+
+submit_polkit_password() {
+  local operation=$1 sequence=$2
+
+  screenshot "ready-studio-$operation-polkit-$sequence"
+  wtype 'omarchy'
+  wtype -k Return
+  wait_until "the $operation polkit request $sequence closes" 30 layer_absent omarchy-polkit
+}
+
+finish_https_site_creation() {
+  local name=$1 expected_path=$2 deadline prompt_count=0
+
+  deadline=$((SECONDS + 180))
+  while :; do
+    if layer_on_screen omarchy-polkit; then
+      prompt_count=$((prompt_count + 1))
+      submit_polkit_password 'custom-domain-create' "$prompt_count"
+    elif site_https_record_ready "$name" "$expected_path" "$SITE_ONE_DOMAIN" &&
+      screen_contains 'Welcome to WordPress Studio'; then
+      break
+    fi
+    (( SECONDS < deadline )) ||
+      fail 'the custom-domain HTTPS site completes its privileged creation flow'
+    sleep 1
+  done
+  (( prompt_count >= 1 )) || fail 'custom-domain creation crosses the visible polkit boundary'
+  pass 'custom-domain creation crosses the visible polkit boundary'
+}
+
+finish_custom_domain_site_deletion() {
+  local name=$1 path=$2 id=$3 deadline prompt_count=0
+
+  deadline=$((SECONDS + 120))
+  while :; do
+    if layer_on_screen omarchy-polkit; then
+      prompt_count=$((prompt_count + 1))
+      submit_polkit_password 'custom-domain-delete' "$prompt_count"
+    elif site_record_absent "$name" "$path" "$id"; then
+      break
+    fi
+    (( SECONDS < deadline )) ||
+      fail 'the custom-domain site completes its privileged deletion flow'
+    sleep 1
+  done
+  (( prompt_count >= 1 )) || fail 'custom-domain deletion crosses the visible polkit boundary'
+  pass 'custom-domain deletion crosses the visible polkit boundary'
+}
+
 create_site_with_pointer() {
   local name=$1 ordinal=$2 expected_path=$3 deadline attempt name_entered=false
 
@@ -1076,6 +1349,42 @@ create_site_with_pointer() {
     sleep 1
   done
   pass "the $ordinal site is persisted"
+}
+
+create_https_site_with_pointer() {
+  local name=$1 ordinal=$2 expected_path=$3 domain=$4 attempt name_entered=false
+
+  click_active_phrase 'Create a new site' '20 5 100 95' "the $ordinal site creation card is clicked"
+  wait_until "the $ordinal create-site form is visible" 20 screen_contains 'Site name'
+  click_active_phrase 'Site name' '20 5 100 70' "the $ordinal site name field is focused"
+  for (( attempt = 0; attempt < 3; attempt++ )); do
+    wtype -M ctrl -k a -m ctrl
+    wtype -d 75 "$name"
+    sleep 1
+    if active_region_contains "$name" '20 20 80 70'; then
+      name_entered=true
+      break
+    fi
+  done
+  [[ $name_entered == "true" ]] || fail "the $ordinal site name is entered exactly"
+  pass "the $ordinal site name is entered exactly"
+  click_active_phrase 'Advanced settings' '20 35 100 100' \
+    "the $ordinal Advanced settings are expanded with the pointer"
+  wait_until "the $ordinal advanced custom-domain control renders" 20 screen_contains 'Use custom domain'
+  click_active_phrase 'Use custom domain' '20 45 100 100' \
+    "the $ordinal custom-domain checkbox is clicked with the pointer"
+  wtype -k tab
+  wtype -M ctrl -k a -m ctrl
+  wtype -d 75 "$domain"
+  wait_until "the $ordinal custom domain is entered exactly" 15 \
+    active_region_contains "$domain" '20 35 100 100'
+  wtype -k tab
+  wait_until "the $ordinal HTTPS control scrolls into view" 15 screen_contains 'Enable HTTPS'
+  wtype -k space
+  revoke_polkit_temporary_authorizations
+  click_active_bottom_right_control "the $ordinal Create site button is clicked"
+  finish_https_site_creation "$name" "$expected_path"
+  pass "the $ordinal HTTPS site is persisted after its privileged setup"
 }
 
 complete_first_site_orientation() {
@@ -1145,11 +1454,27 @@ cleanup() {
       $path == "$HOME/Studio/omarchy-acceptance-two" ||
       $path == "$HOME/Studio/omarchy-removal-preserve" ]]; then
       if [[ -x $BUNDLED_NODE && -f $BUNDLED_CLI ]]; then
-        "$BUNDLED_NODE" --experimental-wasm-jspi "$BUNDLED_CLI" site delete --path "$path" --avoid-telemetry >/dev/null 2>&1 || true
+        if [[ $path == "$HOME/Studio/omarchy-acceptance-one" ]]; then
+          # Deleting the custom-domain fixture requires interactive polkit for
+          # /etc/hosts. On failure, stop it without starting a hidden prompt;
+          # the disposable guest owns the remaining system fixture state.
+          timeout 20 "$BUNDLED_NODE" --experimental-wasm-jspi "$BUNDLED_CLI" site stop \
+            --path "$path" --avoid-telemetry >/dev/null 2>&1 || true
+        else
+          timeout 30 "$BUNDLED_NODE" --experimental-wasm-jspi "$BUNDLED_CLI" site delete \
+            --path "$path" --avoid-telemetry >/dev/null 2>&1 || true
+        fi
       fi
       [[ ! -e $path ]] || rm -rf -- "$path"
     fi
   done
+  if [[ -d $FIREFOX_NSS_DB && ! -L $FIREFOX_NSS_DB &&
+    $FIREFOX_NSS_DB == "$HOME/.mozilla/firefox/omarchy-acceptance.default-release" ]]; then
+    rm -rf -- "$FIREFOX_NSS_DB"
+  fi
+  if [[ -d $STANDARD_NSS_DB && ! -L $STANDARD_NSS_DB ]]; then
+    certutil -D -d "sql:$STANDARD_NSS_DB" -n "$UNRELATED_NSS_NICKNAME" >/dev/null 2>&1 || true
+  fi
   if [[ -d $containment_root ]]; then
     while read -r pid; do
       [[ -n $pid ]] && kill -KILL "$pid" 2>/dev/null || true
@@ -1216,6 +1541,7 @@ wait_until 'the not-installed Studio panel opens' 20 layer_on_screen omarchy-key
 wait_until 'the Studio panel reports Not installed' 20 screen_contains 'Not installed'
 screenshot 'success-studio-01-not-installed'
 sudo -K
+record_package_handoff_baseline
 click_screen_phrase 'Install Studio' '70 0 100 40' 'the Install Studio button is clicked with the pointer'
 wait_until 'the visible Studio installer terminal opens' 30 window_present "$TERMINAL_CLASS"
 finish_package_install_or_update 'installer' 'success-studio-02-installed-terminal'
@@ -1245,6 +1571,7 @@ installed_package_before_update=$(pacman -Q "$PACKAGE_NAME")
 studio_hash_before_update=$(sha256sum /usr/lib/studio/studio)
 pacman_log_line_before_update=$(wc -l </var/log/pacman.log)
 sudo -K
+record_package_handoff_baseline
 click_screen_phrase 'Update Studio' '70 0 100 40' 'the Update Studio button is clicked with the pointer'
 wait_until 'the visible Studio updater terminal opens' 30 window_present "$TERMINAL_CLASS"
 finish_package_install_or_update 'updater' 'success-studio-04-updated-terminal'
@@ -1302,8 +1629,10 @@ click_active_phrase 'Back' '0 55 55 100' 'the second tour Back button is clicked
 wait_until 'second-step Back returns to local sites' 20 screen_contains 'Sites run right on your machine'
 click_active_bottom_right_control 'the local-sites Continue button is clicked again'
 wait_until 'Studio Code tour step returns' 20 screen_contains 'Build with Studio Code'
-# Account login/signup, remote connection/import, custom domains, and HTTPS
-# deliberately stay out of this offline local-site lifecycle lane.
+# Account login/signup and remote connection/import deliberately stay out of
+# this offline local-site lifecycle lane. Custom domains and HTTPS stay local
+# and cross the guest's real polkit, hosts-file, system-trust, and browser-NSS
+# boundaries below.
 click_active_bottom_right_control 'the offline-safe Skip log in button is clicked'
 wait_until 'fresh Studio reaches Add a site' 30 screen_contains 'Add a site'
 
@@ -1320,7 +1649,12 @@ site_record_absent "$SITE_ONE_NAME" "$HOME/Studio/omarchy-acceptance-one" || fai
 site_record_absent "$SITE_TWO_NAME" "$HOME/Studio/omarchy-acceptance-two" || fail 'form Back does not create the second acceptance site'
 pass 'form Back creates no acceptance site'
 
-create_site_with_pointer "$SITE_ONE_NAME" 'first' "$HOME/Studio/omarchy-acceptance-one"
+prepare_browser_trust_fixture
+studio_hosts_entries_absent "$SITE_ONE_DOMAIN" || fail 'the custom domain is absent from hosts before creation'
+[[ ! -e $STUDIO_SYSTEM_CA_PATH && ! -L $STUDIO_SYSTEM_CA_PATH ]] ||
+  fail 'the Studio system trust anchor is absent before HTTPS setup'
+create_https_site_with_pointer "$SITE_ONE_NAME" 'first' \
+  "$HOME/Studio/omarchy-acceptance-one" "$SITE_ONE_DOMAIN"
 load_site_record "$SITE_ONE_NAME" "$HOME/Studio/omarchy-acceptance-one" SITE_ONE
 complete_first_site_orientation
 [[ $SITE_ONE_PATH == "$HOME/Studio/omarchy-acceptance-one" ]] || fail 'the first site uses its isolated default path'
@@ -1328,10 +1662,28 @@ wait_until 'the first site writes WordPress and SQLite files' 120 site_files_rea
 wait_until 'the first site reports online through the bundled CLI' 120 site_cli_state "$SITE_ONE_PATH" true
 wait_until 'the first site exposes the WordPress REST API' 120 site_rest_ready "$SITE_ONE_PORT"
 wait_until 'the first site serves visible HTML' 120 site_frontend_ready "$SITE_ONE_PORT"
+wait_until 'the first site writes a CA and domain-matched HTTPS certificate' 30 \
+  studio_https_certificates_ready "$SITE_ONE_DOMAIN"
+wait_until 'the custom domain has one canonical IPv4 and IPv6 hosts entry' 30 \
+  studio_hosts_entries_present "$SITE_ONE_DOMAIN" "$SITE_ONE_PORT"
+wait_until 'the Studio CA reaches the Arch system bundle and both browser NSS databases' 30 \
+  studio_system_and_browser_trust_ready
+wait_until 'the trusted custom-domain HTTPS endpoint exposes the WordPress REST API' 120 \
+  site_https_rest_ready "$SITE_ONE_DOMAIN"
+for database in "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB"; do
+  nss_has_certificate "$database" "$UNRELATED_NSS_NICKNAME" ||
+    fail 'Studio trust preserves the unrelated NSS certificate fixture'
+done
+pass 'Studio trust preserves unrelated Chromium and Firefox certificates'
+STUDIO_CA_HASH=$(sha256sum "$STUDIO_CA_PATH" | cut -d ' ' -f 1)
 screenshot 'success-studio-07-first-site-running'
 
 click_active_relative_control 35 14 'the site Settings tab is clicked'
 wait_until 'the Settings tab renders PHP version controls' 20 screen_contains 'PHP version'
+wait_until 'the Settings tab renders the custom HTTPS domain' 20 screen_contains "$SITE_ONE_DOMAIN"
+wait_until 'the Settings tab reports HTTPS enabled' 20 screen_contains 'Enabled'
+screen_absent 'Trust Certificate' || fail 'the fully trusted HTTPS site exposes no stale Trust Certificate action'
+pass 'the Settings tab reports the custom domain as fully trusted HTTPS'
 screenshot 'success-studio-08-settings-tab'
 click_active_relative_control 41 14 'the site Debugging tab is clicked'
 wait_until 'the Debugging tab renders Xdebug controls' 20 screen_contains 'Xdebug'
@@ -1358,6 +1710,7 @@ wait_until 'Open site launches the external browser' 60 browser_window_present
 dismiss_chromium_terms_if_needed "$SITE_ONE_NAME"
 wait_until 'the native Wayland browser is active with the first site in its title' 60 active_native_browser_for_site "$SITE_ONE_NAME"
 site_frontend_ready "$SITE_ONE_PORT" || fail 'the externally opened site remains reachable'
+site_https_rest_ready "$SITE_ONE_DOMAIN" || fail 'the externally opened custom domain remains trusted over HTTPS'
 pass 'the externally opened site remains reachable'
 screenshot 'success-studio-12-external-site'
 close_browser_windows
@@ -1453,11 +1806,36 @@ for site_name in "$SITE_TWO_NAME" "$SITE_ONE_NAME"; do
   # The fixed 560px confirmation dialog centers its destructive button 212px
   # right and 56px below the active window center. Its red label is otherwise
   # a recurring Tesseract false negative despite being plainly rendered.
+  if [[ $site_name == "$SITE_ONE_NAME" ]]; then
+    revoke_polkit_temporary_authorizations
+  fi
   click_active_centered_control 212 56 "the $site_name deletion is confirmed with the pointer"
-  wait_until "$site_name leaves Studio config" 30 site_record_absent "$site_name" "$site_path" "$site_id"
+  if [[ $site_name == "$SITE_ONE_NAME" ]]; then
+    finish_custom_domain_site_deletion "$site_name" "$site_path" "$site_id"
+  else
+    wait_until "$site_name leaves Studio config" 30 site_record_absent "$site_name" "$site_path" "$site_id"
+  fi
   wait_until "$site_name files are deleted" 30 test ! -e "$site_path"
   wait_until "$site_name stops serving after deletion" 30 site_http_offline "$site_port"
   wait_until "the Delete $site_name confirmation closes" 30 screen_absent "Delete $site_name"
+  if [[ $site_name == "$SITE_ONE_NAME" ]]; then
+    wait_until 'custom-domain deletion removes both hosts entries' 30 \
+      studio_hosts_entries_absent "$SITE_ONE_DOMAIN"
+    [[ ! -e $HOME/.studio/certificates/domains/$SITE_ONE_DOMAIN.crt &&
+      ! -L $HOME/.studio/certificates/domains/$SITE_ONE_DOMAIN.crt &&
+      ! -e $HOME/.studio/certificates/domains/$SITE_ONE_DOMAIN.key &&
+      ! -L $HOME/.studio/certificates/domains/$SITE_ONE_DOMAIN.key ]] ||
+      fail 'custom-domain deletion removes its domain certificate and private key'
+    [[ $(sha256sum "$STUDIO_CA_PATH" | cut -d ' ' -f 1) == "$STUDIO_CA_HASH" ]] ||
+      fail 'custom-domain deletion preserves the exact user CA for other future sites'
+    studio_system_and_browser_trust_ready ||
+      fail 'custom-domain deletion preserves the matching system and browser root trust'
+    for database in "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB"; do
+      nss_has_certificate "$database" "$UNRELATED_NSS_NICKNAME" ||
+        fail 'custom-domain deletion preserves the unrelated NSS certificate fixture'
+    done
+    pass 'custom-domain deletion cleans site-specific state and preserves root trust'
+  fi
 done
 wait_until 'Studio config contains no sites after both deletions' 30 studio_config_has_no_sites
 wait_until 'the first deleted site leaves the visible sidebar' 30 \
@@ -1536,6 +1914,17 @@ wait_until 'the visible Studio removal terminal opens' 30 window_present "$TERMI
 wait_until 'the removal terminal owns focus' 30 active_window_matches "$TERMINAL_CLASS"
 wait_until 'the remover completes browser trust cleanup and reaches the package transaction' 60 \
   pgrep -f '[s]udo pacman -Rns --noconfirm wordpress-studio-omarchy'
+for database in "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB"; do
+  nss_has_certificate "$database" "$STUDIO_NSS_NICKNAME" &&
+    fail 'browser trust cleanup removes the matching Studio CA before package removal'
+  nss_has_certificate "$database" "$UNRELATED_NSS_NICKNAME" ||
+    fail 'browser trust cleanup preserves the unrelated NSS certificate before package removal'
+done
+[[ -f $STUDIO_SYSTEM_CA_PATH && ! -L $STUDIO_SYSTEM_CA_PATH ]] ||
+  fail 'the system trust anchor remains package-owned until the package transaction'
+cmp -s "$STUDIO_CA_PATH" "$STUDIO_SYSTEM_CA_PATH" ||
+  fail 'the package-owned trust anchor still matches the preserved user CA at handoff'
+pass 'browser trust cleanup is exact and completes before the package transaction'
 remove_deadline=$((SECONDS + 180))
 remove_password_sent=false
 until ! pacman -Q "$PACKAGE_NAME" >/dev/null 2>&1; do
@@ -1559,7 +1948,21 @@ wait_until 'the remover terminates every Studio process' 30 studio_processes_abs
 wait_until 'the Studio executable is removed' 30 test ! -e /usr/bin/studio
 [[ ! -e /usr/bin/studio-omarchy-cleanup-user-trust ]] ||
   fail 'the standalone browser trust cleanup helper is removed with the package'
-[[ ! -e /etc/ca-certificates/trust-source/anchors/studio-ca.crt ]] || fail 'the Studio trust anchor is removed with the package'
+[[ ! -e $STUDIO_SYSTEM_CA_PATH && ! -L $STUDIO_SYSTEM_CA_PATH ]] ||
+  fail 'the Studio trust anchor is removed with the package'
+[[ $(sha256sum "$STUDIO_CA_PATH" | cut -d ' ' -f 1) == "$STUDIO_CA_HASH" ]] ||
+  fail 'package removal preserves the exact user-owned Studio CA'
+if openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$STUDIO_CA_PATH" >/dev/null 2>&1; then
+  fail 'package removal extracts the system trust bundle without the Studio CA'
+fi
+for database in "$STANDARD_NSS_DB" "$FIREFOX_NSS_DB"; do
+  certutil -L -d "sql:$database" >/dev/null 2>&1 ||
+    fail 'package removal leaves each browser NSS database readable'
+  nss_has_certificate "$database" "$STUDIO_NSS_NICKNAME" &&
+    fail 'package removal leaves no matching Studio CA in browser trust'
+  nss_has_certificate "$database" "$UNRELATED_NSS_NICKNAME" ||
+    fail 'package removal preserves unrelated browser trust'
+done
 pass 'the Studio trust anchor is removed with the package'
 
 click_bar_widget false

@@ -60,6 +60,96 @@ download_bounded() {
   mv -- "$partial" "$output"
 }
 
+install_verified_package() {
+  local source_path="$1"
+  local package_name="$2"
+  local expected_hash="$3"
+  local max_bytes="$4"
+  local actual_hash hash_limit
+
+  [[ -f $source_path && ! -L $source_path ]] ||
+    fail 'the verified package is not a regular file'
+  hash_limit=$((max_bytes + 1))
+  actual_hash=$(
+    timeout --signal=TERM --kill-after=5s 120s \
+      head -c "$hash_limit" "$source_path" |
+      sha256sum |
+      cut -d ' ' -f 1
+  ) || fail 'the package checksum could not be read within its safety budget'
+  [[ $actual_hash == "$expected_hash" ]] || fail 'the package checksum does not match'
+  printf '%s: OK\n' "$package_name"
+
+  sudo /usr/bin/bash -c '
+set -euo pipefail
+export LC_ALL=C
+
+source_path=$1
+package_name=$2
+expected_hash=$3
+max_bytes=$4
+staging_dir=""
+
+privileged_fail() {
+  echo "WordPress Studio installation failed: $*" >&2
+  exit 1
+}
+
+cleanup() {
+  if [[ -n $staging_dir && $staging_dir == /var/tmp/studio-omarchy-install.* ]]; then
+    /usr/bin/rm -rf -- "$staging_dir"
+  fi
+}
+trap cleanup EXIT
+
+[[ $package_name =~ ^wordpress-studio-omarchy-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-x86_64\.pkg\.tar\.zst$ ]] ||
+  privileged_fail "the privileged package handoff name is unsafe"
+[[ $expected_hash =~ ^[0-9a-f]{64}$ ]] ||
+  privileged_fail "the privileged package handoff checksum is unsafe"
+[[ $max_bytes =~ ^[1-9][0-9]*$ ]] && (( max_bytes <= 2147483648 )) ||
+  privileged_fail "the privileged package handoff byte budget is unsafe"
+[[ $source_path == /* && ${source_path##*/} == "$package_name" ]] ||
+  privileged_fail "the privileged package handoff source path is unsafe"
+
+umask 077
+staging_dir=$(/usr/bin/mktemp -d /var/tmp/studio-omarchy-install.XXXXXXXXXX)
+[[ $staging_dir == /var/tmp/studio-omarchy-install.* && -d $staging_dir && ! -L $staging_dir ]] ||
+  privileged_fail "could not create a safe privileged package staging directory"
+staged_path="$staging_dir/$package_name"
+copy_limit=$((max_bytes + 1))
+
+if ! /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+  /usr/bin/dd \
+    if="$source_path" \
+    of="$staged_path" \
+    iflag=nofollow,nonblock,fullblock,count_bytes \
+    bs=1M \
+    count="$copy_limit" \
+    status=none; then
+  privileged_fail "the privileged package handoff copy failed or exceeded its deadline"
+fi
+[[ ! -L $staged_path && -f $staged_path ]] ||
+  privileged_fail "the privileged package handoff did not produce a regular file"
+/usr/bin/chmod 600 -- "$staged_path"
+IFS="|" read -r staged_type staged_uid staged_gid staged_mode staged_links staged_bytes < <(
+  /usr/bin/stat -c "%F|%u|%g|%a|%h|%s" -- "$staged_path"
+) || privileged_fail "the privileged package handoff metadata could not be read"
+[[ $staged_type == "regular file" && $staged_uid == 0 && $staged_gid == 0 &&
+  $staged_mode == 600 && $staged_links == 1 && $staged_bytes =~ ^[1-9][0-9]*$ ]] ||
+  privileged_fail "the privileged package handoff metadata is unsafe"
+(( staged_bytes <= max_bytes )) ||
+  privileged_fail "the package changed beyond its byte budget before installation"
+read -r staged_hash _ < <(
+  /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+    /usr/bin/sha256sum "$staged_path"
+) ||
+  privileged_fail "the privileged package handoff checksum could not be read"
+[[ $staged_hash == "$expected_hash" ]] ||
+  privileged_fail "the package changed before the privileged installation handoff"
+
+/usr/bin/pacman -U --needed --noconfirm -- "$staged_path"
+' bash "$source_path" "$package_name" "$expected_hash" "$max_bytes"
+}
+
 for command_name in curl jq pacman realpath sha256sum sudo timeout; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
@@ -133,11 +223,7 @@ IFS=' ' read -r expected_hash expected_name extra <"$checksum_path" || true
 [[ ${expected_hash:-} =~ ^[0-9a-f]{64}$ && ${expected_name:-} == "$package_name" && -z ${extra:-} ]] ||
   fail 'the checksum file has an unexpected format or filename'
 
-actual_hash=$(sha256sum "$package_path" | cut -d ' ' -f 1)
-[[ $actual_hash == "$expected_hash" ]] || fail 'the package checksum does not match'
-printf '%s: OK\n' "$package_name"
-
-sudo pacman -U --needed --noconfirm -- "$package_path"
+install_verified_package "$package_path" "$package_name" "$expected_hash" "$package_max_bytes"
 
 if [[ $test_mode == false ]]; then
   studio_root='/usr/lib/studio'

@@ -65,7 +65,7 @@ git -C "$studio_root" checkout --detach 121b18d77f96e4362c7d22bdcd4c428022503f8b
   npm --prefix "$studio_root" ci &&
   npm --prefix "$studio_root" run lint &&
   npm --prefix "$studio_root" run typecheck &&
-  npm --prefix "$studio_root" test &&
+  npm --prefix "$studio_root" test -- --maxWorkers=1 &&
   npm --prefix "$studio_root" run package
 pinned_build_status=$?
 set -e
