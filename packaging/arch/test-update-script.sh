@@ -537,7 +537,9 @@ expect_failure 'symlink download directory' env \
   STUDIO_UPDATE_RELEASE_FILE="$exact_release" \
   STUDIO_UPDATE_RUN_ROOT="$symlink_root" \
   PATH="$test_root/bin:$PATH" \
-  "$script_dir/studio-omarchy-update"
+  "$test_updater"
+grep -qF 'the download directory must be a real directory, not a link or special file' \
+  "$test_root/failure-output"
 
 fifo_root="$test_root/runs/fifo"
 mkdir -p "$fifo_root"
@@ -550,7 +552,9 @@ expect_failure 'non-directory download path' env \
   STUDIO_UPDATE_RELEASE_FILE="$exact_release" \
   STUDIO_UPDATE_RUN_ROOT="$fifo_root" \
   PATH="$test_root/bin:$PATH" \
-  "$script_dir/studio-omarchy-update"
+  "$test_updater"
+grep -qF 'the download directory must be a real directory, not a link or special file' \
+  "$test_root/failure-output"
 
 cmp "$script_dir/../../install.sh" "$script_dir/studio-omarchy-update"
 

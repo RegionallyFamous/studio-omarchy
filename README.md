@@ -23,11 +23,15 @@ The Quattro integration requires Omarchy with its shared shell, visible terminal
 The native package can still be installed without the bar plugin:
 
 ```bash
-studio_installer=$(mktemp)
-trap 'rm -f -- "$studio_installer"' EXIT
-curl -fsSLo "$studio_installer" \
+studio_installer=$(/usr/bin/mktemp)
+trap '/usr/bin/rm -f -- "$studio_installer"' EXIT
+/usr/bin/env -i PATH=/usr/bin LC_ALL=C \
+  /usr/bin/curl --disable --fail --show-error --location \
+  --proto '=https' --proto-redir '=https' \
+  --cacert /etc/ssl/certs/ca-certificates.crt \
+  --output "$studio_installer" \
   https://raw.githubusercontent.com/RegionallyFamous/studio-omarchy/main/install.sh
-bash "$studio_installer"
+/bin/bash -p "$studio_installer"
 ```
 
 Launch **WordPress Studio** from the Omarchy app menu or run:
