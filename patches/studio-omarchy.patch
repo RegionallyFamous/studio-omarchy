@@ -452,4 +452,49 @@ index 00000000..9d6e1768
 +		expect( isArchBasedLinux( { id: 'ubuntu', idLike: [ 'debian' ] } ) ).toBe( false );
 +	} );
 +} );
-
+diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
+--- a/apps/studio/src/site-server.ts
++++ b/apps/studio/src/site-server.ts
+@@ -264,6 +264,7 @@ export class SiteServer {
+ 
+ 		console.log( `Starting server for '${ this.details.name }'` );
+ 		await this.server.start();
++		this.adoptRunningState( true );
+ 	}
+ 
+ 	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
+diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
+--- a/apps/studio/src/tests/site-server.test.ts
++++ b/apps/studio/src/tests/site-server.test.ts
+@@ -228,5 +228,31 @@ describe( 'SiteServer', () => {
+ 				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
+ 			);
+ 		} );
++
++		it( 'marks a successful CLI start as running before it resolves', async () => {
++			mockStartServer.mockResolvedValueOnce( {
++				url: 'http://localhost:1234',
++				options: { port: 1234, phpVersion: '8.0' },
++				_internal: { mode: 'wordpress', port: 1234 },
++			} );
++
++			const server = SiteServer.register( {
++				id: 'successful-start',
++				name: 'successful-start',
++				path: '/tmp/successful-start',
++				port: 1234,
++				adminPassword: 'test-password',
++				phpVersion: '8.4',
++				running: false,
++				themeDetails: undefined,
++			} );
++
++			await server.start();
++
++			expect( server.details.running ).toBe( true );
++			if ( server.details.running ) {
++				expect( server.details.url ).toBe( 'http://localhost:1234' );
++			}
++		} );
+ 	} );
+ } );
