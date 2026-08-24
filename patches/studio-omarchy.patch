@@ -2802,6 +2802,7 @@ index c69b9ebd2..15735dbfe 100644
  import os from 'node:os';
  import path from 'node:path';
 -import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  import {
 +	ARCH_LINUX_TRUST_STORE_PATH,
  	buildLinuxTrustInstallCommand,
@@ -2814,7 +2815,6 @@ index c69b9ebd2..15735dbfe 100644
 +	isLinuxTrustAnchorCurrent,
 +	readLinuxTrustCertificate,
  } from '@studio/common/lib/linux-trust-store';
-+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  
  describe( 'linux-trust-store', () => {
 +	const studioCAFixturePath = path.join(
