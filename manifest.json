@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.regionallyfamous.studio",
   "name": "WordPress Studio",
-  "version": "1.19.0",
+  "version": "1.20.0",
   "author": "RegionallyFamous",
   "license": "GPL-2.0-or-later",
   "description": "Install, update, launch, and remove the native Omarchy build of WordPress Studio from a keyboard-friendly Quattro panel with visible package verification and native Wayland integration.",

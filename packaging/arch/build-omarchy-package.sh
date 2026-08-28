@@ -9,7 +9,7 @@ export PATH
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 version=$(sed -n 's/^pkgver=//p' "$script_dir/PKGBUILD")
-readonly upstream_commit='d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84'
+readonly upstream_commit='e234e9491adc7484ce8829e8d0f24c874a6e5487'
 upstream_commit_file="$script_dir/upstream-commit"
 cleanup_source="$repo_root/scripts/cleanup-user-trust.sh"
 
@@ -108,8 +108,8 @@ trap '/usr/bin/rm -rf -- "$build_root"' EXIT
 
 git init --quiet "$studio_root"
 git -C "$studio_root" remote add origin https://github.com/Automattic/studio.git
-git -C "$studio_root" fetch --depth 1 origin d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84
-git -C "$studio_root" checkout --detach d3f1d19e0d56a7fa7d3937d53c00122ee05d4d84 ||
+git -C "$studio_root" fetch --depth 1 origin e234e9491adc7484ce8829e8d0f24c874a6e5487
+git -C "$studio_root" checkout --detach e234e9491adc7484ce8829e8d0f24c874a6e5487 ||
   fail 'Unable to check out the pinned Studio source.'
 [[ $(git -C "$studio_root" rev-parse HEAD) == "$upstream_commit" ]] ||
   fail 'The checked-out Studio source does not match the pinned commit.'
