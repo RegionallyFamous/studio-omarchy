@@ -1332,7 +1332,7 @@ index 7e01abec9..97b94e5f4 100644
  		} );
  	} );
 diff --git a/apps/cli/playground-server-child.ts b/apps/cli/playground-server-child.ts
-index dc14d0f22..6192dcc2d 100644
+index edbe2ca4c..3826b9a36 100644
 --- a/apps/cli/playground-server-child.ts
 +++ b/apps/cli/playground-server-child.ts
 @@ -10,6 +10,7 @@
@@ -1343,7 +1343,7 @@ index dc14d0f22..6192dcc2d 100644
  import { rootCertificates } from 'node:tls';
  import path, { dirname } from 'path';
  import { setPhpIniEntries } from '@php-wasm/universal';
-@@ -58,6 +59,65 @@ import {
+@@ -60,6 +61,65 @@ import { buildWpCliPhpArgv } from 'cli/lib/wp-cli-php-ini';
  let server: RunCLIServer | null = null;
  let lastCliArgs: Record< string, unknown > | null = null;
  
@@ -1409,7 +1409,7 @@ index dc14d0f22..6192dcc2d 100644
  // Intercept and prefix all console output from playground-cli
  const originalConsoleLog = console.log;
  const originalConsoleError = console.error;
-@@ -429,7 +489,7 @@ const startServer = wrapWithStartingPromise(
+@@ -435,7 +495,7 @@ const startServer = wrapWithStartingPromise(
  
  			const args = await getBaseRunCLIArgs( 'server', config );
  
@@ -1418,7 +1418,7 @@ index dc14d0f22..6192dcc2d 100644
  
  			stopSignal.throwIfAborted();
  
-@@ -516,7 +576,7 @@ async function runBlueprint( config: ServerConfig, signal: AbortSignal ): Promis
+@@ -522,7 +582,7 @@ async function runBlueprint( config: ServerConfig, signal: AbortSignal ): Promis
  		signal.throwIfAborted();
  
  		const args = await getBaseRunCLIArgs( 'run-blueprint', config );
@@ -1814,10 +1814,10 @@ index 000000000..c7ee680c7
 +	};
 +}
 diff --git a/apps/studio/src/lib/php-error-recovery.ts b/apps/studio/src/lib/php-error-recovery.ts
-index d65123e77..0ee0d72ee 100644
+index c3a7a8b74..7ef78e79a 100644
 --- a/apps/studio/src/lib/php-error-recovery.ts
 +++ b/apps/studio/src/lib/php-error-recovery.ts
-@@ -105,7 +105,7 @@ export async function startErrorRecovery(
+@@ -107,7 +107,7 @@ export async function startErrorRecovery(
  
  	await new Promise< void >( ( resolve, reject ) => {
  		errorServer.on( 'error', reject );
@@ -2003,10 +2003,10 @@ index 000000000..2f6599998
 +	} );
 +} );
 diff --git a/apps/studio/src/lib/tests/php-error-recovery.test.ts b/apps/studio/src/lib/tests/php-error-recovery.test.ts
-index 51e8b9d55..cf17e5ff4 100644
+index c24906112..df14ef667 100644
 --- a/apps/studio/src/lib/tests/php-error-recovery.test.ts
 +++ b/apps/studio/src/lib/tests/php-error-recovery.test.ts
-@@ -15,7 +15,7 @@ function getFreePort(): Promise< number > {
+@@ -16,7 +16,7 @@ function getFreePort(): Promise< number > {
  	return new Promise( ( resolve, reject ) => {
  		const srv = http.createServer();
  		srv.once( 'error', reject );
@@ -2015,7 +2015,7 @@ index 51e8b9d55..cf17e5ff4 100644
  			const address = srv.address();
  			const port = typeof address === 'object' && address ? address.port : 0;
  			srv.close( () => resolve( port ) );
-@@ -27,7 +27,7 @@ function canBind( port: number ): Promise< boolean > {
+@@ -28,7 +28,7 @@ function canBind( port: number ): Promise< boolean > {
  	return new Promise( ( resolve ) => {
  		const srv = http.createServer();
  		srv.once( 'error', () => resolve( false ) );
@@ -2024,7 +2024,7 @@ index 51e8b9d55..cf17e5ff4 100644
  	} );
  }
  
-@@ -109,6 +109,7 @@ describe( 'error recovery port lifecycle', () => {
+@@ -163,6 +163,7 @@ describe( 'error recovery port lifecycle', () => {
  	test( 'holds the port and marks the site running, then releases both on stop', async () => {
  		const port = await getFreePort();
  		const dir = fs.mkdtempSync( nodePath.join( os.tmpdir(), 'php-recovery-test-' ) );
@@ -2032,7 +2032,7 @@ index 51e8b9d55..cf17e5ff4 100644
  		const siteServer = {
  			details: { id: 'test-site', port, path: dir } as {
  				id: string;
-@@ -124,6 +125,7 @@ describe( 'error recovery port lifecycle', () => {
+@@ -178,6 +179,7 @@ describe( 'error recovery port lifecycle', () => {
  
  		try {
  			await startErrorRecovery( siteServer as never, 'Fatal error: boom', () => ( {} ) );
@@ -2040,7 +2040,7 @@ index 51e8b9d55..cf17e5ff4 100644
  			expect( isInErrorRecovery( 'test-site' ) ).toBe( true );
  			// The recovery error server holds the port; the site shows as running and in recovery.
  			expect( await canBind( port ) ).toBe( false );
-@@ -149,6 +151,7 @@ describe( 'error recovery port lifecycle', () => {
+@@ -203,6 +205,7 @@ describe( 'error recovery port lifecycle', () => {
  			expect( siteServer.inErrorRecovery ).toBe( false );
  		} finally {
  			await stopErrorRecovery( 'test-site' );
@@ -2049,7 +2049,7 @@ index 51e8b9d55..cf17e5ff4 100644
  		}
  	} );
 diff --git a/apps/studio/src/site-server.ts b/apps/studio/src/site-server.ts
-index 4bb9bf6cc..f54ecf4a5 100644
+index 18ee76be6..1a5d2b488 100644
 --- a/apps/studio/src/site-server.ts
 +++ b/apps/studio/src/site-server.ts
 @@ -265,6 +265,7 @@ export class SiteServer {
@@ -2061,10 +2061,10 @@ index 4bb9bf6cc..f54ecf4a5 100644
  
  	// Adopt an authoritative running value, touching only running/url so Studio-owned fields survive.
 diff --git a/apps/studio/src/tests/site-server.test.ts b/apps/studio/src/tests/site-server.test.ts
-index bbc029409..3f9a444e1 100644
+index 001e23fd4..be978a1ab 100644
 --- a/apps/studio/src/tests/site-server.test.ts
 +++ b/apps/studio/src/tests/site-server.test.ts
-@@ -195,5 +195,31 @@ describe( 'SiteServer', () => {
+@@ -196,5 +196,31 @@ describe( 'SiteServer', () => {
  				"Site server started with Playground's 'theme' mode. Studio only supports 'wordpress' mode."
  			);
  		} );
@@ -2097,10 +2097,10 @@ index bbc029409..3f9a444e1 100644
  	} );
  } );
 diff --git a/apps/studio/src/tests/updates.test.ts b/apps/studio/src/tests/updates.test.ts
-index b90c9371d..8fc417f5e 100644
+index 8108d605d..b2c609677 100644
 --- a/apps/studio/src/tests/updates.test.ts
 +++ b/apps/studio/src/tests/updates.test.ts
-@@ -43,7 +43,7 @@ afterEach( () => {
+@@ -64,7 +64,7 @@ afterEach( () => {
  } );
  
  describe( 'Linux updater', () => {
@@ -2109,7 +2109,7 @@ index b90c9371d..8fc417f5e 100644
  		global.fetch = vi.fn().mockResolvedValue( {
  			status: 200,
  			ok: true,
-@@ -65,14 +65,12 @@ describe( 'Linux updater', () => {
+@@ -86,14 +86,12 @@ describe( 'Linux updater', () => {
  
  		const args = getLastDialogOptions();
  		expect( args.message ).toContain( '1.9.0' );
@@ -2128,7 +2128,7 @@ index b90c9371d..8fc417f5e 100644
  		global.fetch = vi.fn().mockResolvedValue( {
  			status: 200,
  			ok: true,
-@@ -89,12 +87,9 @@ describe( 'Linux updater', () => {
+@@ -110,12 +108,9 @@ describe( 'Linux updater', () => {
  		await manualCheckForUpdates();
  
  		await vi.waitFor( () => {
@@ -2144,7 +2144,7 @@ index b90c9371d..8fc417f5e 100644
  
  	it( 'does not copy to the clipboard or open the browser when the user dismisses the dialog', async () => {
 diff --git a/apps/studio/src/updates.ts b/apps/studio/src/updates.ts
-index 142b6b7a1..7f5245bfc 100644
+index 275dd526d..8d02152c2 100644
 --- a/apps/studio/src/updates.ts
 +++ b/apps/studio/src/updates.ts
 @@ -3,7 +3,7 @@ import * as Sentry from '@sentry/electron/main';
@@ -2155,14 +2155,17 @@ index 142b6b7a1..7f5245bfc 100644
 +import { getLinuxUpdateAction } from 'src/lib/linux-update';
  import { getPreferredStudioUiMode } from 'src/lib/studio-ui-mode';
  import { isDevRelease } from 'src/lib/version-utils';
- import { getMainWindow } from 'src/main-window';
-@@ -358,24 +358,22 @@ function rescheduleLinuxOrFinish() {
+ import { getExistingMainWindow, getMainWindow } from 'src/main-window';
+@@ -424,27 +424,25 @@ function rescheduleLinuxOrFinish() {
  	}, AUTO_UPDATE_INTERVAL_MS );
  }
  
 -async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: string ) {
 +async function showLinuxUpdateAvailableNotice( version: string, _downloadUrl: string ) {
- 	const mainWindow = await getMainWindow();
+ 	const mainWindow = getExistingMainWindow();
+ 	if ( ! mainWindow ) {
+ 		return;
+ 	}
  
 -	const command = `sudo apt install ~/Downloads/${ debFilenameFromUrl( downloadUrl ) }`;
 +	const updateAction = getLinuxUpdateAction();
@@ -2187,7 +2190,7 @@ index 142b6b7a1..7f5245bfc 100644
  		defaultId: 0,
  		cancelId: 1,
  	} );
-@@ -384,31 +382,7 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
+@@ -453,31 +451,7 @@ async function showLinuxUpdateAvailableNotice( version: string, downloadUrl: str
  		return;
  	}
  
@@ -2199,7 +2202,7 @@ index 142b6b7a1..7f5245bfc 100644
 -			);
 -			return;
 -		}
--		clipboard.writeText( command );
+-		await clipboard.writeText( command );
 -		void shellOpenExternalWrapper( parsedUrl.toString() );
 -	} catch {
 -		Sentry.captureException( new Error( `Malformed downloadUrl: ${ downloadUrl }` ) );
@@ -2216,7 +2219,7 @@ index 142b6b7a1..7f5245bfc 100644
 -		// ignore
 -	}
 -	return 'studio.deb';
-+	clipboard.writeText( updateAction.command );
++	await clipboard.writeText( updateAction.command );
  }
  
  function isAppRunningFromDMG(): boolean {
@@ -2792,7 +2795,7 @@ index 000000000..9d6e17684
 +	} );
 +} );
 diff --git a/packages/common/lib/tests/linux-trust-store.test.ts b/packages/common/lib/tests/linux-trust-store.test.ts
-index c69b9ebd2..15735dbfe 100644
+index c69b9ebd2..e53af7d82 100644
 --- a/packages/common/lib/tests/linux-trust-store.test.ts
 +++ b/packages/common/lib/tests/linux-trust-store.test.ts
 @@ -1,17 +1,35 @@
@@ -2801,8 +2804,7 @@ index c69b9ebd2..15735dbfe 100644
  import fs from 'node:fs';
  import os from 'node:os';
  import path from 'node:path';
--import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  import {
 +	ARCH_LINUX_TRUST_STORE_PATH,
  	buildLinuxTrustInstallCommand,
@@ -2832,7 +2834,7 @@ index c69b9ebd2..15735dbfe 100644
  	describe( 'constants', () => {
  		it( 'targets the Debian/Ubuntu system trust bundle', () => {
  			expect( LINUX_SYSTEM_CA_BUNDLE ).toBe( '/etc/ssl/certs/ca-certificates.crt' );
-@@ -26,21 +41,453 @@ describe( 'linux-trust-store', () => {
+@@ -26,21 +44,453 @@ describe( 'linux-trust-store', () => {
  		} );
  	} );
  
@@ -2854,9 +2856,7 @@ index c69b9ebd2..15735dbfe 100644
 -		it( 'composes an install + update-ca-certificates command targeting the system trust store', () => {
 -			const command = buildLinuxTrustInstallCommand( '/home/u/.studio/certificates/studio-ca.crt' );
 +		const certificate = studioCAFixture;
- 
--			expect( command ).toBe(
--				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
++
 +		it( 'binds the exact certificate bytes and fingerprint to a fixed Debian trust destination', () => {
 +			const command = buildLinuxTrustInstallCommand( certificate, {
 +				id: 'ubuntu',
@@ -2866,7 +2866,9 @@ index c69b9ebd2..15735dbfe 100644
 +			const derFingerprint = new X509Certificate( certificate ).fingerprint256
 +				.replace( /:/g, '' )
 +				.toLowerCase();
-+
+ 
+-			expect( command ).toBe(
+-				`install -m 0644 "/home/u/.studio/certificates/studio-ca.crt" "${ LINUX_TRUST_STORE_PATH }" && update-ca-certificates`
 +			expect( command ).toContain( certificate.toString( 'base64' ) );
 +			expect( command ).toContain( fingerprint );
 +			expect( command.match( new RegExp( fingerprint, 'g' ) ) ).toHaveLength( 6 );
@@ -2913,7 +2915,7 @@ index c69b9ebd2..15735dbfe 100644
 +			);
 +			expect( command ).toMatch(
 +				/\/usr\/sbin\/update-ca-certificates && \/usr\/bin\/printf[^&]+studio-ca\.crt/
-+			);
+ 			);
 +			expect( command ).toMatch(
 +				/openssl verify -CAfile [^&]+studio-ca\.crt' && \/usr\/bin\/printf[^&]+studio-ca\.crt/
 +			);
@@ -2941,7 +2943,7 @@ index c69b9ebd2..15735dbfe 100644
 +			expect( debianRemovalScript ).not.toMatch( /(^|\s)rm -f/ );
 +			expect( debianRemovalScript ).toContain(
 +				'/usr/sbin/update-ca-certificates --fresh >/dev/null'
- 			);
++			);
 +			expect( debianRemovalScript ).not.toContain( 'update-ca-certificates --fresh >/dev/null ||' );
 +		} );
 +
